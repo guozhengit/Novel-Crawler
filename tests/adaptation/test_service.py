@@ -20,7 +20,7 @@ class FakeAcquirer:
         self.pages = pages
         self.calls: list[str] = []
 
-    def fetch_page(self, url: str, *, max_body_bytes: int | None = None) -> AcquiredPage:
+    def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
         self.calls.append(url)
         if max_body_bytes is not None and len(self.pages[url].encode()) > max_body_bytes:
             raise AcquisitionError("response_too_large", "https://example.test/", False)
@@ -86,9 +86,9 @@ def test_probe_passes_cumulative_remaining_budget_before_each_download() -> None
             super().__init__(pages)
             self.limits: list[int | None] = []
 
-        def fetch_page(self, url: str, *, max_body_bytes: int | None = None) -> AcquiredPage:
+        def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
             self.limits.append(max_body_bytes)
-            return super().fetch_page(url, max_body_bytes=max_body_bytes)
+            return super().fetch_page(url, max_body_bytes=max_body_bytes, locked_origin=locked_origin)
 
     index = '<div id="list"><a href="/c1">Chapter 1</a><a href="/c2">Chapter 2</a><a href="/c3">Chapter 3</a></div>'
     pages = {"https://example.test/book": index + " " * (15_000 - len(index)), "https://example.test/c1": "x" * 5_001}
@@ -106,7 +106,7 @@ def test_probe_budget_and_acquisition_failures_are_safe_rejections() -> None:
     assert result.reason_ids == ("acquisition.response_too_large",)
 
     class Broken:
-        def fetch_page(self, url: str, *, max_body_bytes: int | None = None) -> AcquiredPage:
+        def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
             raise AcquisitionError("timeout", "https://example.test/", True)
 
     failed = ProbeService(acquirer=Broken()).probe("https://example.test/private?q=secret")

@@ -122,6 +122,10 @@ def test_batch_validates_identity_origin_kind_and_single_page_contract() -> None
         ScoredPageBatch("sample-1", "https://example.test/path", PageKind.CHAPTER, ())
     with pytest.raises(ValueError, match="page_kind"):
         DecisionPolicy().decide(Classification(PageKind.BOOK_INDEX, 1, ()), batch(PageKind.CHAPTER))
+    with pytest.raises(ValueError, match="sample_id"):
+        DecisionPolicy().decide(Classification(PageKind.CHAPTER, 1, (), "sample-other", "https://example.test"), batch(PageKind.CHAPTER))
+    with pytest.raises(ValueError, match="safe_origin"):
+        DecisionPolicy().decide(Classification(PageKind.CHAPTER, 1, (), "sample-1", "https://other.test"), batch(PageKind.CHAPTER))
     foreign = scored(FieldKind.CONTENT, "article", 0.9)
     object.__setattr__(foreign, "sample_id", "sample-2")
     with pytest.raises(ValueError, match="sample_id"):

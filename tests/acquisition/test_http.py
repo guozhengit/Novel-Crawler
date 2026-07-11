@@ -160,6 +160,27 @@ def test_relative_redirect_is_joined_before_next_request() -> None:
     assert transport.calls[1]["path"] == "/final?x=1"
 
 
+def test_locked_origin_rejects_initial_and_redirect_cross_origin_before_transport() -> None:
+    policy, _ = policy_with_calls({"example.test": "93.184.216.34", "other.test": "142.250.72.14"})
+    initial = FakeTransport([response()])
+    with pytest.raises(AcquisitionError, match="cross_origin"):
+        HttpPageAcquirer(initial, policy).fetch("https://other.test/start", locked_origin="https://example.test")
+    assert initial.calls == []
+
+    redirected = FakeTransport([response(302, headers={"Location": "https://other.test/final"})])
+    with pytest.raises(AcquisitionError) as caught:
+        HttpPageAcquirer(redirected, policy).fetch("https://example.test/start", locked_origin="https://example.test")
+    assert (caught.value.code, caught.value.recoverable) == ("cross_origin", False)
+    assert [call["original_host"] for call in redirected.calls] == ["example.test"]
+
+
+def test_locked_origin_allows_same_origin_redirect_with_default_port_normalization() -> None:
+    policy, _ = policy_with_calls({"xn--bcher-kva.test": "93.184.216.34"})
+    transport = FakeTransport([response(302, headers={"Location": "/final"}), response()])
+    HttpPageAcquirer(transport, policy).fetch("https://xn--bcher-kva.test/start", locked_origin="https://bücher.test:443")
+    assert len(transport.calls) == 2
+
+
 def test_snapshot_urls_never_retain_credentials_query_or_fragment() -> None:
     policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
     transport = FakeTransport(

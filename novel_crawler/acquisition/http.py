@@ -130,13 +130,16 @@ class HttpPageAcquirer:
         self.user_agent = user_agent
         self.max_body_bytes = max_body_bytes
 
-    def fetch(self, url: str, *, max_body_bytes: int | None = None) -> PageSnapshot:
-        return self.fetch_page(url, max_body_bytes=max_body_bytes).snapshot
+    def fetch(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> PageSnapshot:
+        return self.fetch_page(url, max_body_bytes=max_body_bytes, locked_origin=locked_origin).snapshot
 
-    def fetch_page(self, url: str, *, max_body_bytes: int | None = None) -> AcquiredPage:
+    def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
         effective_max = self.max_body_bytes if max_body_bytes is None else min(self.max_body_bytes, max_body_bytes)
         if effective_max <= 0:
             raise ValueError("max_body_bytes must be positive")
+        origin_lock = self._origin_key(locked_origin) if locked_origin is not None else None
+        if origin_lock is not None and self._origin_key(url) != origin_lock:
+            raise AcquisitionError("cross_origin", redact_url(url), False)
         requested_url = redact_url(url)
         current_url = url
         seen = {current_url}
@@ -198,6 +201,8 @@ class HttpPageAcquirer:
                 if len(redirects) >= self.max_redirects:
                     raise AcquisitionError("too_many_redirects", redact_url(current_url), False)
                 next_url = urljoin(current_url, location)
+                if origin_lock is not None and self._origin_key(next_url) != origin_lock:
+                    raise AcquisitionError("cross_origin", redact_url(next_url), False)
                 if next_url in seen:
                     raise AcquisitionError("redirect_loop", redact_url(next_url), False)
                 try:
@@ -250,6 +255,14 @@ class HttpPageAcquirer:
     def _request_target(path: str, query: str) -> str:
         target = path or "/"
         return f"{target}?{query}" if query else target
+
+    @staticmethod
+    def _origin_key(url: str) -> tuple[str, str, int]:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        raw_host = (parts.hostname or "").lower()
+        host = raw_host if ":" in raw_host else raw_host.encode("idna").decode("ascii")
+        return scheme, host, parts.port or (443 if scheme == "https" else 80)
 
     @staticmethod
     def _host_header(host: str, port: int, scheme: str) -> str:

@@ -150,6 +150,9 @@ def test_realistic_mixed_catalog_selects_only_chapter_anchors() -> None:
     assert all("Home" not in node.text and "Latest" not in node.text and "Next" not in node.text for node in selected)
     assert candidate.metadata["container_selector"]
     assert candidate.metadata["link_text_rule"] == "chapter_title.v2"
+    private_container = str(candidate.metadata["container_selector"])
+    assert private_container not in repr(candidate)
+    assert private_container not in repr(result)
 
 
 def test_large_mixed_catalog_uses_safe_href_structure_not_exact_selector_list() -> None:

@@ -24,7 +24,7 @@ from .validation import ConfigDraft, MultiPageValidator, PageValidation, Validat
 
 
 class PageAcquirer(Protocol):
-    def fetch_page(self, url: str, *, max_body_bytes: int | None = None) -> AcquiredPage: ...
+    def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage: ...
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,7 @@ class ProbeService:
 
     def probe(self, book_or_chapter_url: str) -> ValidationResult:
         self._fetches = self._bytes = 0
-        self._origin = None
+        self._origin = self._origin_key(book_or_chapter_url)
         try:
             start = self._fetch(book_or_chapter_url)
             start_analysis = self._analyze(start.snapshot)
@@ -102,11 +102,9 @@ class ProbeService:
         if self._origin is not None and requested_origin != self._origin:
             raise AcquisitionError("cross_origin", self._origin_display(url), False)
         remaining = self.max_probe_bytes - self._bytes
-        page = self.acquirer.fetch_page(url, max_body_bytes=remaining)
+        page = self.acquirer.fetch_page(url, max_body_bytes=remaining, locked_origin=self._origin_display(url))
         actual_origin = self._origin_key(page.navigation_url)
-        if self._origin is None:
-            self._origin = actual_origin
-        elif actual_origin != self._origin:
+        if actual_origin != self._origin:
             raise AcquisitionError("cross_origin", self._origin_display(page.navigation_url), False)
         size = len(page.snapshot.body)
         if size > self.max_probe_bytes or self._bytes + size > self.max_probe_bytes:

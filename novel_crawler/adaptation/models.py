@@ -91,7 +91,7 @@ class Candidate:
     metadata = property(lambda self: self._metadata)
 
     def __repr__(self) -> str:
-        return f"Candidate(field={self.field.value!r}, selector_present=True, value_preview={self.value_preview!r}, raw_score={self.raw_score!r}, confidence={self.confidence!r}, evidence={self.evidence!r}, metadata={dict(self.metadata)!r})"
+        return f"Candidate(field={self.field.value!r}, selector_present=True, value_preview={self.value_preview!r}, raw_score={self.raw_score!r}, confidence={self.confidence!r}, evidence={self.evidence!r}, metadata_keys={tuple(sorted(self.metadata))!r}, metadata_count={len(self.metadata)})"
 
 
 class ExtractionResult:
