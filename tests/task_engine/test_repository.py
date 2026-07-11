@@ -832,3 +832,153 @@ def test_only_cleanup_completion_or_terminal_cancel_clears_gate(tmp_path: Path) 
             task.task_id, TaskStatus.CANCELLED, expected_version=again.version
         )
         assert cancelled.cleanup_required is False
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"busy_timeout_ms": 0}, "busy_timeout_ms"),
+        ({"max_metadata_bytes": 1}, "max_metadata_bytes"),
+        ({"max_error_length": 0}, "max_error_length"),
+    ],
+)
+def test_repository_rejects_unsafe_resource_bounds(
+    tmp_path: Path, kwargs: dict[str, int], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        TaskRepository(tmp_path / "tasks.db", **kwargs)
+
+
+def test_cleanup_gate_repository_rejects_stale_missing_and_invalid_calls(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test")
+        with pytest.raises(TaskInputError, match="cleanup_error_code_required"):
+            repository.require_cleanup(  # type: ignore[arg-type]
+                task.task_id, expected_version=task.version, error_code=None
+            )
+        with pytest.raises(InvalidTaskTransition, match="cleanup_gate_not_allowed"):
+            repository.require_cleanup(
+                task.task_id,
+                expected_version=task.version,
+                error_code="interaction_cleanup_required",
+            )
+        with pytest.raises(TaskNotFound):
+            repository.require_cleanup(
+                "missing",
+                expected_version=0,
+                error_code="interaction_cleanup_required",
+            )
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        with pytest.raises(TaskVersionConflict):
+            repository.require_cleanup(
+                task.task_id,
+                expected_version=task.version,
+                error_code="interaction_cleanup_required",
+            )
+        gated = repository.require_cleanup(
+            task.task_id,
+            expected_version=probing.version,
+            error_code="interaction_cleanup_required",
+        )
+        assert (
+            repository.require_cleanup(
+                task.task_id,
+                expected_version=gated.version,
+                error_code="interaction_cleanup_required",
+            )
+            == gated
+        )
+        with pytest.raises(TaskNotFound):
+            repository.complete_cleanup_gate("missing", expected_version=0)
+        with pytest.raises(TaskVersionConflict):
+            repository.complete_cleanup_gate(task.task_id, expected_version=probing.version)
+        completed = repository.complete_cleanup_gate(task.task_id, expected_version=gated.version)
+        with pytest.raises(InvalidTaskTransition, match="cleanup_gate_not_active"):
+            repository.complete_cleanup_gate(task.task_id, expected_version=completed.version)
+
+
+def test_interaction_lease_rejects_foreign_active_and_invalid_operations(tmp_path: Path) -> None:
+    owner = "a" * 32
+    now = "2030-01-01T00:00:00+00:00"
+    expiry = "2030-01-01T00:10:00+00:00"
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        with pytest.raises(TaskInputError, match="expected_version_invalid"):
+            repository.recover_lost_interaction("missing", expected_version=-1)
+        with pytest.raises(TaskNotFound):
+            repository.recover_lost_interaction("missing", expected_version=0)
+
+        task = repository.create_task("https://example.test")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        with pytest.raises(InvalidTaskTransition, match="interaction_recovery_not_allowed"):
+            repository.recover_lost_interaction(task.task_id, expected_version=probing.version)
+        waiting = repository.transition_to_waiting_with_lease(
+            task.task_id,
+            expected_version=probing.version,
+            owner_id=owner,
+            owner_epoch=1,
+            expires_at=expiry,
+        )
+        with pytest.raises(TaskVersionConflict):
+            repository.recover_lost_interaction(
+                task.task_id, expected_version=probing.version, now=now
+            )
+        with pytest.raises(InvalidTaskTransition, match="interaction_lease_active"):
+            repository.recover_lost_interaction(
+                task.task_id, expected_version=waiting.version, now=now
+            )
+
+        with pytest.raises(TaskNotFound):
+            repository.renew_interaction_lease(
+                "missing",
+                expected_version=0,
+                owner_id=owner,
+                owner_epoch=1,
+                expires_at=expiry,
+            )
+        with pytest.raises(TaskVersionConflict):
+            repository.renew_interaction_lease(
+                task.task_id,
+                expected_version=probing.version,
+                owner_id=owner,
+                owner_epoch=1,
+                expires_at=expiry,
+            )
+        created = repository.create_task("https://other.test")
+        assert (
+            repository.renew_interaction_lease(
+                created.task_id,
+                expected_version=created.version,
+                owner_id=owner,
+                owner_epoch=1,
+                expires_at=expiry,
+            )
+            is False
+        )
+        with pytest.raises(TaskInputError, match="interaction_lease_time_invalid"):
+            repository.list_orphaned_waiting(now="")
+
+
+@pytest.mark.parametrize(
+    ("owner", "epoch", "expiry", "message"),
+    [
+        ("short", 1, "2030-01-01T00:10:00+00:00", "owner_invalid"),
+        ("a" * 32, -1, "2030-01-01T00:10:00+00:00", "epoch_invalid"),
+        ("a" * 32, 1, "bad", "time_invalid"),
+        ("a" * 32, 1, "x" * 20, "time_invalid"),
+        ("a" * 32, 1, "2030-01-01T00:10:00", "time_invalid"),
+    ],
+)
+def test_interaction_lease_input_validation_is_fail_closed(
+    tmp_path: Path, owner: str, epoch: int, expiry: str, message: str
+) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        with pytest.raises(TaskInputError, match=message):
+            repository.transition_to_waiting_with_lease(
+                task.task_id,
+                expected_version=probing.version,
+                owner_id=owner,
+                owner_epoch=epoch,
+                expires_at=expiry,
+            )
