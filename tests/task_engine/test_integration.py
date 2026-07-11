@@ -279,6 +279,49 @@ def test_capture_capacity_one_aborts_second_concurrent_handle(tmp_path: Path) ->
         assert first_secret.encode() not in raw and second_secret.encode() not in raw
 
 
+def test_capacity_abort_cancel_failure_retains_emergency_gate_until_retry(tmp_path: Path) -> None:
+    first_secret = "occupied-private-ticket"
+    second_secret = "emergency-private-ticket"
+
+    class FailsCancelOnce(FakeAdaptive):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail = True
+
+        def cancel(self, ticket):
+            token = ticket.token if isinstance(ticket, VerificationTicket) else ticket
+            self.cancelled.append(token)
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("cancel failed")
+            return AdaptiveResult(ConfigResolution(ResolutionKind.CANCELLED))
+
+    adaptive = FailsCancelOnce()
+    with TaskRepository(tmp_path / "capture-emergency.db") as repo:
+        first = crawling(repo)
+        second = crawling(repo)
+        controller = AdaptiveTaskController(repo, adaptive, max_interactions=1)
+        controller.adopt_acquisition_result(
+            first.task_id,
+            result(ResolutionKind.WAITING_FOR_USER, token=first_secret),
+        )
+        captured = controller.capture_acquisition_result(
+            second.task_id,
+            second.version,
+            lambda: result(ResolutionKind.WAITING_FOR_USER, token=second_secret),
+        )
+        assert captured.status is TaskStatus.RECOVERABLE_FAILED
+        assert captured.cleanup_required is True
+        assert controller.interaction(second.task_id).kind is InteractionKind.CANCEL_PENDING  # type: ignore[union-attr]
+        assert adaptive.cancelled == [second_secret]
+        retried = controller.retry_cleanup(second.task_id)
+        assert retried.status is TaskStatus.CANCELLED
+        assert retried.cleanup_required is False
+        assert adaptive.cancelled == [second_secret, second_secret]
+        raw = (tmp_path / "capture-emergency.db").read_bytes()
+        assert first_secret.encode() not in raw and second_secret.encode() not in raw
+
+
 def test_continue_verification_is_concurrently_idempotent(tmp_path: Path) -> None:
     secret = "verification-secret"
     adaptive = FakeAdaptive(result(ResolutionKind.WAITING_FOR_USER, token=secret), result(ResolutionKind.REUSED))

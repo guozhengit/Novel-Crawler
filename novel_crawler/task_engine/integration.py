@@ -126,6 +126,7 @@ class AdaptiveTaskController:
         self._repository = repository
         self._adaptive = adaptive_service
         self._max_interactions = max_interactions
+        self._max_emergency_cleanup = max_interactions
         self._ttl = interaction_ttl_seconds
         self._monotonic = monotonic
         self._wall_clock = wall_clock
@@ -135,6 +136,7 @@ class AdaptiveTaskController:
         self._lock = threading.RLock()
         self._interactions: OrderedDict[str, _PrivateInteraction] = OrderedDict()
         self._late_resume_status: dict[str, TaskStatus] = {}
+        self._emergency_cleanup_ids: set[str] = set()
         self._probe_flights: dict[str, _ProbeFlight] = {}
         self.recovered_orphans = self._recover_orphaned_waiting()
 
@@ -201,6 +203,8 @@ class AdaptiveTaskController:
             else:
                 return current
         except Exception:
+            if outcome.kind is ResolutionKind.WAITING_FOR_USER:
+                return self._retain_failed_late_cancel(current, outcome)
             compensated = outcome
         if compensated.kind is not ResolutionKind.CLEANUP_REQUIRED:
             return current
@@ -215,6 +219,32 @@ class AdaptiveTaskController:
             )
         except (TaskVersionConflict, InvalidTaskTransition):
             return self._repository.get_task(current.task_id)
+
+    def _retain_failed_late_cancel(
+        self, current: TaskRecord, outcome: AdaptiveResult
+    ) -> TaskRecord:
+        assert outcome.ticket is not None
+        with self._lock:
+            if (
+                current.task_id not in self._emergency_cleanup_ids
+                and len(self._emergency_cleanup_ids) >= self._max_emergency_cleanup
+            ):
+                raise RuntimeError("emergency_cleanup_capacity")
+            self._emergency_cleanup_ids.add(current.task_id)
+        expiry = self._wall_clock() + timedelta(seconds=self._ttl)
+        interaction = _PrivateInteraction(
+            InteractionKind.VERIFICATION,
+            outcome.ticket,
+            InteractionSummary(
+                InteractionKind.VERIFICATION,
+                outcome.ticket.safe_origin,
+                outcome.ticket.attempt,
+                expiry.isoformat(),
+                verification_required=True,
+            ),
+            self._monotonic() + self._ttl,
+        )
+        return self._enter_cancel_pending(current.task_id, current, interaction)
 
     def __repr__(self) -> str:
         with self._lock:
@@ -815,6 +845,7 @@ class AdaptiveTaskController:
     def _drop(self, task_id: str) -> None:
         with self._lock:
             self._interactions.pop(task_id, None)
+            self._emergency_cleanup_ids.discard(task_id)
 
     def _lease_expiry(self) -> str:
         return (self._wall_clock() + timedelta(seconds=self._ttl)).isoformat()
