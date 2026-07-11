@@ -142,7 +142,15 @@ class ApplicationService:
                 raise ApplicationError(_repository_input_code(exc)) from None
             except TaskRepositoryError:
                 raise ApplicationError("task_create_failed", retryable=True) from None
-        return self._safe_task_view(task)
+        try:
+            return self._safe_task_view(task)
+        except ApplicationError as exc:
+            # Persistence and executor submission have already succeeded.  A
+            # secondary checkpoint/interaction projection failure must not
+            # hide the durable task identifier from the caller.
+            if exc.code == "task_view_failed":
+                return self._minimal_task_view(task)
+            raise
 
     def get_task(self, task_id: str) -> TaskView:
         with self._operation():
@@ -720,6 +728,24 @@ class ApplicationService:
             checkpoint_version_total=sum(item.version for item in checkpoints),
             interaction=interaction,
             progress=MappingProxyType(progress),
+        )
+
+    @staticmethod
+    def _minimal_task_view(task: TaskRecord) -> TaskView:
+        return TaskView(
+            task_id=task.task_id,
+            status=task.status.value,
+            version=task.version,
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+            error_code=task.error_code,
+            resume_status=task.resume_status.value if task.resume_status is not None else None,
+            terminal=task.is_terminal,
+            cleanup_required=task.cleanup_required,
+            checkpoint_count=0,
+            checkpoint_version_total=0,
+            interaction=None,
+            progress=MappingProxyType({}),
         )
 
     def _compensate_submission(self, task: TaskRecord, code: str) -> TaskRecord:

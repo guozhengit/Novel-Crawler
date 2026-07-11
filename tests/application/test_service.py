@@ -966,7 +966,7 @@ def test_close_retries_failed_controller_before_closing_downstream_resources(tmp
 
 
 @pytest.mark.parametrize("source", ["checkpoints", "interaction", "serialization"])
-def test_task_view_dependency_failures_map_to_stable_traceable_error(tmp_path: Path, source: str) -> None:
+def test_created_task_view_dependency_failures_return_minimal_traceable_view(tmp_path: Path, source: str) -> None:
     class BrokenRepository(TaskRepository):
         def list_checkpoints(self, task_id: str):
             if source == "checkpoints":
@@ -989,14 +989,41 @@ def test_task_view_dependency_failures_map_to_stable_traceable_error(tmp_path: P
     executor = FakeExecutor(repo)
     service = ApplicationService(repo, executor, controller=BrokenController())
 
-    with pytest.raises(ApplicationError) as created:
-        service.create_crawl_task("https://example.com", {})
-    assert created.value.code == "task_view_failed"
-    assert created.value.retryable is True
-    assert created.value.task_id is not None
+    created = service.create_crawl_task("https://example.com", {})
+    assert created.task_id
+    assert created.status == "created"
+    assert created.interaction is None
+    assert created.checkpoint_count == 0
+    assert created.checkpoint_version_total == 0
+    assert dict(created.progress) == {}
     assert len(repo.list_tasks()) == 1
-    assert executor.submitted == [created.value.task_id]
-    assert "secret" not in repr(created.value).casefold()
+    assert executor.submitted == [created.task_id]
+    assert "secret" not in repr(created).casefold()
+    with pytest.raises(ApplicationError, match="task_view_failed"):
+        service.get_task(created.task_id)
+    service.close()
+
+
+def test_batch_reports_created_and_submitted_when_full_view_dependencies_fail(tmp_path: Path) -> None:
+    class BrokenRepository(TaskRepository):
+        def list_checkpoints(self, task_id: str):
+            raise RuntimeError("token=secret C:\\private")
+
+    repo = BrokenRepository(tmp_path / "batch-minimal-view.db")
+    executor = FakeExecutor(repo)
+    service = ApplicationService(repo, executor)
+    source = tmp_path / "urls.txt"
+    source.write_text("https://one.test/book\n", encoding="utf-8")
+
+    result = service.create_crawl_tasks_from_file(source)
+
+    assert result["created"] == 1
+    assert result["submitted"] == 1
+    assert result["failed"] == 0
+    assert result["not_started"] == 0
+    assert len(result["tasks"]) == 1
+    assert result["tasks"][0]["status"] == "created"
+    assert "secret" not in repr(result).casefold()
     service.close()
 
 
