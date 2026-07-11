@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 _SAFE_COUNT = re.compile(r"[a-z][a-z0-9_]{0,39}")
@@ -30,8 +32,9 @@ def safe_origin(url: str | None) -> str:
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return "redacted"
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
         port = f":{parsed.port}" if parsed.port is not None else ""
-        return f"{parsed.scheme}://{parsed.hostname}{port}"
+        return urlunsplit((parsed.scheme, f"{host}{port}", "", "", ""))
     except ValueError:
         return "redacted"
 
@@ -41,7 +44,7 @@ class Diagnostic:
     codes: tuple[DiagnosticCode, ...]
     evidence_ids: tuple[str, ...] = ()
     origin: str = "redacted"
-    counts: dict[str, int] | None = None
+    counts: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         codes = tuple(self.codes)
@@ -57,7 +60,7 @@ class Diagnostic:
             raise ValueError("counts must be non-negative integers with safe keys")
         object.__setattr__(self, "codes", codes)
         object.__setattr__(self, "evidence_ids", evidence)
-        object.__setattr__(self, "counts", counts)
+        object.__setattr__(self, "counts", MappingProxyType(counts))
 
     def to_dict(self) -> dict[str, Any]:
         return {

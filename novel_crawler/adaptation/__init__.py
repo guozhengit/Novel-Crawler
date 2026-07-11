@@ -1,6 +1,6 @@
 """Candidate extraction primitives for scored site adaptation."""
 
-from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, FieldDecision
+from .decision import AdaptationDecision, DecisionConfig, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
 from .diagnostics import Diagnostic, DiagnosticCode
 from .extractor import CandidateExtractor, ExtractionRule, ExtractorConfig
 from .models import Candidate, Evidence, ExtractionResult, FieldKind
@@ -20,6 +20,7 @@ __all__ = [
     "AdaptationDecision",
     "Candidate",
     "DecisionKind",
+    "DecisionConfig",
     "DecisionPolicy",
     "Diagnostic",
     "DiagnosticCode",
@@ -39,4 +40,5 @@ __all__ = [
     "ScoringConfig",
     "ScoringContext",
     "ScoringRule",
+    "ScoredPageBatch",
 ]
