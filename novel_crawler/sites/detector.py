@@ -37,6 +37,7 @@ CHAPTER_LIST_SELECTORS = [
 
 CHAPTER_TEXT_RE = re.compile(r"(第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节回卷集]|chapter\s*\d+)", re.I)
 CHAPTER_HREF_RE = re.compile(r"(/|^)(chapter|chap|read)?[_/-]?\d+\.(html?|xhtml)$|/\d+/?$", re.I)
+CLEAN_TEXT_PHRASES = ("请收藏本站", "最新网址", "手机阅读", "加入书签")
 
 
 @dataclass
@@ -72,7 +73,7 @@ class SiteInspection:
             },
             "clean": {
                 "remove_selectors": ["script", "style", ".ad", ".ads", "iframe"],
-                "remove_text_contains": ["请收藏本站", "最新网址", "手机阅读", "加入书签"],
+                "remove_text_contains": list(CLEAN_TEXT_PHRASES),
             },
         }
 

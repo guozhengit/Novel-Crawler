@@ -66,7 +66,7 @@ class Fetcher:
                 if self.proxy_pool and proxy:
                     self.proxy_pool.record_fail(proxy)
             time.sleep(random.uniform(self.options.retry_backoff_min, self.options.retry_backoff_max) * (attempt + 1))
-        raise RuntimeError(f"fetch failed: {url}: {last_error}")
+        raise RuntimeError(f"抓取失败：{url}：{last_error}")
 
     def _select_proxy(self) -> dict[str, str] | None:
         if self.proxy_pool:
@@ -84,7 +84,7 @@ class Fetcher:
                 raise
         if self.enable_playwright:
             return self.fetch_text_with_browser(url)
-        raise RuntimeError(f"fetch returned empty content: {url}")
+        raise RuntimeError(f"抓取内容为空：{url}")
 
     def fetch_text_with_browser(self, url: str) -> str:
         try:
