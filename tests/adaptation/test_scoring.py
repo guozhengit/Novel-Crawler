@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -12,6 +12,7 @@ from novel_crawler.acquisition.models import PageSnapshot
 from novel_crawler.adaptation.extractor import CandidateExtractor
 from novel_crawler.adaptation.models import Candidate, Evidence, FieldKind
 from novel_crawler.adaptation.scoring import (
+    CandidateIdentity,
     CandidateScorer,
     ScoreComponent,
     ScoredCandidate,
@@ -37,6 +38,10 @@ def test_context_requires_real_snapshot_and_results_do_not_retain_derived_conten
     scored = CandidateScorer().score(item(FieldKind.TITLE, "h1"), context)
     assert scored.score > 0 and scored.confidence == scored.score
     assert "Private Book Title" not in repr(scored)
+    assert "Private Book Title" not in repr(context)
+    assert "Private Book Title" not in str(context)
+    with pytest.raises(TypeError):
+        asdict(context)  # type: ignore[arg-type]
     assert scored.calibration_id == "heuristic-v1"
     with pytest.raises(TypeError):
         ScoringContext(PageKind.CHAPTER, {})  # type: ignore[arg-type]
@@ -118,8 +123,10 @@ def test_component_weights_form_exact_normalized_mean() -> None:
         rule_id = "title.custom"
         field = FieldKind.TITLE
 
-        def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> tuple[ScoreComponent, ...]:
-            del candidate, features, config
+        def components(self, identity: CandidateIdentity, features: object) -> tuple[ScoreComponent, ...]:
+            assert identity == CandidateIdentity(FieldKind.TITLE, "h1")
+            assert not hasattr(identity, "metadata") and not hasattr(identity, "raw_score") and not hasattr(identity, "evidence")
+            del features
             return (ScoreComponent("title.low", 0, 1), ScoreComponent("title.high", 1, 3))
 
     scored = CandidateScorer([FixedRule()]).score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, snapshot("<h1>x</h1>")))
@@ -152,8 +159,8 @@ def test_rule_registry_and_malformed_outputs_fail_stably() -> None:
         def __init__(self, result: object) -> None:
             self.result = result
 
-        def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> object:
-            del candidate, features, config
+        def components(self, identity: CandidateIdentity, features: object) -> object:
+            del identity, features
             return self.result
 
     with pytest.raises(ValueError, match="duplicate scoring field"):
@@ -177,3 +184,39 @@ def test_config_is_versioned_and_score_model_rejects_invalid_values() -> None:
         ScoreComponent("title.x", float("nan"), 1)
     with pytest.raises(ValueError):
         ScoredCandidate(item(FieldKind.TITLE, "h1"), 2, (), "heuristic-v1", "v1")
+
+
+def test_identity_is_frozen_and_selector_is_safe() -> None:
+    identity = CandidateIdentity(FieldKind.CONTENT, "article.chapter-content")
+    with pytest.raises(FrozenInstanceError):
+        identity.selector = "body"  # type: ignore[misc]
+    for selector in ("", "https://private.test", "a[href*='token=secret']"):
+        with pytest.raises(ValueError):
+            CandidateIdentity(FieldKind.CONTENT, selector)
+    with pytest.raises(TypeError):
+        CandidateIdentity("content", "article")  # type: ignore[arg-type]
+
+
+def test_chapter_continuity_requires_adjacent_numbers() -> None:
+    scorer = CandidateScorer()
+
+    def continuity(html: str) -> float:
+        scored = scorer.score(item(FieldKind.CHAPTER_LIST, "nav a"), ScoringContext(PageKind.BOOK_INDEX, snapshot(html)))
+        return next(component.score for component in scored.components if component.rule_id == "chapter_list.continuity")
+
+    adjacent = "<nav><a href='/1'>Chapter 1</a><a href='/2'>Chapter 2</a><a href='/3'>Chapter 3</a></nav>"
+    jumped = "<nav><a href='/1'>Chapter 1</a><a href='/99'>Chapter 99</a></nav>"
+    volume_boundary = "<nav><a href='/1'>Book 1 Chapter 1</a><a href='/2'>Book 2 Chapter 1</a></nav>"
+    assert continuity(adjacent) == 1
+    assert continuity(jumped) == 0
+    assert 0 <= continuity(volume_boundary) <= 1
+
+
+def test_remaining_validation_boundaries_are_stable() -> None:
+    with pytest.raises(ValueError):
+        ScoringConfig(target_paragraphs=0)
+    for score, weight in ((-0.1, 1), (1.1, 1), (0.5, 0), (0.5, float("inf"))):
+        with pytest.raises(ValueError):
+            ScoreComponent("title.boundary", score, weight)
+    with pytest.raises(TypeError):
+        ScoringContext("chapter", snapshot(""))  # type: ignore[arg-type]

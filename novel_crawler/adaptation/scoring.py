@@ -10,7 +10,7 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeAlias, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
@@ -32,16 +32,39 @@ _NAV_TEXT = {
     FieldKind.NEXT_LINK: re.compile(r"^(?:下一[章节页]?|后一[章节页]?|next(?:\s+chapter)?)$", re.I),
     FieldKind.INDEX_LINK: re.compile(r"^(?:目录|章节列表|返回书页|table\s+of\s+contents|contents|index)$", re.I),
 }
+_UNSAFE_SELECTOR = re.compile(r"(?:https?://|[?&]|token|secret|session|password)", re.I)
+
+
+class ScoringContext:
+    """Ephemeral scoring input whose representation never includes response data."""
+
+    __slots__ = ("page_kind", "_snapshot")
+
+    def __init__(self, page_kind: PageKind, snapshot: PageSnapshot) -> None:
+        if not isinstance(page_kind, PageKind) or not isinstance(snapshot, PageSnapshot):
+            raise TypeError("ScoringContext requires PageKind and PageSnapshot")
+        self.page_kind = page_kind
+        self._snapshot = snapshot
+
+    def __repr__(self) -> str:
+        snapshot = self._snapshot
+        origin = urlsplit(snapshot.final_url)
+        safe_origin = f"{origin.scheme}://{origin.netloc}" if origin.scheme and origin.netloc else "redacted"
+        return f"ScoringContext(page_kind={self.page_kind.value!r}, origin={safe_origin!r}, method={snapshot.method!r}, status={snapshot.status_code})"
 
 
 @dataclass(frozen=True)
-class ScoringContext:
-    page_kind: PageKind
-    snapshot: PageSnapshot
+class CandidateIdentity:
+    """Only candidate information a pluggable scoring rule may observe."""
+
+    field: FieldKind
+    selector: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.page_kind, PageKind) or not isinstance(self.snapshot, PageSnapshot):
-            raise TypeError("ScoringContext requires PageKind and PageSnapshot")
+        if not isinstance(self.field, FieldKind):
+            raise TypeError("field must be FieldKind")
+        if not self.selector or len(self.selector) > 512 or _UNSAFE_SELECTOR.search(self.selector):
+            raise ValueError("selector must be bounded and free of URLs or query-like secrets")
 
 
 @dataclass(frozen=True)
@@ -109,20 +132,46 @@ ScorerConfig = ScoringConfig
 
 
 @dataclass(frozen=True)
-class _Features:
+class HeadingFeatures:
     valid: bool
     tag: str = ""
     text_length: int = 0
     semantic: float = 0
+
+
+@dataclass(frozen=True)
+class ChapterListFeatures:
+    valid: bool
     count: int = 0
     continuity: float = 0
     same_origin: float = 0
     precision: float = 0
+
+
+@dataclass(frozen=True)
+class ContentFeatures:
+    valid: bool
+    text_length: int = 0
     paragraphs: int = 0
     link_density: float = 1
     clean_ratio: float = 0
+
+
+@dataclass(frozen=True)
+class NavigationFeatures:
+    valid: bool
+    semantic: float = 0
     rel: float = 0
     order: float = 0
+
+
+@dataclass(frozen=True)
+class CleanFeatures:
+    valid: bool
+    semantic: float = 0
+
+
+FieldFeatures: TypeAlias = HeadingFeatures | ChapterListFeatures | ContentFeatures | NavigationFeatures | CleanFeatures
 
 
 @runtime_checkable
@@ -133,34 +182,41 @@ class ScoringRule(Protocol):
     @property
     def field(self) -> FieldKind: ...
 
-    def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> tuple[ScoreComponent, ...]: ...
+    def components(self, identity: CandidateIdentity, features: FieldFeatures) -> tuple[ScoreComponent, ...]: ...
 
 
 @dataclass(frozen=True)
 class _BuiltinRule:
     field: FieldKind
+    config: ScoringConfig
 
     @property
     def rule_id(self) -> str:
         return f"{self.field.value}.builtin"
 
-    def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> tuple[ScoreComponent, ...]:
-        del candidate
-        f = features if isinstance(features, _Features) else _Features(False)
+    def components(self, identity: CandidateIdentity, features: FieldFeatures) -> tuple[ScoreComponent, ...]:
+        del identity
         prefix = self.field.value
         if self.field is FieldKind.TITLE:
-            return (_component(prefix, "semantic", f.semantic, 3), _component(prefix, "dom", _tag_score(f.tag, {"h1": 1, "title": 0.7, "h2": 0.5}), 2), _component(prefix, "length", _length_score(f.text_length, 2, 80), 1))
+            heading = features if isinstance(features, HeadingFeatures) else HeadingFeatures(False)
+            return (_component(prefix, "semantic", heading.semantic, 3), _component(prefix, "dom", _tag_score(heading.tag, {"h1": 1, "title": 0.7, "h2": 0.5}), 2), _component(prefix, "length", _length_score(heading.text_length, 2, 80), 1))
         if self.field is FieldKind.AUTHOR:
-            return (_component(prefix, "semantic", f.semantic, 4), _component(prefix, "length", _length_score(f.text_length, 2, 64), 1))
+            author = features if isinstance(features, HeadingFeatures) else HeadingFeatures(False)
+            return (_component(prefix, "semantic", author.semantic, 4), _component(prefix, "length", _length_score(author.text_length, 2, 64), 1))
         if self.field is FieldKind.CHAPTER_TITLE:
-            return (_component(prefix, "semantic", f.semantic, 4), _component(prefix, "dom", _tag_score(f.tag, {"h1": 1, "h2": 0.6, "title": 0.5}), 2), _component(prefix, "length", _length_score(f.text_length, 2, 100), 1))
+            chapter_title = features if isinstance(features, HeadingFeatures) else HeadingFeatures(False)
+            return (_component(prefix, "semantic", chapter_title.semantic, 4), _component(prefix, "dom", _tag_score(chapter_title.tag, {"h1": 1, "h2": 0.6, "title": 0.5}), 2), _component(prefix, "length", _length_score(chapter_title.text_length, 2, 100), 1))
         if self.field is FieldKind.CHAPTER_LIST:
-            return (_component(prefix, "count", min(1, f.count / config.target_chapter_links), 2), _component(prefix, "continuity", f.continuity, 3), _component(prefix, "same_origin", f.same_origin, 1), _component(prefix, "selector_precision", f.precision, 4))
+            chapter_list = features if isinstance(features, ChapterListFeatures) else ChapterListFeatures(False)
+            return (_component(prefix, "count", min(1, chapter_list.count / self.config.target_chapter_links), 2), _component(prefix, "continuity", chapter_list.continuity, 3), _component(prefix, "same_origin", chapter_list.same_origin, 1), _component(prefix, "selector_precision", chapter_list.precision, 4))
         if self.field is FieldKind.CONTENT:
-            return (_component(prefix, "length", min(1, f.text_length / config.target_content_chars), 2), _component(prefix, "paragraphs", min(1, f.paragraphs / config.target_paragraphs), 2), _component(prefix, "link_density", max(0, 1 - f.link_density * 3), 3), _component(prefix, "cleanliness", f.clean_ratio, 5))
+            content = features if isinstance(features, ContentFeatures) else ContentFeatures(False)
+            return (_component(prefix, "length", min(1, content.text_length / self.config.target_content_chars), 2), _component(prefix, "paragraphs", min(1, content.paragraphs / self.config.target_paragraphs), 2), _component(prefix, "link_density", max(0, 1 - content.link_density * 3) if content.valid else 0, 3), _component(prefix, "cleanliness", content.clean_ratio, 5))
         if self.field in _NAV_TEXT:
-            return (_component(prefix, "rel", f.rel, 3), _component(prefix, "text", f.semantic, 2), _component(prefix, "order", f.order, 1))
-        return (_component(prefix, "noise_marker", f.semantic, 1),)
+            navigation = features if isinstance(features, NavigationFeatures) else NavigationFeatures(False)
+            return (_component(prefix, "rel", navigation.rel, 3), _component(prefix, "text", navigation.semantic, 2), _component(prefix, "order", navigation.order, 1))
+        clean = features if isinstance(features, CleanFeatures) else CleanFeatures(False)
+        return (_component(prefix, "noise_marker", clean.semantic, 1),)
 
 
 def _component(prefix: str, name: str, score: float, weight: float) -> ScoreComponent:
@@ -182,7 +238,7 @@ class CandidateScorer:
 
     def __init__(self, rules: Sequence[ScoringRule] | None = None, config: ScoringConfig | None = None) -> None:
         self.config = config or ScoringConfig()
-        values: tuple[ScoringRule, ...] = tuple(rules) if rules is not None else tuple(_BuiltinRule(field) for field in FieldKind)
+        values: tuple[ScoringRule, ...] = tuple(rules) if rules is not None else tuple(_BuiltinRule(field, self.config) for field in FieldKind)
         if not values or not all(isinstance(rule, ScoringRule) for rule in values):
             raise TypeError("rules must be a nonempty sequence of ScoringRule")
         seen: set[FieldKind] = set()
@@ -199,7 +255,8 @@ class CandidateScorer:
         if rule is None:
             raise ValueError(f"no scoring rule for field {candidate.field.value}")
         features = self._derive(candidate, context)
-        raw = rule.components(candidate, features, self.config)
+        identity = CandidateIdentity(candidate.field, candidate.selector)
+        raw = rule.components(identity, features)
         if not isinstance(raw, tuple) or not raw or not all(isinstance(value, ScoreComponent) for value in raw):
             raise ValueError("components must be a nonempty tuple of ScoreComponent")
         ids = [value.rule_id for value in raw]
@@ -216,71 +273,83 @@ class CandidateScorer:
         return tuple(sorted((self.score(candidate, context) for candidate in candidates), key=lambda value: (-value.score, value.candidate.selector)))
 
     @staticmethod
-    def _derive(candidate: Candidate, context: ScoringContext) -> _Features:
-        soup = BeautifulSoup(context.snapshot.html, "lxml")
+    def _derive(candidate: Candidate, context: ScoringContext) -> FieldFeatures:
+        soup = BeautifulSoup(context._snapshot.html, "lxml")
         try:
             nodes = soup.select(candidate.selector)
         except Exception:
-            return _Features(False)
+            return _empty_features(candidate.field)
         tags = [node for node in nodes if isinstance(node, Tag)]
         if not tags:
-            return _Features(False)
+            return _empty_features(candidate.field)
         return _field_features(candidate.field, tags, context, soup)
 
 
-def _field_features(field: FieldKind, nodes: list[Tag], context: ScoringContext, soup: BeautifulSoup) -> _Features:
+def _empty_features(field: FieldKind) -> FieldFeatures:
+    if field in {FieldKind.TITLE, FieldKind.AUTHOR, FieldKind.CHAPTER_TITLE}:
+        return HeadingFeatures(False)
+    if field is FieldKind.CHAPTER_LIST:
+        return ChapterListFeatures(False)
+    if field is FieldKind.CONTENT:
+        return ContentFeatures(False)
+    if field in _NAV_TEXT:
+        return NavigationFeatures(False)
+    return CleanFeatures(False)
+
+
+def _field_features(field: FieldKind, nodes: list[Tag], context: ScoringContext, soup: BeautifulSoup) -> FieldFeatures:
     text = " ".join(node.get_text(" ", strip=True) for node in nodes).strip()
     first = nodes[0]
     tag = first.name
     if field is FieldKind.TITLE:
         valid = len(nodes) == 1 and tag in {"h1", "h2", "title"}
-        return _Features(valid, tag, len(text), float(valid and context.page_kind is not PageKind.CHAPTER)) if valid else _Features(False)
+        return HeadingFeatures(valid, tag, len(text), float(valid and context.page_kind is not PageKind.CHAPTER)) if valid else HeadingFeatures(False)
     if field is FieldKind.AUTHOR:
         semantic = float(len(nodes) == 1 and bool(_AUTHOR.search(text)))
-        return _Features(bool(semantic), tag, len(text), semantic) if semantic else _Features(False)
+        return HeadingFeatures(bool(semantic), tag, len(text), semantic) if semantic else HeadingFeatures(False)
     if field is FieldKind.CHAPTER_TITLE:
         semantic = float(len(nodes) == 1 and tag in {"h1", "h2", "title"} and bool(_CHAPTER.search(text)))
-        return _Features(bool(semantic), tag, len(text), semantic) if semantic else _Features(False)
+        return HeadingFeatures(bool(semantic), tag, len(text), semantic) if semantic else HeadingFeatures(False)
     if field is FieldKind.CHAPTER_LIST:
         if any(node.name != "a" for node in nodes):
-            return _Features(False)
+            return ChapterListFeatures(False)
         chapter_flags = [bool(_CHAPTER.search(node.get_text(" ", strip=True))) for node in nodes]
         count = sum(chapter_flags)
         if count == 0:
-            return _Features(False)
+            return ChapterListFeatures(False)
         precision = count / len(nodes)
-        origins = [urlsplit(urljoin(context.snapshot.final_url, str(node.get("href", "")))).netloc for node in nodes]
-        base = urlsplit(context.snapshot.final_url).netloc
+        origins = [urlsplit(urljoin(context._snapshot.final_url, str(node.get("href", "")))).netloc for node in nodes]
+        base = urlsplit(context._snapshot.final_url).netloc
         same = sum(origin == base for origin in origins) / len(origins)
         continuity = _continuity(nodes, chapter_flags)
-        return _Features(True, tag, len(text), precision, count, continuity, same, precision)
+        return ChapterListFeatures(True, count, continuity, same, precision)
     if field is FieldKind.CONTENT:
         if len(nodes) != 1 or tag not in {"article", "main", "section", "div"} or _is_noise(first):
-            return _Features(False)
+            return ContentFeatures(False)
         total_text = first.get_text(" ", strip=True)
         noise_length = sum(len(node.get_text(" ", strip=True)) for node in first.find_all(_is_noise))
         clean_length = max(0, len(total_text) - noise_length)
         paragraphs = sum(1 for node in first.find_all("p") if not any(_is_noise(parent) for parent in node.parents if isinstance(parent, Tag)))
         if clean_length < 45 or paragraphs == 0:
-            return _Features(False)
+            return ContentFeatures(False)
         link_length = sum(len(node.get_text(" ", strip=True)) for node in first.find_all("a"))
         density = link_length / max(1, len(total_text))
         clean_ratio = clean_length / max(1, len(total_text))
-        return _Features(True, tag, clean_length, 1, paragraphs=paragraphs, link_density=density, clean_ratio=clean_ratio)
+        return ContentFeatures(True, clean_length, paragraphs, density, clean_ratio)
     if field in _NAV_TEXT:
         if len(nodes) != 1 or tag != "a":
-            return _Features(False)
+            return NavigationFeatures(False)
         rels = {str(value).casefold() for value in first.get("rel", [])}
         expected = field.value.removesuffix("_link")
         rel = float(expected in rels)
         semantic = float(bool(_NAV_TEXT[field].fullmatch(text)))
         if not rel and not semantic:
-            return _Features(False)
+            return NavigationFeatures(False)
         anchors = soup.find_all("a")
         order = float(first in anchors and (field is FieldKind.INDEX_LINK or len(anchors) > 1))
-        return _Features(True, tag, len(text), semantic, rel=rel, order=order)
+        return NavigationFeatures(True, semantic, rel, order)
     semantic = float(any(_is_noise(node) for node in nodes))
-    return _Features(bool(semantic), tag, len(text), semantic)
+    return CleanFeatures(bool(semantic), semantic)
 
 
 def _is_noise(node: Tag) -> bool:
@@ -300,5 +369,7 @@ def _continuity(nodes: list[Tag], flags: list[bool]) -> float:
             numbers.append(int(match.group()))
     if len(numbers) < 2:
         return 1.0
-    adjacent = sum(right > left for left, right in zip(numbers, numbers[1:], strict=False))
+    # Decimal chapter labels and volume resets are intentionally neutral until
+    # a future calibration can distinguish them without content leakage.
+    adjacent = sum(right - left == 1 for left, right in zip(numbers, numbers[1:], strict=False))
     return adjacent / (len(numbers) - 1)
