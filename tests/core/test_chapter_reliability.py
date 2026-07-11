@@ -532,6 +532,107 @@ def test_delete_preflights_orphan_symlink_before_changing_files_or_database(tmp_
         storage.close()
 
 
+def test_delete_outbox_commits_before_cleanup_and_blocks_late_mark_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    other = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    storage.mark_done(book_id, chapter, "body")
+    committed = threading.Event()
+    release = threading.Event()
+    original = storage._process_deletion_job
+
+    def pause_after_commit(job_id: int) -> bool:
+        committed.set()
+        assert release.wait(5)
+        return original(job_id)
+
+    monkeypatch.setattr(storage, "_process_deletion_job", pause_after_commit)
+    thread = threading.Thread(target=storage.delete_book, args=(book_id,))
+    thread.start()
+    assert committed.wait(5)
+    with pytest.raises(KeyError, match="chapter not found"):
+        other.mark_done(book_id, chapter, "late body")
+    release.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert storage.conn.execute("SELECT COUNT(*) FROM deletion_jobs").fetchone()[0] == 0
+    other.close()
+    storage.close()
+
+
+def test_pending_delete_job_recovers_after_commit_cleanup_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    path = storage.mark_done(book_id, chapter, "body")
+
+    def crash(_job_id: int) -> bool:
+        raise KeyboardInterrupt("cleanup process crashed")
+
+    monkeypatch.setattr(storage, "_process_deletion_job", crash)
+    with pytest.raises(KeyboardInterrupt, match="cleanup process crashed"):
+        storage.delete_book(book_id)
+    assert storage.conn.execute("SELECT COUNT(*) FROM books WHERE id=?", (book_id,)).fetchone()[0] == 0
+    assert storage.conn.execute("SELECT state FROM deletion_jobs").fetchone()[0] == "pending"
+    assert path.exists()
+    storage.close()
+
+    reopened = Storage(data / "crawler.db", data)
+    try:
+        assert not path.exists()
+        assert reopened.conn.execute("SELECT COUNT(*) FROM deletion_jobs").fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+def test_unified_delete_derives_renamed_legacy_tree_from_recorded_path(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    original = Book(title="old-name", url="https://example.test/book", site="site")
+    book_id = storage.upsert_book(original)
+    legacy = data / "contents" / "old-name"
+    legacy.mkdir(parents=True)
+    recorded = legacy / "00001.txt"
+    recorded.write_text("body", encoding="utf-8")
+    (legacy / ".orphan.tmp").write_text("partial", encoding="utf-8")
+    storage.conn.execute(
+        "INSERT INTO chapters(book_id,chapter_index,title,url,canonical_url,status,content_path) VALUES(?,1,'x','https://example.test/1','https://example.test/1','done',?)",
+        (book_id, str(recorded)),
+    )
+    storage.conn.commit()
+    storage.upsert_book(Book(title="new-name", url=original.url, site=original.site))
+    storage.delete_book(book_id)
+    assert not legacy.exists()
+    assert storage.conn.execute("SELECT COUNT(*) FROM deletion_jobs").fetchone()[0] == 0
+    storage.close()
+
+
+def test_unified_delete_rejects_unsafe_manifest_before_database_commit(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    outside = tmp_path / "private.txt"
+    outside.write_text("private", encoding="utf-8")
+    storage.conn.execute(
+        "INSERT INTO chapters(book_id,chapter_index,title,url,canonical_url,status,content_path) VALUES(?,1,'x','https://example.test/1','https://example.test/1','done',?)",
+        (book_id, str(outside)),
+    )
+    storage.conn.commit()
+    with pytest.raises(ValueError, match="content_path_outside_root"):
+        storage.delete_book(book_id)
+    assert storage.get_book(book_id).book_id == book_id
+    assert storage.conn.execute("SELECT COUNT(*) FROM deletion_jobs").fetchone()[0] == 0
+    assert outside.read_text(encoding="utf-8") == "private"
+    storage.close()
+
+
 def test_secure_content_delete_rejects_paths_outside_root(tmp_path: Path) -> None:
     root = tmp_path / "root"
     outside = tmp_path / "outside"

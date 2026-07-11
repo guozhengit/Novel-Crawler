@@ -86,18 +86,6 @@ class CrawlerService:
         return self.storage.list_books()
 
     def delete_book(self, book_id: int) -> None:
-        try:
-            book = self.storage.get_book(book_id)
-        except KeyError:
-            self.storage.delete_book(book_id)
-            return
-        cache_dir = self.ctx.cache_dir / book.site / safe_filename(book.title)
-        delete_cache = not self.storage.has_other_book(book_id, book.title, site=book.site)
-        if delete_cache:
-            self.storage.validate_tree_under(self.ctx.cache_dir, cache_dir)
-        self.storage.delete_book_content(book_id, book.title)
-        if delete_cache:
-            self.storage.remove_tree_under(self.ctx.cache_dir, cache_dir)
         self.storage.delete_book(book_id)
 
     def validate(self, book_id: int) -> ValidationReport:

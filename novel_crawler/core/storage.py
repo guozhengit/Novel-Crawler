@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import re
@@ -29,6 +30,8 @@ _SAFE_ERROR_CODES = frozenset(
         "source_fetch_failed",
     }
 )
+_MAX_DELETION_PATHS = 10_000
+_MAX_DELETION_MANIFEST_BYTES = 1_048_576
 
 
 class ChapterContentConflict(RuntimeError):
@@ -97,6 +100,7 @@ class Storage:
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.init_schema()
+        self._retry_deletion_jobs()
 
     def close(self) -> None:
         with self._lock:
@@ -155,6 +159,14 @@ class Storage:
                     discarded_content_path TEXT,
                     discarded_content_hash TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS deletion_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_json TEXT NOT NULL CHECK(length(manifest_json) <= 1048576),
+                    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'blocked')),
+                    error_code TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 """
             )
@@ -439,11 +451,157 @@ class Storage:
         return [dict(row) for row in rows]
 
     def delete_book(self, book_id: int) -> None:
+        job_id: int | None = None
         with self._lock:
-            self.conn.execute("DELETE FROM chapters WHERE book_id=?", (book_id,))
-            self.conn.execute("DELETE FROM download_logs WHERE book_id=?", (book_id,))
-            self.conn.execute("DELETE FROM books WHERE id=?", (book_id,))
-            self.conn.commit()
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                book = self.conn.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
+                if book is not None:
+                    manifest = self._build_deletion_manifest_locked(book_id, book)
+                    encoded = json.dumps(manifest, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+                    if len(encoded.encode("utf-8")) > _MAX_DELETION_MANIFEST_BYTES:
+                        raise ValueError("deletion_manifest_too_large")
+                    self._decode_deletion_manifest(encoded)
+                    cursor = self.conn.execute(
+                        "INSERT INTO deletion_jobs(manifest_json, state) VALUES(?, 'pending')", (encoded,)
+                    )
+                    job_id = int(cursor.lastrowid)
+                self.conn.execute("DELETE FROM chapters WHERE book_id=?", (book_id,))
+                self.conn.execute("DELETE FROM download_logs WHERE book_id=?", (book_id,))
+                self.conn.execute("DELETE FROM books WHERE id=?", (book_id,))
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
+        if job_id is not None:
+            self._process_deletion_job(job_id)
+
+    def _build_deletion_manifest_locked(self, book_id: int, book: sqlite3.Row) -> dict[str, object]:
+        content_root = self.data_dir / "contents"
+        cache_root = self.data_dir / "cache"
+        rows = self.conn.execute(
+            "SELECT content_path FROM chapters WHERE book_id=? AND content_path IS NOT NULL", (book_id,)
+        ).fetchall()
+        other_rows = self.conn.execute(
+            "SELECT content_path FROM chapters WHERE book_id!=? AND content_path IS NOT NULL", (book_id,)
+        ).fetchall()
+        other_books = self.conn.execute("SELECT title, site FROM books WHERE id!=?", (book_id,)).fetchall()
+        paths = [self._validate_content_path(content_root, Path(str(row["content_path"]))) for row in rows]
+        shared_keys = {
+            key
+            for row in other_rows
+            if (key := self._content_path_key(content_root, Path(str(row["content_path"])))) is not None
+        }
+        files = sorted(
+            {str(path) for path in paths if self._content_path_key(content_root, path) not in shared_keys}
+        )
+        tree_candidates = {self.chapter_content_dir(book_id, str(book["title"]))}
+        content_root_resolved = content_root.resolve(strict=False)
+        other_title_keys = {safe_filename(str(row["title"])) for row in other_books}
+        for path in paths:
+            relative = path.resolve(strict=False).relative_to(content_root_resolved)
+            if len(relative.parts) < 2:
+                continue
+            parent = content_root / relative.parts[0]
+            if parent == self.chapter_content_dir(book_id, str(book["title"])) or parent.name not in other_title_keys:
+                tree_candidates.add(parent)
+        content_trees: list[str] = []
+        for tree in sorted(tree_candidates, key=str):
+            self.validate_tree_under(content_root, tree)
+            if not any(self._key_is_under_tree(key, tree.resolve(strict=False)) for key in shared_keys):
+                content_trees.append(str(Path(os.path.abspath(tree))))
+
+        cache_tree = cache_root / str(book["site"]) / safe_filename(str(book["title"]))
+        cache_trees: list[str] = []
+        cache_shared = any(
+            str(row["site"]) == str(book["site"])
+            and safe_filename(str(row["title"])) == safe_filename(str(book["title"]))
+            for row in other_books
+        )
+        if not cache_shared:
+            self.validate_tree_under(cache_root, cache_tree)
+            cache_trees.append(str(Path(os.path.abspath(cache_tree))))
+        count = len(files) + len(content_trees) + len(cache_trees)
+        if count > _MAX_DELETION_PATHS:
+            raise ValueError("deletion_manifest_too_many_paths")
+        return {"cache_trees": cache_trees, "content_files": files, "content_trees": content_trees, "version": 1}
+
+    def _retry_deletion_jobs(self) -> None:
+        processed = 0
+        while processed < 10_000:
+            with self._lock:
+                rows = self.conn.execute(
+                    "SELECT id FROM deletion_jobs WHERE state='pending' ORDER BY id LIMIT 1000"
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                self._process_deletion_job(int(row["id"]))
+                processed += 1
+
+    def _process_deletion_job(self, job_id: int) -> bool:
+        try:
+            with self._lock:
+                row = self.conn.execute(
+                    "SELECT manifest_json FROM deletion_jobs WHERE id=? AND state='pending'", (job_id,)
+                ).fetchone()
+            if row is None:
+                return False
+            manifest = self._decode_deletion_manifest(str(row["manifest_json"]))
+            content_root = self.data_dir / "contents"
+            cache_root = self.data_dir / "cache"
+            files = [self._validate_content_path(content_root, Path(value)) for value in manifest["content_files"]]
+            content_trees = [Path(value) for value in manifest["content_trees"]]
+            cache_trees = [Path(value) for value in manifest["cache_trees"]]
+            for tree in content_trees:
+                self.validate_tree_under(content_root, tree)
+            for tree in cache_trees:
+                self.validate_tree_under(cache_root, tree)
+            for path in files:
+                path = self._validate_content_path(content_root, path)
+                if path.exists():
+                    path.unlink()
+            for tree in content_trees:
+                self.remove_tree_under(content_root, tree)
+            for tree in cache_trees:
+                self.remove_tree_under(cache_root, tree)
+            with self._lock:
+                self.conn.execute("DELETE FROM deletion_jobs WHERE id=? AND state='pending'", (job_id,))
+                self.conn.commit()
+            return True
+        except Exception:
+            with self._lock:
+                self.conn.execute(
+                    """UPDATE deletion_jobs SET state='blocked', error_code='deletion_cleanup_failed',
+                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (job_id,),
+                )
+                self.conn.commit()
+            return False
+
+    @staticmethod
+    def _decode_deletion_manifest(encoded: str) -> dict[str, list[str] | int]:
+        if len(encoded.encode("utf-8")) > _MAX_DELETION_MANIFEST_BYTES:
+            raise ValueError("deletion_manifest_too_large")
+        try:
+            value = json.loads(encoded)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError("deletion_manifest_invalid") from exc
+        if not isinstance(value, dict) or set(value) != {"cache_trees", "content_files", "content_trees", "version"}:
+            raise ValueError("deletion_manifest_invalid")
+        if value["version"] != 1:
+            raise ValueError("deletion_manifest_invalid")
+        total = 0
+        for key in ("cache_trees", "content_files", "content_trees"):
+            items = value[key]
+            if not isinstance(items, list) or any(
+                not isinstance(item, str) or not item or len(item) > 4096 for item in items
+            ):
+                raise ValueError("deletion_manifest_invalid")
+            total += len(items)
+        if total > _MAX_DELETION_PATHS:
+            raise ValueError("deletion_manifest_too_many_paths")
+        return value
 
     def has_other_book(self, book_id: int, title: str, *, site: str | None = None) -> bool:
         with self._lock:
