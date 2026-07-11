@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -16,6 +17,7 @@ from novel_crawler.task_engine.models import ALLOWED_TRANSITIONS, TaskEvent, Tas
 SCHEMA_VERSION = 2
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SENSITIVE_KEYS = (
+    "api_key",
     "authorization",
     "browser_token",
     "content",
@@ -24,22 +26,105 @@ _SENSITIVE_KEYS = (
     "html",
     "page_body",
     "password",
+    "passwd",
+    "private_key",
     "profile_path",
     "resume_status",
+    "session_id",
     "secret",
     "token",
 )
 _AUTHORIZATION_HEADER = re.compile(r"(?im)^\s*authorization\s*:\s*(?:bearer\s+)?\S+")
 _BEARER_VALUE = re.compile(r"(?i)(?:^|\s)bearer\s+([a-z0-9._~+/=-]+)(?=$|[\s,;])")
-_CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)(?:^|[\s;,&?])(?:cookie|token|password|secret)\s*=\s*\S+"
+_CREDENTIAL_LABEL = (
+    r"(?:browser[ _-]*token|access[ _-]*token|api[ _-]*(?:token|key)|"
+    r"refresh[ _-]*token|session[ _-]*(?:token|id)|auth[ _-]*token|"
+    r"private[ _-]*key|secret[ _-]*key|password|passwd|cookie|token|secret)"
+)
+_CREDENTIAL_EQUALS = re.compile(rf"(?i)(?<![a-z0-9_]){_CREDENTIAL_LABEL}\s*=\s*\S+")
+_CREDENTIAL_COLON_VALUE = re.compile(
+    rf"(?i)(?<![a-z0-9_]){_CREDENTIAL_LABEL}\s*:\s*=?\s*(?P<value>[^\s,;]+)"
+)
+_CREDENTIAL_JSON = re.compile(
+    rf'''(?i)["']{_CREDENTIAL_LABEL}["']\s*:\s*["'][^"']+["']'''
 )
 _COOKIE_HEADER = re.compile(r"(?im)^\s*cookie\s*:\s*[^\s=;]+=[^\s;]+")
 _HTML_STRUCTURE = re.compile(r"(?i)<\s*(?:html|body)(?:\s|>)")
 _PROFILE_PATH_ASSIGNMENT = re.compile(r"(?i)profile(?:_|\s+)path\s*[:=]\s*\S+")
 _STATUS_SQL = ", ".join(f"'{status.value}'" for status in TaskStatus)
 _RESUMABLE_STATUSES = frozenset({TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED})
+_DISPLAY_TEXT_KEYS = frozenset({"book_name", "book_title", "title"})
 _MAX_MIGRATION_EVENTS = 100_000
+
+
+V1_ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = MappingProxyType({
+    TaskStatus.CREATED: frozenset({TaskStatus.PROBING, TaskStatus.PAUSED, TaskStatus.CANCELLED}),
+    TaskStatus.PROBING: frozenset(
+        {
+            TaskStatus.WAITING_FOR_USER,
+            TaskStatus.VALIDATING,
+            TaskStatus.RECOVERABLE_FAILED,
+            TaskStatus.PAUSED,
+            TaskStatus.TERMINAL_FAILED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.WAITING_FOR_USER: frozenset(
+        {
+            TaskStatus.VALIDATING,
+            TaskStatus.RECOVERABLE_FAILED,
+            TaskStatus.TERMINAL_FAILED,
+            TaskStatus.PAUSED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.VALIDATING: frozenset(
+        {
+            TaskStatus.WAITING_FOR_USER,
+            TaskStatus.READY,
+            TaskStatus.RECOVERABLE_FAILED,
+            TaskStatus.PAUSED,
+            TaskStatus.TERMINAL_FAILED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.READY: frozenset(
+        {TaskStatus.CRAWLING, TaskStatus.PAUSED, TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED}
+    ),
+    TaskStatus.CRAWLING: frozenset(
+        {
+            TaskStatus.COMPLETED,
+            TaskStatus.PAUSED,
+            TaskStatus.WAITING_FOR_USER,
+            TaskStatus.RECOVERABLE_FAILED,
+            TaskStatus.TERMINAL_FAILED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.PAUSED: frozenset(
+        {
+            TaskStatus.PROBING,
+            TaskStatus.WAITING_FOR_USER,
+            TaskStatus.VALIDATING,
+            TaskStatus.READY,
+            TaskStatus.CRAWLING,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.RECOVERABLE_FAILED: frozenset(
+        {
+            TaskStatus.PROBING,
+            TaskStatus.VALIDATING,
+            TaskStatus.READY,
+            TaskStatus.CRAWLING,
+            TaskStatus.TERMINAL_FAILED,
+            TaskStatus.CANCELLED,
+        }
+    ),
+    TaskStatus.COMPLETED: frozenset(),
+    TaskStatus.TERMINAL_FAILED: frozenset(),
+    TaskStatus.CANCELLED: frozenset(),
+})
 
 
 class TaskRepositoryError(RuntimeError):
@@ -211,7 +296,7 @@ class TaskRepository:
 
     def _backfill_resume_statuses_unchecked(self) -> None:
         rows = self._connection.execute(
-            "SELECT task_id, status, version FROM tasks WHERE status IN (?, ?)",
+            "SELECT task_id, status, version FROM tasks WHERE status IN (?, ?) ORDER BY rowid",
             (TaskStatus.PAUSED.value, TaskStatus.RECOVERABLE_FAILED.value),
         ).fetchall()
         for task in rows:
@@ -477,20 +562,20 @@ def _validate_error_code(value: str | None) -> str | None:
     return value
 
 
-def _reject_sensitive_metadata(value: Any) -> None:
+def _reject_sensitive_metadata(value: Any, *, display_text: bool = False) -> None:
     if isinstance(value, Mapping):
         for key, child in value.items():
             if not isinstance(key, str):
                 raise TaskInputError("metadata_invalid")
-            normalized = key.casefold().replace("-", "_")
+            normalized = re.sub(r"[-\s]+", "_", key.casefold())
             if any(sensitive in normalized for sensitive in _SENSITIVE_KEYS):
                 raise TaskInputError("metadata_sensitive")
-            _reject_sensitive_metadata(child)
+            _reject_sensitive_metadata(child, display_text=normalized in _DISPLAY_TEXT_KEYS)
     elif isinstance(value, (list, tuple)):
         for child in value:
-            _reject_sensitive_metadata(child)
+            _reject_sensitive_metadata(child, display_text=display_text)
     elif isinstance(value, str):
-        if _contains_sensitive_text(value):
+        if _contains_sensitive_text(value, display_text=display_text):
             raise TaskInputError("metadata_sensitive")
         try:
             parsed = urlsplit(value)
@@ -500,24 +585,32 @@ def _reject_sensitive_metadata(value: Any) -> None:
             raise TaskInputError("metadata_sensitive")
 
 
-def _contains_sensitive_text(value: str) -> bool:
+def _contains_sensitive_text(value: str, *, display_text: bool = False) -> bool:
     if (
         _AUTHORIZATION_HEADER.search(value)
-        or _CREDENTIAL_ASSIGNMENT.search(value)
+        or _CREDENTIAL_EQUALS.search(value)
+        or _CREDENTIAL_JSON.search(value)
         or _COOKIE_HEADER.search(value)
         or _HTML_STRUCTURE.search(value)
         or _PROFILE_PATH_ASSIGNMENT.search(value)
     ):
         return True
-    for match in _BEARER_VALUE.finditer(value):
-        credential = match.group(1)
-        if len(credential) >= 6 and (
-            len(credential) >= 16
-            or any(character.isdigit() for character in credential)
-            or any(character in "._~+/=-" for character in credential)
-        ):
-            return True
+    if not display_text and _CREDENTIAL_COLON_VALUE.search(value):
+        return True
+    if not display_text:
+        for match in _BEARER_VALUE.finditer(value):
+            if _looks_like_credential(match.group(1)):
+                return True
     return False
+
+
+def _looks_like_credential(value: str) -> bool:
+    candidate = value.strip("\"'()[]{}")
+    return len(candidate) >= 6 and (
+        len(candidate) >= 16
+        or any(character.isdigit() for character in candidate)
+        or any(character in "._~+/=-" for character in candidate)
+    )
 
 
 def _validated_resume_origin(
@@ -526,7 +619,7 @@ def _validated_resume_origin(
     if len(events) != task_version + 1:
         raise ValueError
     previous: TaskStatus | None = None
-    pending_origin: TaskStatus | None = None
+    last_from: TaskStatus | None = None
     for expected_version, event in enumerate(events):
         if int(event["task_version"]) != expected_version:
             raise ValueError
@@ -539,24 +632,13 @@ def _validated_resume_origin(
         else:
             if from_status is not previous or from_status is None:
                 raise ValueError
-            if to_status not in ALLOWED_TRANSITIONS[from_status]:
+            if to_status not in V1_ALLOWED_TRANSITIONS[from_status]:
                 raise ValueError
-            if from_status in _RESUMABLE_STATUSES and to_status not in {
-                TaskStatus.TERMINAL_FAILED,
-                TaskStatus.CANCELLED,
-            }:
-                if pending_origin is None or to_status is not pending_origin:
-                    raise ValueError
-        if to_status in _RESUMABLE_STATUSES:
-            if from_status is None:
-                raise ValueError
-            pending_origin = from_status
-        else:
-            pending_origin = None
+            last_from = from_status
         previous = to_status
-    if previous is not task_status or pending_origin is None:
+    if previous is not task_status or last_from is None:
         raise ValueError
-    return pending_origin
+    return last_from
 
 
 def _task_from_row(row: sqlite3.Row) -> TaskRecord:

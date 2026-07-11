@@ -71,6 +71,7 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     ),
     TaskStatus.PAUSED: frozenset(
         {
+            TaskStatus.CREATED,
             TaskStatus.PROBING,
             TaskStatus.WAITING_FOR_USER,
             TaskStatus.VALIDATING,
