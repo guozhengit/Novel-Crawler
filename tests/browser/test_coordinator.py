@@ -634,6 +634,28 @@ def test_terminal_outcome_cache_is_bounded_and_expires(tmp_path: Path) -> None:
         coordinator.continue_verification(second.token)
 
 
+def test_terminal_cache_limits_and_concurrent_continue_fail_closed(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="limits must be positive"):
+        VerificationCoordinator(BrowserSessionStore(tmp_path / "invalid"), max_terminal=0)
+    with pytest.raises(ValueError, match="limits must be positive"):
+        VerificationCoordinator(BrowserSessionStore(tmp_path / "ttl"), terminal_ttl=timedelta(0))
+
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path / "active"),
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    active = coordinator._active[ticket.token]
+    active.lock.acquire()
+    try:
+        with pytest.raises(VerificationRequired, match="verification_in_progress"):
+            coordinator.continue_verification(ticket.token)
+    finally:
+        active.lock.release()
+    coordinator.cancel(ticket.token)
+
+
 def test_completed_terminal_cache_never_retains_page_body(tmp_path: Path) -> None:
     private_body = "private chapter text" * 100_000
     chapter = browser_snapshot(f"<title>Chapter</title><article>{private_body}</article>")
@@ -695,6 +717,39 @@ def test_async_crash_terminal_is_idempotently_failed(tmp_path: Path) -> None:
     second = coordinator.cancel(ticket.token)
     assert first.status is VerificationStatus.FAILED
     assert second == first
+
+
+def test_async_terminal_lease_failure_is_cached_as_cleanup_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    active = coordinator._active[ticket.token]
+    original_close = BrowserSessionLease.close
+    failures = 1
+
+    def fail_once(lease: BrowserSessionLease) -> None:
+        nonlocal failures
+        if lease is active.lease and failures:
+            failures -= 1
+            raise RuntimeError("lease close failed")
+        original_close(lease)
+
+    monkeypatch.setattr(BrowserSessionLease, "close", fail_once)
+    coordinator._worker_terminal(ticket.token, "deadline", True)
+    pending = coordinator.continue_verification(ticket.token)
+    assert pending.status is VerificationStatus.TIMED_OUT and pending.cleanup_required
+    assert coordinator.retry_cleanup(ticket.token).status is VerificationStatus.TIMED_OUT
+
+
+def test_unknown_early_terminal_is_bounded_safe_state(tmp_path: Path) -> None:
+    coordinator = VerificationCoordinator(BrowserSessionStore(tmp_path), safety_policy=PUBLIC_POLICY)
+    coordinator._worker_terminal("never-known-token", "deadline", True)
+    assert coordinator._early_terminal == {"never-known-token": ("deadline", True)}
 
 
 def test_inflight_continue_returns_deadline_tombstone_not_synthesized_failure(tmp_path: Path) -> None:

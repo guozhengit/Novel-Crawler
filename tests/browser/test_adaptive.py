@@ -97,6 +97,21 @@ def test_adaptive_service_is_exported_from_browser_package() -> None:
     assert ExportedAdaptiveBrowserService is AdaptiveBrowserService
 
 
+def test_adaptive_result_rejects_inconsistent_private_handles() -> None:
+    waiting = ConfigResolution(ResolutionKind.WAITING_FOR_USER, reason_ids=("verification_required",))
+    cleanup = ConfigResolution(ResolutionKind.CLEANUP_REQUIRED, reason_ids=("cleanup_required",))
+    terminal = ConfigResolution(ResolutionKind.REJECTED)
+    with pytest.raises(ValueError, match="waiting results"):
+        AdaptiveResult(waiting)
+    with pytest.raises(ValueError, match="cleanup results"):
+        AdaptiveResult(cleanup, cleanup_ticket="private-token", cleanup_source="invalid")
+    with pytest.raises(ValueError, match="terminal results"):
+        AdaptiveResult(terminal, cleanup_ticket="private-token", cleanup_source="headless")
+    result = AdaptiveResult(cleanup, cleanup_ticket="private-token", cleanup_source="headless")
+    with pytest.raises(AttributeError, match="immutable"):
+        result.kind = ResolutionKind.REJECTED
+
+
 def test_resolve_reuses_one_private_ticket_and_serialization_is_safe() -> None:
     url = "https://example.test/private?token=secret"
     manager = FakeManager([required(url)])
@@ -425,6 +440,21 @@ def test_cancel_cleanup_retries_then_returns_cancelled() -> None:
     assert service.retry_cleanup(cleanup.cleanup_ticket).kind is ResolutionKind.CANCELLED
 
 
+def test_cancel_unknown_token_and_coordinator_error_fail_closed() -> None:
+    service = AdaptiveBrowserService(FakeManager([]), FakeAcquirer(), FakeCoordinator([]))
+    assert service.cancel("never-known").reason_ids == ("verification_token_invalid",)
+
+    class CancelError(FakeCoordinator):
+        def cancel(self, token: str) -> VerificationOutcome:
+            raise VerificationRequired("verification_in_progress")
+
+    url = "https://example.test/private"
+    failing = AdaptiveBrowserService(FakeManager([required(url)]), FakeAcquirer(), CancelError([]))
+    waiting = failing.resolve(url, "download")
+    assert failing.cancel(waiting.ticket).reason_ids == ("verification_in_progress",)
+    assert failing.cancel(waiting.ticket).reason_ids == ("verification_in_progress",)
+
+
 def test_cleanup_during_verified_resume_retries_entire_resolution() -> None:
     url = "https://example.test/private"
     manager = FakeManager(
@@ -461,6 +491,24 @@ def test_cleanup_retry_error_remains_retryable_and_unknown_token_fails() -> None
     assert retried.kind is ResolutionKind.CLEANUP_REQUIRED
     assert retried.reason_ids == ("verification_in_progress",)
     assert service.retry_cleanup("unknown").kind is ResolutionKind.VERIFICATION_FAILED
+
+
+def test_visible_cleanup_retry_outcome_can_remain_pending() -> None:
+    class StillCleaning(FakeCoordinator):
+        def retry_cleanup(self, token: str) -> VerificationOutcome:
+            return VerificationOutcome(
+                VerificationStatus.CANCELLED,
+                "https://example.test",
+                cleanup_required=True,
+                cleanup_ticket=token,
+            )
+
+    url = "https://example.test/private"
+    coordinator = StillCleaning([])
+    coordinator.ticket = VerificationTicket("cleanup-token", VerificationStatus.FAILED, "https://example.test")
+    service = AdaptiveBrowserService(FakeManager([required(url)]), FakeAcquirer(), coordinator)
+    cleanup = service.resolve(url, "download")
+    assert service.retry_cleanup(cleanup.cleanup_ticket).kind is ResolutionKind.CLEANUP_REQUIRED
 
 
 @pytest.mark.parametrize(
@@ -570,6 +618,35 @@ def test_partial_profile_activation_failure_always_deactivates() -> None:
     waiting = service.resolve(url, "download")
     assert service.continue_verification(waiting.ticket).kind is ResolutionKind.VERIFICATION_FAILED
     assert acquirer.deactivated
+
+
+def test_partial_activation_and_deactivation_failure_returns_profile_cleanup() -> None:
+    class BothFail(FakeAcquirer):
+        def activate_persistent_profile(self, url: str, *, task_key: str, pages: int) -> None:
+            raise RuntimeError("partial activation")
+
+        def deactivate_persistent_profile(self, url: str, *, task_key: str) -> None:
+            raise RuntimeError("profile cleanup")
+
+    url = "https://example.test/private"
+    coordinator = FakeCoordinator([VerificationOutcome(VerificationStatus.COMPLETED, "https://example.test")])
+    service = AdaptiveBrowserService(FakeManager([required(url)]), BothFail(), coordinator)
+    waiting = service.resolve(url, "download")
+    cleanup = service.continue_verification(waiting.ticket)
+    assert cleanup.kind is ResolutionKind.CLEANUP_REQUIRED
+    assert cleanup.reason_ids == ("profile_cleanup_required",)
+
+
+@pytest.mark.parametrize(
+    ("resume_error", "reason"),
+    [(required("https://example.test/private"), "verification_persisted_challenge"), (RuntimeError("boom"), "verification_resume_failed")],
+)
+def test_verified_resume_errors_fail_closed(resume_error: Exception, reason: str) -> None:
+    url = "https://example.test/private"
+    coordinator = FakeCoordinator([VerificationOutcome(VerificationStatus.COMPLETED, "https://example.test")])
+    service = AdaptiveBrowserService(FakeManager([required(url), resume_error]), FakeAcquirer(), coordinator)
+    waiting = service.resolve(url, "download")
+    assert service.continue_verification(waiting.ticket).reason_ids == (reason,)
 
 
 def test_combined_cleanup_transitions_to_profile_only_after_headless_success() -> None:
