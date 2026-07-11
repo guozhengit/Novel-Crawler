@@ -4,6 +4,8 @@ import re
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -24,13 +26,22 @@ from novel_crawler.task_engine import (
 )
 
 _UNSAFE_TEXT = re.compile(
-    r"https?://|(?:^|\s)[A-Za-z]:[\\/]|(?:^|\s)/[^\s]+|"
+    r"https?://|(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s]+|"
+    r"(?<![A-Za-z0-9_])\\\\[^\\\s]+\\[^\s]+|"
+    r"(?<![A-Za-z0-9_])/(?:[^/\s]+/)*[^/\s]+|"
     r"(?:password|passwd|token|secret|cookie|authorization|profile[_ -]?path)\s*[:=]",
     re.I,
 )
 _BOOK_KEYS = ("id", "title", "author", "site", "total", "done", "failed", "pending")
 _PROGRESS_KEYS = ("total", "done", "failed", "pending")
 _FORMATS = frozenset({"txt", "epub", "md", "jsonl"})
+_INTERACTION_KINDS = frozenset({"verification", "confirmation", "cleanup", "cancel_pending"})
+
+
+class _ServiceState(StrEnum):
+    OPEN = "open"
+    CLOSING = "closing"
+    CLOSED = "closed"
 
 
 class _Executor(Protocol):
@@ -80,7 +91,11 @@ class ApplicationService:
         self._crawler = crawler
         self._close_timeout = close_timeout
         self._lock = threading.RLock()
-        self._closed = False
+        self._state = _ServiceState.OPEN
+        self._controller_closed = controller is None
+        self._executor_closed = False
+        self._repository_closed = False
+        self._crawler_closed = crawler is None
 
     def __enter__(self) -> ApplicationService:
         self._ensure_open()
@@ -110,12 +125,12 @@ class ApplicationService:
                 raise ApplicationError(_repository_input_code(exc)) from None
             except TaskRepositoryError:
                 raise ApplicationError("task_create_failed", retryable=True) from None
-        return self._task_view(task)
+        return self._safe_task_view(task)
 
     def get_task(self, task_id: str) -> TaskView:
         with self._operation():
             try:
-                return self._task_view(self._repository.get_task(task_id))
+                return self._safe_task_view(self._repository.get_task(task_id))
             except TaskNotFound:
                 raise ApplicationError("task_not_found") from None
             except TaskRepositoryError:
@@ -129,7 +144,7 @@ class ApplicationService:
     ) -> list[TaskView]:
         with self._operation():
             try:
-                return [self._task_view(task) for task in self._repository.list_tasks(statuses=statuses, limit=limit)]
+                return [self._safe_task_view(task) for task in self._repository.list_tasks(statuses=statuses, limit=limit)]
             except TaskInputError:
                 raise ApplicationError("task_query_invalid") from None
             except TaskRepositoryError:
@@ -168,12 +183,12 @@ class ApplicationService:
                 if current.cleanup_required:
                     raise ApplicationError("cleanup_required", retryable=True, task_id=task_id)
                 if current.is_terminal:
-                    return self._task_view(current)
+                    return self._safe_task_view(current)
                 if current.status in {TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED}:
                     self._executor.resume(task_id)
                 elif current.status in {TaskStatus.CREATED, TaskStatus.READY}:
                     self._executor.submit(task_id)
-                return self._task_view(self._repository.get_task(task_id))
+                return self._safe_task_view(self._repository.get_task(task_id))
             except ApplicationError:
                 raise
             except TaskNotFound:
@@ -260,36 +275,44 @@ class ApplicationService:
 
     def close(self) -> bool:
         with self._lock:
-            if self._closed:
+            if self._state is _ServiceState.CLOSED:
                 return True
-            self._closed = True
-        complete = True
-        if self._controller is not None:
-            try:
-                complete = bool(self._controller.close()) and complete
-            except Exception:
-                complete = False
-        try:
-            complete = bool(self._executor.shutdown(wait=True, timeout=self._close_timeout)) and complete
-        except Exception:
-            complete = False
-        try:
-            self._repository.close()
-        except Exception:
-            complete = False
-        if self._crawler is not None:
-            try:
-                close = getattr(self._crawler, "close", None)
-                if callable(close):
-                    close()
-                else:
-                    storage = getattr(self._crawler, "storage", None)
-                    storage_close = getattr(storage, "close", None)
-                    if callable(storage_close):
-                        storage_close()
-            except Exception:
-                complete = False
-        return complete
+            self._state = _ServiceState.CLOSING
+            if not self._controller_closed and self._controller is not None:
+                try:
+                    self._controller_closed = bool(self._controller.close())
+                except Exception:
+                    self._controller_closed = False
+            if not self._executor_closed:
+                try:
+                    self._executor_closed = bool(
+                        self._executor.shutdown(wait=True, timeout=self._close_timeout)
+                    )
+                except Exception:
+                    self._executor_closed = False
+            if not self._controller_closed or not self._executor_closed:
+                return False
+            if not self._repository_closed:
+                try:
+                    self._repository.close()
+                    self._repository_closed = True
+                except Exception:
+                    return False
+            if not self._crawler_closed and self._crawler is not None:
+                try:
+                    close = getattr(self._crawler, "close", None)
+                    if callable(close):
+                        close()
+                    else:
+                        storage = getattr(self._crawler, "storage", None)
+                        storage_close = getattr(storage, "close", None)
+                        if callable(storage_close):
+                            storage_close()
+                    self._crawler_closed = True
+                except Exception:
+                    return False
+            self._state = _ServiceState.CLOSED
+            return True
 
     def _control_transition(self, task_id: str, target: TaskStatus, reason: str) -> TaskView:
         with self._operation():
@@ -297,14 +320,14 @@ class ApplicationService:
                 try:
                     current = self._repository.get_task(task_id)
                     if current.is_terminal or current.status is target:
-                        return self._task_view(current)
+                        return self._safe_task_view(current)
                     updated = self._repository.transition(
                         task_id,
                         target,
                         expected_version=current.version,
                         reason=reason,
                     )
-                    return self._task_view(updated)
+                    return self._safe_task_view(updated)
                 except TaskVersionConflict:
                     continue
                 except TaskNotFound:
@@ -321,7 +344,6 @@ class ApplicationService:
                 raise ApplicationError("interaction_unavailable")
             try:
                 getattr(self._controller, name)(task_id, *args)
-                return self._task_view(self._repository.get_task(task_id))
             except TaskNotFound:
                 raise ApplicationError("task_not_found") from None
             except (InvalidTaskTransition, TaskVersionConflict):
@@ -330,6 +352,17 @@ class ApplicationService:
                 raise ApplicationError("interaction_failed", retryable=True, task_id=task_id) from None
             except Exception:
                 raise ApplicationError("interaction_failed", retryable=True, task_id=task_id) from None
+            return self._safe_task_view(self._repository.get_task(task_id))
+
+    def _safe_task_view(self, task: TaskRecord) -> TaskView:
+        try:
+            return self._task_view(task)
+        except ApplicationError:
+            raise
+        except Exception:
+            raise ApplicationError(
+                "task_view_failed", retryable=True, task_id=task.task_id
+            ) from None
 
     def _task_view(self, task: TaskRecord) -> TaskView:
         checkpoints = self._repository.list_checkpoints(task.task_id)
@@ -337,9 +370,12 @@ class ApplicationService:
         if self._controller is not None:
             summary = self._controller.interaction(task.task_id)
             if summary is not None:
-                safe = summary.to_safe_dict()
+                raw = summary.to_safe_dict()
+                safe: Mapping[str, object] = raw if isinstance(raw, Mapping) else {}
+                raw_kind = safe.get("kind")
+                kind = raw_kind if isinstance(raw_kind, str) and raw_kind in _INTERACTION_KINDS else "unknown"
                 interaction = InteractionView(
-                    kind=str(safe.get("kind", "unknown"))[:32],
+                    kind=kind,
                     attempt=_safe_count(safe.get("attempt", 0)),
                     expires_at=_safe_timestamp(safe.get("expires_at")),
                     verification_required=safe.get("verification_required") is True,
@@ -383,7 +419,9 @@ class ApplicationService:
 
     def _ensure_open(self) -> None:
         with self._lock:
-            if self._closed:
+            if self._state is _ServiceState.CLOSING:
+                raise ApplicationError("service_closing", retryable=True)
+            if self._state is _ServiceState.CLOSED:
                 raise ApplicationError("service_closed")
 
     @contextmanager
@@ -410,7 +448,13 @@ def _safe_count(value: object) -> int:
 
 
 def _safe_timestamp(value: object) -> str | None:
-    return value if isinstance(value, str) and len(value) <= 64 and not _UNSAFE_TEXT.search(value) else None
+    if not isinstance(value, str) or len(value) > 64 or _UNSAFE_TEXT.search(value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if parsed.tzinfo is not None else None
 
 
 def _safe_text(value: object, *, maximum: int = 256) -> str:

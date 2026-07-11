@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -14,7 +15,13 @@ from novel_crawler.application import (
     TaskView,
 )
 from novel_crawler.core.storage import BookDeletionResult
-from novel_crawler.task_engine import ExecutorClosed, ExecutorQueueFull, TaskRepository, TaskStatus
+from novel_crawler.task_engine import (
+    BackgroundTaskExecutor,
+    ExecutorClosed,
+    ExecutorQueueFull,
+    TaskRepository,
+    TaskStatus,
+)
 
 
 class FakeExecutor:
@@ -453,7 +460,7 @@ def test_interaction_and_safe_view_handle_malformed_dependency_data(tmp_path: Pa
     service = ApplicationService(repo, FakeExecutor(repo), controller=UnsafeController())
     view = service.get_task(task.task_id)
     assert view.interaction is not None
-    assert len(view.interaction.kind) == 32
+    assert view.interaction.kind == "unknown"
     assert view.interaction.attempt == 0
     assert view.interaction.expires_at is None
     assert view.interaction.verification_required is False
@@ -501,7 +508,9 @@ def test_close_falls_back_to_crawler_storage_and_contains_cleanup_failures(tmp_p
     crawler = StorageOnlyCrawler()
     service = ApplicationService(repo, BrokenExecutor(repo), controller=BrokenController(), crawler=crawler)  # type: ignore[arg-type]
     assert service.close() is False
-    assert crawler.storage.closed
+    assert crawler.storage.closed is False
+    repo.close()
+    crawler.storage.close()
 
 
 def test_close_waits_for_an_inflight_query_before_closing_repository(tmp_path: Path) -> None:
@@ -525,3 +534,202 @@ def test_close_waits_for_an_inflight_query_before_closing_repository(tmp_path: P
         release.set()
         assert query.result().task_id == task.task_id
         assert closing.result() is True
+
+
+def test_close_is_retryable_and_keeps_dependencies_open_while_real_worker_is_blocked(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_handler(_context, _task):
+        entered.set()
+        assert release.wait(5)
+
+    class TrackingRepository(TaskRepository):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            super().close()
+
+    repo = TrackingRepository(tmp_path / "retry-close.db")
+    crawler = FakeCrawler()
+    executor = BackgroundTaskExecutor(
+        repo,
+        {TaskStatus.PROBING: blocked_handler},
+        max_workers=1,
+        max_queue_size=2,
+    )
+    service = ApplicationService(repo, executor, crawler=crawler, close_timeout=0)
+    view = service.create_crawl_task("https://example.com", {})
+    assert entered.wait(5)
+
+    assert service.close() is False
+    assert repo.close_calls == 0
+    assert crawler.closed is False
+    assert repo.get_task(view.task_id).status is TaskStatus.PROBING
+    with pytest.raises(ApplicationError, match="service_closing"):
+        service.get_task(view.task_id)
+
+    release.set()
+    deadline = time.monotonic() + 5
+    closed = service.close()
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+        closed = service.close()
+    assert closed is True
+    assert repo.close_calls == 1
+    assert crawler.closed is True
+    assert service.close() is True
+
+
+def test_close_retries_failed_controller_before_closing_downstream_resources(tmp_path: Path) -> None:
+    class RetryController(FakeController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        def close(self) -> bool:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("token=secret")
+            return super().close()
+
+    repo = TaskRepository(tmp_path / "controller-retry.db")
+    executor = FakeExecutor(repo)
+    controller = RetryController()
+    crawler = FakeCrawler()
+    service = ApplicationService(repo, executor, controller=controller, crawler=crawler)
+
+    assert service.close() is False
+    assert executor.closed is True
+    assert crawler.closed is False
+    assert repo.connection.execute("SELECT 1").fetchone()[0] == 1
+    assert service.close() is True
+    assert controller.close_calls == 2
+    assert crawler.closed is True
+
+
+@pytest.mark.parametrize("source", ["checkpoints", "interaction", "serialization"])
+def test_task_view_dependency_failures_map_to_stable_traceable_error(tmp_path: Path, source: str) -> None:
+    class BrokenRepository(TaskRepository):
+        def list_checkpoints(self, task_id: str):
+            if source == "checkpoints":
+                raise RuntimeError("token=secret C:\\private")
+            return super().list_checkpoints(task_id)
+
+    class BrokenSummary(FakeSummary):
+        def to_safe_dict(self):
+            if source == "serialization":
+                raise RuntimeError("Authorization: Bearer secret")
+            return super().to_safe_dict()
+
+    class BrokenController(FakeController):
+        def interaction(self, task_id: str):
+            if source == "interaction":
+                raise RuntimeError("password=secret /private")
+            return BrokenSummary()
+
+    repo = BrokenRepository(tmp_path / f"view-{source}.db")
+    executor = FakeExecutor(repo)
+    service = ApplicationService(repo, executor, controller=BrokenController())
+
+    with pytest.raises(ApplicationError) as created:
+        service.create_crawl_task("https://example.com", {})
+    assert created.value.code == "task_view_failed"
+    assert created.value.retryable is True
+    assert created.value.task_id is not None
+    assert len(repo.list_tasks()) == 1
+    assert executor.submitted == [created.value.task_id]
+    assert "secret" not in repr(created.value).casefold()
+    service.close()
+
+
+def test_interaction_view_strictly_allowlists_kind_and_validates_fields(tmp_path: Path) -> None:
+    class MalformedSummary(FakeSummary):
+        def to_safe_dict(self):
+            return {
+                "kind": "https://evil.test/verification",
+                "attempt": 10**30,
+                "expires_at": "tomorrow at C:\\private",
+                "verification_required": True,
+                "confirmation_required": False,
+                "cleanup_required": False,
+            }
+
+    class MalformedController(FakeController):
+        def interaction(self, task_id: str):
+            return MalformedSummary()
+
+    repo = TaskRepository(tmp_path / "malformed-interaction.db")
+    task = repo.create_task("https://example.com")
+    service = ApplicationService(repo, FakeExecutor(repo), controller=MalformedController())
+    view = service.get_task(task.task_id)
+    assert view.interaction is not None
+    assert view.interaction.kind == "unknown"
+    assert view.interaction.attempt == 2_147_483_647
+    assert view.interaction.expires_at is None
+    assert "evil" not in repr(view)
+    service.close()
+
+
+def test_interaction_view_accepts_only_timezone_aware_iso_expiration(tmp_path: Path) -> None:
+    class TimestampSummary(FakeSummary):
+        def to_safe_dict(self):
+            return {**super().to_safe_dict(), "expires_at": "2026-07-12T05:00:00+08:00"}
+
+    class TimestampController(FakeController):
+        def interaction(self, task_id: str):
+            return TimestampSummary()
+
+    repo = TaskRepository(tmp_path / "timestamp.db")
+    task = repo.create_task("https://example.com")
+    service = ApplicationService(repo, FakeExecutor(repo), controller=TimestampController())
+    assert service.get_task(task.task_id).interaction.expires_at == "2026-07-12T05:00:00+08:00"  # type: ignore[union-attr]
+    service.close()
+
+
+def test_close_supports_crawler_storage_fallback_after_upstreams_stop(tmp_path: Path) -> None:
+    class StorageOnlyCrawler:
+        class Storage:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        def __init__(self) -> None:
+            self.storage = self.Storage()
+
+    repo = TaskRepository(tmp_path / "storage-fallback.db")
+    crawler = StorageOnlyCrawler()
+    service = ApplicationService(repo, FakeExecutor(repo), crawler=crawler)  # type: ignore[arg-type]
+    assert service.close() is True
+    assert crawler.storage.closed is True
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "output=C:\\Users\\name\\secret.txt",
+        "output: \\\\server\\share\\secret.txt",
+        "output(/home/name/private.txt)",
+        "output=[/var/lib/novel/data.db]",
+        "path=/opt/novel/data",
+    ],
+)
+def test_report_redacts_absolute_paths_after_non_whitespace_boundaries(app, unsafe: str) -> None:
+    service, _, _, _, crawler = app
+    crawler.report = lambda _book_id: f"safe before\n{unsafe}\nsafe after"  # type: ignore[method-assign]
+    assert service.book_report(1) == "safe before\n[redacted]\nsafe after"
+
+
+@pytest.mark.parametrize(
+    "safe",
+    ["done/total: 2/3", "chapter 1/2 complete", "selector div/span", "ordinary prose"],
+)
+def test_report_does_not_redact_natural_relative_slashes(app, safe: str) -> None:
+    service, _, _, _, crawler = app
+    crawler.report = lambda _book_id: safe  # type: ignore[method-assign]
+    assert service.book_report(1) == safe
