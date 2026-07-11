@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import re
 from collections.abc import Callable, Iterable, Sequence
@@ -21,6 +20,8 @@ DEFAULT_CHAPTER_PATTERNS = (
     r"第\s*[0-9零一二三四五六七八九十百千万两]+(?:\.[0-9]+)?\s*[章节回卷]",
     r"(?:chapter|part|book)\s+(?:\d+(?:\.\d+)?|[ivxlcdm]+)\b",
     r"(?:prologue|epilogue)\b",
+    r"(?:foreword|afterword|interlude)\b",
+    r"chapter\s+(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)(?:[ -]+|\b))+",
     r"(?:序章|楔子|番外(?:\s*\d+)?)",
 )
 DEFAULT_AUTHOR_PATTERNS = (r"^(?:作者\s*[：:]?|by\s+|written\s+by\s+|author\s*[：:]\s*)(.+)$",)
@@ -38,6 +39,9 @@ class ExtractorConfig:
     version: str = "v2"
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "chapter_title_patterns", tuple(self.chapter_title_patterns))
+        object.__setattr__(self, "author_patterns", tuple(self.author_patterns))
+        object.__setattr__(self, "enabled_fields", frozenset(self.enabled_fields))
         if self.min_chapter_links < 1 or self.min_content_chars < 1:
             raise ValueError("thresholds must be positive")
         if not self.chapter_title_patterns or not self.author_patterns:
@@ -109,7 +113,7 @@ class CandidateExtractor:
                 continue
             seen.add((field, summary))
             score = (0.9 if node.name == "h1" else 0.65) + (0.15 if field is FieldKind.CHAPTER_TITLE else 0)
-            candidate = self._candidate(soup, field, node, summary, score, "heading.semantic", f"tag={node.name};text_len={len(text)}")
+            candidate = self._candidate(soup, field, node, summary, score, "heading.semantic", f"tag={node.name};length_bucket={self._length_bucket(len(text))}")
             if candidate:
                 yield candidate
 
@@ -120,14 +124,14 @@ class CandidateExtractor:
             text = node.get_text(" ", strip=True)
             author = next((match.group(1).strip() for pattern in self._authors if (match := pattern.match(text))), "")
             if author:
-                candidate = self._candidate(soup, FieldKind.AUTHOR, node, self._summary(author), 0.85, "author.label", f"text_len={len(author)}")
+                candidate = self._candidate(soup, FieldKind.AUTHOR, node, self._summary(author), 0.85, "author.label", f"length_bucket={self._length_bucket(len(author))}")
                 if candidate:
                     yield candidate
         for label in soup.find_all(string=lambda value: bool(value and re.fullmatch(r"\s*作者\s*[：:]?\s*", value))):
             parent = label.parent
             sibling = parent.find_next_sibling() if isinstance(parent, Tag) else None
             if isinstance(sibling, Tag) and (text := sibling.get_text(" ", strip=True)):
-                candidate = self._candidate(soup, FieldKind.AUTHOR, sibling, self._summary(text), 0.75, "author.sibling", f"text_len={len(text)}")
+                candidate = self._candidate(soup, FieldKind.AUTHOR, sibling, self._summary(text), 0.75, "author.sibling", f"length_bucket={self._length_bucket(len(text))}")
                 if candidate:
                     yield candidate
 
@@ -139,19 +143,20 @@ class CandidateExtractor:
             anchors = node.find_all("a", href=True)
             chapter_links = [link for link in anchors if self._chapter.search(link.get_text(" ", strip=True))]
             children = node.find_all(["div", "section", "ul", "ol"], recursive=False)
-            if len(chapter_links) < self.config.min_chapter_links or len(chapter_links) != len(anchors):
+            if len(chapter_links) < self.config.min_chapter_links:
                 continue
             if any(len([link for link in child.find_all("a", href=True) if self._chapter.search(link.get_text(" ", strip=True))]) >= self.config.min_chapter_links for child in children):
                 continue
             container = self._unique_css(soup, node)
             if not container:
                 continue
-            selector = f"{container} a"
-            selected = soup.select(selector)
-            if selected != chapter_links:
+            selected = self._chapter_anchor_selector(soup, container, chapter_links)
+            if not selected:
                 continue
+            selector, strategy = selected
             score = 0.55 + min(len(chapter_links), 10) * 0.04
-            yield self._make(FieldKind.CHAPTER_LIST, selector, f"link_count={len(chapter_links)}", score, "chapter_list.cluster", f"link_count={len(chapter_links)}", {"link_count": len(chapter_links)})
+            metadata: dict[str, MetadataValue] = {"link_count": len(chapter_links), "container_selector": container, "link_text_rule": "chapter_title.v2", "selector_strategy": strategy}
+            yield self._make(FieldKind.CHAPTER_LIST, selector, f"link_count={len(chapter_links)}", score, "chapter_list.cluster", f"link_count={len(chapter_links)}", metadata)
 
     def _content(self, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
         if page_kind is not PageKind.CHAPTER:
@@ -163,16 +168,16 @@ class CandidateExtractor:
             if not isinstance(clone, Tag):
                 continue
             for descendant in list(clone.find_all(True)):
-                if self._is_noise(descendant):
+                if descendant.attrs is not None and self._is_noise(descendant):
                     descendant.decompose()
             text = clone.get_text(" ", strip=True)
             paragraphs = len(clone.find_all("p"))
             marker = " ".join([str(node.get("id", "")), *node.get("class", [])])
-            hint = bool(re.search(r"(?:content|article|chapter|reader|read|正文|内容)", marker, re.I))
+            hint = node.name == "article" or bool(re.search(r"(?:content|article|chapter|reader|read|正文|内容)", marker, re.I))
             if len(text) < self.config.min_content_chars or not hint and paragraphs < 2:
                 continue
             score = min(1.2, 0.35 + len(text) / 500 + paragraphs * 0.12 + (0.25 if hint else 0))
-            candidate = self._candidate(soup, FieldKind.CONTENT, node, self._summary(text), score, "content.text_density", f"text_len={len(text)};paragraphs={paragraphs}", {"text_length": len(text), "paragraph_count": paragraphs})
+            candidate = self._candidate(soup, FieldKind.CONTENT, node, self._summary(text), score, "content.text_density", f"length_bucket={self._length_bucket(len(text))};paragraphs={paragraphs}", {"length_bucket": self._length_bucket(len(text)), "paragraph_count": paragraphs})
             if candidate:
                 yield candidate
 
@@ -187,7 +192,7 @@ class CandidateExtractor:
                 field = next((kind for kind, pattern in patterns if pattern.fullmatch(text)), None)
             if field is None:
                 continue
-            candidate = self._candidate(soup, field, link, self._summary(text), 0.9 if field.value.removesuffix("_link") in rel_tokens else 0.7, "navigation.semantic", f"rel_count={len(rel_tokens)};text_len={len(text)}")
+            candidate = self._candidate(soup, field, link, self._summary(text), 0.9 if field.value.removesuffix("_link") in rel_tokens else 0.7, "navigation.semantic", f"rel_count={len(rel_tokens)};length_bucket={self._length_bucket(len(text))}")
             if candidate:
                 yield candidate
 
@@ -196,7 +201,7 @@ class CandidateExtractor:
         for node in soup.find_all(True):
             if not self._is_noise(node):
                 continue
-            candidate = self._candidate(soup, FieldKind.CLEAN_SELECTOR, node, "noise_region=1", 0.85, "noise.marker", f"tag={node.name};marker_len={len(self._marker(node))}")
+            candidate = self._candidate(soup, FieldKind.CLEAN_SELECTOR, node, "noise_region=1", 0.85, "noise.marker", f"tag={node.name};length_bucket={self._length_bucket(len(self._marker(node)))}")
             if candidate:
                 yield candidate
 
@@ -212,10 +217,19 @@ class CandidateExtractor:
     @staticmethod
     def _summary(text: str) -> str:
         normalized = re.sub(r"\s+", " ", text).strip()
-        digest = hashlib.sha256(normalized.encode()).hexdigest()[:12]
-        return f"text_length={len(normalized)};sha256={digest}"
+        return f"length_bucket={CandidateExtractor._length_bucket(len(normalized))}"
+
+    @staticmethod
+    def _length_bucket(length: int) -> str:
+        if length <= 16:
+            return "1-16"
+        if length <= 64:
+            return "17-64"
+        return "65+"
 
     def _marker(self, node: Tag) -> str:
+        if node.attrs is None:
+            return node.name
         return " ".join([node.name, str(node.get("id", "")), *node.get("class", [])])
 
     def _is_noise(self, node: Tag) -> bool:
@@ -227,11 +241,11 @@ class CandidateExtractor:
     @staticmethod
     def _unique_css(soup: BeautifulSoup, node: Tag) -> str | None:
         node_id = node.get("id")
-        if isinstance(node_id, str) and node_id and not CandidateExtractor._private_attribute(node_id, node):
+        if isinstance(node_id, str) and node_id and CandidateExtractor._semantic_attribute(node_id, node):
             selector = f"#{soupsieve.escape(node_id)}"
             if soup.select(selector) == [node]:
                 return selector
-        classes = [item for item in node.get("class", []) if isinstance(item, str) and item and not CandidateExtractor._private_attribute(item, node)]
+        classes = [item for item in node.get("class", []) if isinstance(item, str) and item and CandidateExtractor._semantic_attribute(item, node)]
         if classes:
             selector = "." + ".".join(soupsieve.escape(item) for item in classes)
             if soup.select(selector) == [node]:
@@ -253,9 +267,46 @@ class CandidateExtractor:
         return None
 
     @staticmethod
-    def _private_attribute(value: str, node: Tag) -> bool:
+    def _semantic_attribute(value: str, node: Tag) -> bool:
         if re.search(r"(?:token|secret|session|password)", value, re.I):
-            return True
+            return False
+        if "@" in value or re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value, re.I):
+            return False
+        if len(value) > 48 or sum(character.isdigit() for character in value) > 4:
+            return False
         compact_value = re.sub(r"\W+", "", value).casefold()
         compact_text = re.sub(r"\W+", "", node.get_text(" ", strip=True)).casefold()
-        return len(compact_value) >= 4 and compact_value in compact_text
+        if len(compact_value) >= 4 and compact_value == compact_text:
+            return False
+        words = set(re.split(r"[-_]", value.casefold()))
+        vocabulary = {"content", "chapter", "catalog", "book", "list", "reader", "article", "author", "title", "nav", "pagination", "main", "body", "text", "novel", "entry", "item", "link", "comment", "recommend", "related", "advert", "ad", "banner", "footer", "share"}
+        return any(word in vocabulary or word.removesuffix("s") in vocabulary for word in words)
+
+    def _chapter_anchor_selector(self, soup: BeautifulSoup, container: str, links: list[Tag]) -> tuple[str, str] | None:
+        common_classes = set(links[0].get("class", []))
+        for link in links[1:]:
+            common_classes &= set(link.get("class", []))
+        for class_name in sorted(common_classes):
+            if not isinstance(class_name, str) or not self._semantic_attribute(class_name, links[0]):
+                continue
+            selector = f"{container} a.{soupsieve.escape(class_name)}"
+            if soup.select(selector) == links:
+                return selector, "semantic_class"
+        for selector in (f"{container} li > a", f"{container} dd > a", f"{container} tr a"):
+            if soup.select(selector) == links:
+                return selector, "structural_group"
+        hrefs = [str(link.get("href", "")) for link in links]
+        if all(re.fullmatch(r"/[A-Za-z][A-Za-z0-9_-]*/[A-Za-z0-9._-]+", href) for href in hrefs):
+            prefixes = {href.rsplit("/", 1)[0] + "/" for href in hrefs}
+            if len(prefixes) == 1:
+                prefix = prefixes.pop()
+                selector = f'{container} a[href^="{prefix}"]'
+                if soup.select(selector) == links:
+                    return selector, "safe_href"
+        if len(links) <= 12:
+            selectors = [self._unique_css(soup, link) for link in links]
+            if all(selectors):
+                selector = ", ".join(cast(list[str], selectors))
+                if soup.select(selector) == links:
+                    return selector, "exact_group"
+        return None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from bs4 import BeautifulSoup
@@ -12,6 +13,8 @@ from novel_crawler.acquisition.models import PageSnapshot
 from novel_crawler.adaptation.extractor import CandidateExtractor, ExtractionRule, ExtractorConfig
 from novel_crawler.adaptation.models import Candidate, Evidence, ExtractionResult, FieldKind
 
+FIXTURES = Path(__file__).parent / "fixtures"
+
 
 def snapshot(html: str) -> PageSnapshot:
     return PageSnapshot("https://reader.example/book/7?token=secret", "https://reader.example/book/7?token=secret", 200, {}, "utf-8", html, html.encode(), "GET", (), datetime.now(UTC))
@@ -19,7 +22,7 @@ def snapshot(html: str) -> PageSnapshot:
 
 def test_models_are_deeply_immutable_private_and_validated() -> None:
     evidence = Evidence("title.h1", 0.8, "text_len=4")
-    preview = "text_length=4;sha256=123456789abc"
+    preview = "length_bucket=1-16"
     candidate = Candidate(FieldKind.TITLE, "h1", preview, 0.8, 0.8, (evidence,), {"rank": 1})
     result = ExtractionResult((candidate,), "builtin", "v1")
     assert result.for_field(FieldKind.TITLE) == (candidate,)
@@ -84,6 +87,7 @@ def test_outputs_never_leak_body_title_author_or_urls() -> None:
     assert all(secret not in serialized for secret in secrets)
     assert "private.example" not in serialized
     assert all(len(item.value_preview) <= 80 for item in result)
+    assert "sha" not in serialized.casefold() and "hash" not in serialized.casefold()
 
 
 def test_selectors_are_unique_with_duplicate_ids_classes_and_special_characters() -> None:
@@ -97,10 +101,10 @@ def test_selectors_are_unique_with_duplicate_ids_classes_and_special_characters(
 
 
 def test_nested_noise_is_removed_before_content_scoring() -> None:
-    clean = "A modest real chapter paragraph. " * 3
-    html = f"<article id='content'><p>{clean}</p><div class='comments'>{'BUY SECRET TOKEN ' * 100}</div></article>"
+    clean = "A modest real chapter paragraph."
+    html = f"<article id='content'><p>{clean}</p><p>It continues.</p><div class='comments'>{'BUY SECRET TOKEN ' * 100}</div></article>"
     item = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER).for_field(FieldKind.CONTENT)[0]
-    assert item.metadata["text_length"] == len(clean.strip())
+    assert item.metadata["length_bucket"] == "17-64"
 
 
 def test_navigation_uses_exact_rel_and_anchored_text() -> None:
@@ -129,6 +133,61 @@ def test_config_can_limit_fields_and_reports_provenance() -> None:
     result = extractor.extract(snapshot("<h1>Novel</h1><p>By Secret</p>"), PageKind.BOOK_INDEX)
     assert {item.field for item in result} == {FieldKind.TITLE}
     assert result.version == "review-v2" and result.provenance
+
+
+def test_realistic_mixed_catalog_selects_only_chapter_anchors() -> None:
+    html = (FIXTURES / "catalog_mixed.html").read_text(encoding="utf-8")
+    soup = BeautifulSoup(html, "lxml")
+    result = CandidateExtractor().extract(snapshot(html), PageKind.BOOK_INDEX)
+    candidate = result.for_field(FieldKind.CHAPTER_LIST)[0]
+    selected = soup.select(candidate.selector)
+    assert [node.get_text(" ", strip=True) for node in selected] == ["Chapter One", "Chapter Twenty-One", "Interlude", "Chapter One Thousand"]
+    assert all("Home" not in node.text and "Latest" not in node.text and "Next" not in node.text for node in selected)
+    assert candidate.metadata["container_selector"]
+    assert candidate.metadata["link_text_rule"] == "chapter_title.v2"
+
+
+def test_large_mixed_catalog_uses_safe_href_structure_not_exact_selector_list() -> None:
+    chapters = "".join(f'<a href="/read/{index}">Chapter {index}</a>' for index in range(1, 14))
+    html = f'<section class="catalog-list"><a href="/">Home</a>{chapters}<a href="/catalog/2">Next</a></section>'
+    soup = BeautifulSoup(html, "lxml")
+    candidate = CandidateExtractor().extract(snapshot(html), PageKind.BOOK_INDEX).for_field(FieldKind.CHAPTER_LIST)[0]
+    assert candidate.metadata["selector_strategy"] == "safe_href"
+    assert len(soup.select(candidate.selector)) == 13
+    assert "," not in candidate.selector
+
+
+def test_realistic_chapter_fixture_removes_nested_noise() -> None:
+    html = (FIXTURES / "chapter_nested_noise.html").read_text(encoding="utf-8")
+    result = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER)
+    assert result.for_field(FieldKind.CHAPTER_TITLE)
+    content = result.for_field(FieldKind.CONTENT)[0]
+    assert content.metadata["paragraph_count"] == 2
+
+
+@pytest.mark.parametrize("title", ["Chapter One", "Chapter Twenty-One", "Chapter Nine Hundred Ninety-Nine", "Chapter One Thousand", "Foreword", "Afterword", "Interlude"])
+def test_english_number_words_and_section_titles(title: str) -> None:
+    assert CandidateExtractor().extract(snapshot(f"<h1>{title}</h1>"), PageKind.CHAPTER).for_field(FieldKind.CHAPTER_TITLE)
+
+
+def test_opaque_pii_and_dynamic_attributes_never_enter_selectors() -> None:
+    opaque = "user@example.com"
+    uuid = "550e8400-e29b-41d4-a716-446655440000"
+    dynamic = "css-98765432109876543210"
+    html = f"<main><article id='{opaque}' class='{uuid} {dynamic}'><p>{'Narrative words. ' * 8}</p></article></main>"
+    candidates = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER).for_field(FieldKind.CONTENT)
+    assert candidates
+    assert all(opaque not in item.selector and uuid not in item.selector and dynamic not in item.selector for item in candidates)
+
+
+def test_config_normalizes_mutable_inputs_and_cannot_be_changed_after_creation() -> None:
+    patterns = [r"Chapter\s+\d+"]
+    fields = {FieldKind.TITLE}
+    config = ExtractorConfig(chapter_title_patterns=patterns, enabled_fields=fields)  # type: ignore[arg-type]
+    patterns.append("Secret")
+    fields.add(FieldKind.AUTHOR)
+    assert config.chapter_title_patterns == (r"Chapter\s+\d+",)
+    assert config.enabled_fields == frozenset({FieldKind.TITLE})
 
 
 def test_invalid_config_rules_and_deep_result_values_are_rejected() -> None:

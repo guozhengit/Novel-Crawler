@@ -12,8 +12,8 @@ from typing import TypeAlias
 
 MetadataValue: TypeAlias = str | int | float | bool
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
-_SAFE_STRUCTURED = re.compile(r"[a-z][a-z0-9_]*=[A-Za-z0-9_.-]+(?:;[a-z][a-z0-9_]*=[A-Za-z0-9_.-]+)*")
-_SELECTOR_SECRET = re.compile(r"(?:https?://|[?&]|token|secret|session|password|href\s*[*^$]?=)", re.I)
+_SAFE_STRUCTURED = re.compile(r"[a-z][a-z0-9_]*=[A-Za-z0-9_.+-]+(?:;[a-z][a-z0-9_]*=[A-Za-z0-9_.+-]+)*")
+_SELECTOR_SECRET = re.compile(r"(?:https?://|[?&]|token|secret|session|password)", re.I)
 
 
 class FieldKind(Enum):
@@ -73,8 +73,10 @@ class Candidate:
                 raise ValueError("metadata keys must be safe identifiers")
             if not isinstance(value, str | int | float | bool) or isinstance(value, float) and not math.isfinite(value):
                 raise ValueError("metadata values must be finite scalars")
-            if isinstance(value, str) and not re.fullmatch(r"[A-Za-z0-9_.-]{0,80}", value):
-                raise ValueError("metadata strings must be short redacted tokens")
+            if isinstance(value, str):
+                safe_string = len(value) <= 512 and not _SELECTOR_SECRET.search(value) if key.endswith("selector") else bool(re.fullmatch(r"[A-Za-z0-9_.+-]{0,80}", value))
+                if not safe_string:
+                    raise ValueError("metadata strings must be short redacted tokens or safe selectors")
             clean_metadata[key] = value
         object.__setattr__(self, "evidence", frozen_evidence)
         object.__setattr__(self, "metadata", MappingProxyType(clean_metadata))
