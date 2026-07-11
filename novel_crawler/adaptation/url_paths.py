@@ -80,17 +80,21 @@ def sibling_template(first: str, second: str) -> str | None:
         return None
     index = differences[0]
     left, right = first_parts[index], second_parts[index]
-    prefix_length = 0
-    while prefix_length < min(len(left), len(right)) and left[prefix_length] == right[prefix_length]:
-        prefix_length += 1
-    suffix_length = 0
-    while suffix_length < min(len(left), len(right)) - prefix_length and left[-1 - suffix_length] == right[-1 - suffix_length]:
-        suffix_length += 1
-    left_middle = left[prefix_length : len(left) - suffix_length if suffix_length else None]
-    right_middle = right[prefix_length : len(right) - suffix_length if suffix_length else None]
-    if not re.fullmatch(r"[0-9]+", left_middle) or not re.fullmatch(r"[0-9]+", right_middle):
+    left_tokens = re.findall(r"%[0-9A-F]{2}|[0-9]+|[^0-9%]+", left)
+    right_tokens = re.findall(r"%[0-9A-F]{2}|[0-9]+|[^0-9%]+", right)
+    if len(left_tokens) != len(right_tokens):
         return None
-    suffix = left[len(left) - suffix_length :] if suffix_length else ""
+    differing_runs: list[int] = []
+    for token_index, (left_token, right_token) in enumerate(zip(left_tokens, right_tokens, strict=True)):
+        is_digit_run = re.fullmatch(r"[0-9]+", left_token) is not None and re.fullmatch(r"[0-9]+", right_token) is not None
+        if is_digit_run:
+            if left_token != right_token:
+                differing_runs.append(token_index)
+        elif left_token != right_token:
+            return None
+    if len(differing_runs) != 1:
+        return None
+    left_tokens[differing_runs[0]] = "{int}"
     merged = [*first_parts]
-    merged[index] = left[:prefix_length] + "{int}" + suffix
+    merged[index] = "".join(left_tokens)
     return "/" + "/".join(merged)

@@ -292,6 +292,13 @@ def test_materializes_all_verified_canonical_paths_and_percent_encoded_digits_ma
     [
         (("/c1", "/c2"), "/c{int}", "/c3", True),
         (("/1.html", "/2.html"), "/{int}.html", "/3.html", True),
+        (("/chapter10", "/chapter11"), "/chapter{int}", "/chapter20", True),
+        (("/9.html", "/10.html"), "/{int}.html", "/20.html", True),
+        (("/c099", "/c100"), "/c{int}", "/c101", True),
+        (("/章1", "/章2"), "/%E7%AB%A0{int}", "/章3", True),
+        (("/一", "/丁"), None, "/七", False),
+        (("/v1c2", "/v2c3"), None, "/v3c4", False),
+        (("/c1", "/d2"), None, "/c3", False),
         (("/c1", "/news"), None, "/c3", False),
         (("/a/1/x", "/b/2/x"), None, "/a/3/x", False),
     ],
