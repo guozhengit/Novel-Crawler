@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import stat
 import subprocess
+from ctypes import wintypes
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,8 +36,10 @@ class FakeWindowsAPI:
         assert descriptor >= 0
         self.events.append(("flush", "file"))
 
-    def move_write_through(self, source: Path, destination: Path) -> None:
+    def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None:
         self.events.append(("move", destination.name))
+        if not replace and destination.exists():
+            raise RegistryIOError("already exists")
         os.replace(source, destination)
 
 
@@ -64,7 +68,7 @@ def test_same_handle_bounded_read_rejects_oversize_and_non_regular(tmp_path: Pat
     assert io.read_bounded(value, 5) == b"12345"
     with pytest.raises(RegistryIOError, match="maximum bytes"):
         io.read_bounded(value, 4)
-    with pytest.raises(RegistryIOError, match="regular|opened"):
+    with pytest.raises(RegistryIOError, match="regular|opened|anchored"):
         io.read_bounded(root, 100)
 
 
@@ -122,6 +126,126 @@ def test_windows_acl_verifier_rejects_any_extra_granting_ace(tmp_path: Path) -> 
         io.verify_private(root)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows anchored handles")
+def test_windows_anchor_holds_parent_without_delete_sharing(tmp_path: Path) -> None:
+    io = default_registry_io()
+    root = tmp_path / "private"
+    nested = root / "nested"
+    io.ensure_directory(root)
+    io.ensure_directory(nested)
+    outside = tmp_path / "outside"
+    with io._api.anchor_guard(root, nested):  # type: ignore[attr-defined]
+        assert not io._api._kernel32.MoveFileExW(str(root), str(outside), 0x1)  # type: ignore[attr-defined]
+    assert root.exists() and not outside.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows canonical handle path")
+def test_windows_anchor_rejects_final_path_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    io = default_registry_io()
+    root = tmp_path / "private"
+    io.ensure_directory(root)
+    api = io._api  # type: ignore[attr-defined]
+    monkeypatch.setattr(api, "_final_path", lambda handle: str(tmp_path / "outside"))
+    with pytest.raises(RegistryIOError, match="canonical"):
+        with api.anchor_guard(root, root):
+            pass
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows canonical handle cleanup")
+def test_windows_path_handle_closes_when_final_path_lookup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    io = default_registry_io()
+    root = tmp_path / "private"
+    io.ensure_directory(root)
+    api = io._api  # type: ignore[attr-defined]
+    closed: list[int] = []
+    original_close = api._kernel32.CloseHandle
+
+    def close_handle(handle: int) -> bool:
+        closed.append(handle)
+        return bool(original_close(handle))
+
+    def fail_final_path(handle: int) -> str:
+        raise RegistryIOError("injected final path lookup failure")
+
+    monkeypatch.setattr(api._kernel32, "CloseHandle", close_handle)
+    monkeypatch.setattr(api, "_final_path", fail_final_path)
+
+    with pytest.raises(RegistryIOError, match="injected final path"):
+        api._open_path_handle(root, 0x00020000)
+
+    assert len(closed) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows anchored create/move")
+def test_windows_parent_swap_injection_cannot_redirect_create_or_move(tmp_path: Path) -> None:
+    class SwapAPI(WindowsAPI):
+        def __init__(self) -> None:
+            self.swap_parent: Path | None = None
+            self.swap_target: Path | None = None
+            self.swap_attempts = 0
+            super().__init__()
+
+        def _attempt_swap(self) -> None:
+            if self.swap_parent is None or self.swap_target is None:
+                return
+            self.swap_attempts += 1
+            assert not self._kernel32.MoveFileExW(str(self.swap_parent), str(self.swap_target), 0x1)
+
+        def create_private_directory(self, path: Path) -> None:
+            self._attempt_swap()
+            super().create_private_directory(path)
+
+        def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None:
+            self._attempt_swap()
+            super().move_write_through(source, destination, replace=replace)
+
+    api = SwapAPI()
+    io = WindowsRegistryIO(api=api)
+    root = tmp_path / "private"
+    io.ensure_directory(root)
+    api.swap_parent = root
+    api.swap_target = tmp_path / "swapped"
+    io.ensure_directory(root / "nested")
+    io.atomic_write(root / "nested" / "value.json", b"inside")
+    assert api.swap_attempts >= 2
+    assert (root / "nested" / "value.json").read_bytes() == b"inside"
+    assert not api.swap_target.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows SetSecurityInfo ABI")
+def test_windows_acl_uses_declared_set_security_info_abi() -> None:
+    api = WindowsAPI()
+    assert api._advapi32.SetSecurityInfo.argtypes == [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+    ]
+    assert api._advapi32.SetSecurityInfo.restype is wintypes.DWORD
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows bootstrap anchor")
+def test_windows_existing_root_bootstrap_is_anchored_before_acl_operation(tmp_path: Path) -> None:
+    root = tmp_path / "existing-root"
+    root.mkdir()
+    outside = tmp_path / "swapped-bootstrap"
+
+    class BootstrapSwapAPI(WindowsAPI):
+        def apply_private_acl(self, path: Path) -> None:
+            if path == root:
+                assert not self._kernel32.MoveFileExW(str(root), str(outside), 0x1)
+            super().apply_private_acl(path)
+
+    io = WindowsRegistryIO(api=BootstrapSwapAPI())
+    io.ensure_directory(root)
+    assert root.exists() and not outside.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows fail-closed Win32 errors")
 def test_windows_get_attributes_failure_is_not_treated_as_safe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -131,8 +255,6 @@ def test_windows_get_attributes_failure_is_not_treated_as_safe(
     def access_denied(path: str) -> int:
         ctypes.set_last_error(5)
         return 0xFFFFFFFF
-
-    import ctypes
 
     monkeypatch.setattr(api._kernel32, "GetFileAttributesW", access_denied)
     with pytest.raises(RegistryIOError, match="verification"):
@@ -150,9 +272,9 @@ def test_windows_real_flush_and_write_through_are_exercised(tmp_path: Path) -> N
             self.events.append("flush")
             super().flush_file(descriptor)
 
-        def move_write_through(self, source: Path, destination: Path) -> None:
+        def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None:
             self.events.append("move")
-            super().move_write_through(source, destination)
+            super().move_write_through(source, destination, replace=replace)
 
     api = SpyAPI()
     io = WindowsRegistryIO(api=api)
@@ -210,7 +332,7 @@ def test_permission_or_durability_failure_is_fail_closed(tmp_path: Path) -> None
 
 def test_windows_write_through_failure_leaves_target_uncommitted(tmp_path: Path) -> None:
     class BrokenMoveAPI(FakeWindowsAPI):
-        def move_write_through(self, source: Path, destination: Path) -> None:
+        def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None:
             raise RegistryIOError("injected write-through failure")
 
     io = WindowsRegistryIO(api=BrokenMoveAPI())
@@ -308,3 +430,22 @@ def test_posix_durability_boundary_failures_are_fail_closed(
         else:
             io.atomic_write(target, b"complete")
     assert not target.exists() or target.read_bytes() == b"complete"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor lifecycle")
+def test_posix_child_descriptor_closes_when_verification_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    io = PosixRegistryIO()
+    closed: list[int] = []
+    original_close = os.close
+
+    def close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(io, "_verify_directory_fd", lambda descriptor: (_ for _ in ()).throw(RegistryIOError("boom")))
+    with pytest.raises(RegistryIOError, match="boom"):
+        io.ensure_directory(tmp_path / "private")
+    assert len(closed) >= 2

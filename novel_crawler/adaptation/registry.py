@@ -20,7 +20,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .config_schema import SiteConfig
-from .registry_io import RegistryIO, RegistryIOError, RegistryIOSizeError, default_registry_io
+from .registry_io import RegistryIO, RegistryIOError, RegistryIOExistsError, RegistryIOSizeError, default_registry_io
 
 _REGISTRY_SCHEMA_VERSION = 1
 _REVISION_NAME = re.compile(r"rev-([0-9]{6})\.json")
@@ -356,9 +356,15 @@ class ConfigRegistry:
         payload = _canonical_json(envelope)
         if len(payload) > self._max_config_bytes:
             raise RegistryLimitError("config revision exceeds maximum bytes")
-        if path.exists():
-            raise RegistryError("config revision already exists")
-        self._io.atomic_write(path, payload)
+        try:
+            self._io.atomic_publish_noreplace(path, payload)
+        except RegistryIOExistsError as exc:
+            try:
+                existing = self._io.read_bounded(path, self._max_config_bytes)
+            except RegistryIOError:
+                raise ConfigConflictError("config revision conflicts with existing content") from exc
+            if existing != payload:
+                raise ConfigConflictError("config revision conflicts with existing content") from exc
         return _Record(entry, path, digest)
 
     @staticmethod

@@ -6,6 +6,8 @@ import ctypes
 import os
 import stat
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from ctypes import wintypes
 from io import BufferedRandom
 from pathlib import Path
@@ -46,10 +48,15 @@ class RegistryIOSizeError(RegistryIOError):
     """A same-handle bounded read exceeded its configured limit."""
 
 
+class RegistryIOExistsError(RegistryIOError):
+    """A no-replace publication found an existing destination."""
+
+
 class RegistryIO(Protocol):
     def ensure_directory(self, path: Path) -> None: ...
     def verify_private(self, path: Path) -> None: ...
     def atomic_write(self, path: Path, payload: bytes) -> None: ...
+    def atomic_publish_noreplace(self, path: Path, payload: bytes) -> None: ...
     def read_bounded(self, path: Path, limit: int) -> bytes: ...
     def durable_move(self, source: Path, destination: Path) -> None: ...
     def open_lock(self, path: Path) -> BufferedRandom: ...
@@ -128,9 +135,13 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
                     os.mkdir(name, 0o700, dir_fd=parent_fd)
                     os.fsync(parent_fd)
                     child_fd = os.open(name, flags, dir_fd=parent_fd)
-                    _FCHMOD(child_fd, 0o700)
-                    self._verify_directory_fd(child_fd)
-                    os.fsync(child_fd)
+                    try:
+                        _FCHMOD(child_fd, 0o700)
+                        self._verify_directory_fd(child_fd)
+                        os.fsync(child_fd)
+                    except Exception:
+                        os.close(child_fd)
+                        raise
                 try:
                     os.close(parent_fd)
                 finally:
@@ -180,6 +191,53 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
             os.fsync(parent_fd)
         except OSError as exc:
             raise RegistryIOError("atomic durable registry write failed") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            os.close(parent_fd)
+
+    def atomic_publish_noreplace(self, path: Path, payload: bytes) -> None:
+        self.ensure_directory(path.parent)
+        parent_fd = self._open_directory(path.parent, require_private=True)
+        temporary = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise RegistryIOError("registry output is not a regular file")
+            _FCHMOD(descriptor, 0o600)
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            try:
+                os.link(
+                    temporary,
+                    path.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise RegistryIOExistsError("registry revision already exists") from exc
+            os.fsync(parent_fd)
+            os.unlink(temporary, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except RegistryIOExistsError:
+            raise
+        except OSError as exc:
+            raise RegistryIOError("atomic no-replace registry publish failed") from exc
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -257,8 +315,10 @@ class _WindowsAPI(Protocol):
     def apply_private_acl(self, path: Path) -> None: ...
     def verify_private_acl(self, path: Path) -> None: ...
     def flush_file(self, descriptor: int) -> None: ...
-    def move_write_through(self, source: Path, destination: Path) -> None: ...
+    def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None: ...
     def create_private_directory(self, path: Path) -> None: ...
+    def apply_private_fd(self, descriptor: int) -> None: ...
+    def verify_private_fd(self, descriptor: int, path: Path) -> None: ...
 
 
 class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
@@ -294,6 +354,10 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             wintypes.HANDLE, ctypes.POINTER(_ByHandleFileInformation),
         ]
         self._kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        self._kernel32.GetFinalPathNameByHandleW.argtypes = [
+            wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+        ]
+        self._kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
         self._kernel32.GetCurrentProcess.restype = wintypes.HANDLE
         self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
             wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.DWORD),
@@ -301,8 +365,16 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
         self._advapi32.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID]
         self._advapi32.SetFileSecurityW.restype = wintypes.BOOL
-        self._advapi32.SetKernelObjectSecurity.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID]
-        self._advapi32.SetKernelObjectSecurity.restype = wintypes.BOOL
+        self._advapi32.SetSecurityInfo.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID,
+        ]
+        self._advapi32.SetSecurityInfo.restype = wintypes.DWORD
+        self._advapi32.GetSecurityDescriptorDacl.argtypes = [
+            wintypes.LPVOID, ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.BOOL),
+        ]
+        self._advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
         self._advapi32.GetFileSecurityW.argtypes = [
             wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
         ]
@@ -387,32 +459,126 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         return bool(attributes & self._REPARSE)
 
     def apply_private_acl(self, path: Path) -> None:
+        handle = self._open_path_handle(path, 0x00060000)
+        try:
+            self._apply_private_handle(handle)
+        finally:
+            self._kernel32.CloseHandle(handle)
+
+    def apply_private_fd(self, descriptor: int) -> None:
+        import msvcrt
+
+        self._apply_private_handle(msvcrt.get_osfhandle(descriptor))
+
+    def _apply_private_handle(self, handle: int) -> None:
         descriptor = ctypes.c_void_p()
         sddl = f"O:{self._owner_sid}D:P(A;OICI;FA;;;{self._owner_sid})(A;OICI;FA;;;SY)"
         convert = self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
         if not convert(sddl, 1, ctypes.byref(descriptor), None):
             raise RegistryIOError("private ACL construction failed")
-        handle = self._open_path_handle(path, 0x00040000)
         try:
+            present = wintypes.BOOL()
+            defaulted = wintypes.BOOL()
+            dacl = wintypes.LPVOID()
+            if not self._advapi32.GetSecurityDescriptorDacl(
+                descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
+            ) or not present or not dacl:
+                raise RegistryIOError("private ACL construction failed")
             security_info = self._DACL | self._PROTECTED_DACL
-            if not self._advapi32.SetKernelObjectSecurity(handle, security_info, descriptor):
-                raise RegistryIOError("private ACL application failed")
+            result = self._advapi32.SetSecurityInfo(handle, 1, security_info, None, None, dacl, None)
+            if result != 0:
+                raise RegistryIOError(f"private ACL application failed ({result})")
         finally:
-            self._kernel32.CloseHandle(handle)
             self._kernel32.LocalFree(descriptor)
 
-    def _open_path_handle(self, path: Path, access: int) -> int:
-        handle = self._kernel32.CreateFileW(str(path), access, 0x7, None, 3, 0x02000000 | 0x00200000, None)
+    @staticmethod
+    def _canonical(value: str | os.PathLike[str]) -> str:
+        text = os.fspath(value)
+        if text.startswith("\\\\?\\"):
+            text = text[4:]
+        return os.path.normcase(os.path.normpath(text))
+
+    def _final_path(self, handle: int) -> str:
+        buffer = ctypes.create_unicode_buffer(32_768)
+        length = self._kernel32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+        if not length or length >= len(buffer):
+            raise RegistryIOError("canonical handle path lookup failed")
+        return self._canonical(buffer.value)
+
+    def _open_anchor_directory(self, path: Path, *, protect_rename: bool) -> int:
+        handle = self._kernel32.CreateFileW(str(path), 0x80020000, 0x3, None, 3, 0x02000000 | 0x00200000, None)
         invalid = ctypes.c_void_p(-1).value
         if handle == invalid:
-            raise RegistryIOError("registry path handle cannot be opened safely")
+            raise RegistryIOError("anchored directory handle cannot be opened")
         information = _ByHandleFileInformation()
         if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
             self._kernel32.CloseHandle(handle)
-            raise RegistryIOError("registry path handle verification failed")
-        if information.dwFileAttributes & self._REPARSE:
+            raise RegistryIOError("anchored directory handle verification failed")
+        if information.dwFileAttributes & self._REPARSE or not information.dwFileAttributes & 0x10:
             self._kernel32.CloseHandle(handle)
-            raise RegistryIOError("registry path handle is a reparse point")
+            raise RegistryIOError("anchored directory is not a regular directory")
+        return handle
+
+    @contextmanager
+    def hold_root(self, root: Path) -> Iterator[None]:
+        handle = self._open_anchor_directory(root, protect_rename=True)
+        try:
+            if self._final_path(handle) != self._canonical(root):
+                raise RegistryIOError("canonical anchored root path mismatch")
+            yield
+        finally:
+            self._kernel32.CloseHandle(handle)
+
+    @contextmanager
+    def anchor_guard(self, root: Path, path: Path) -> Iterator[None]:
+        root = root.absolute()
+        path = path.absolute()
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise RegistryIOError("anchored path escapes trusted root") from exc
+        handles: list[int] = []
+        try:
+            current = root
+            root_handle = self._open_anchor_directory(root, protect_rename=False)
+            handles.append(root_handle)
+            current_final = self._final_path(root_handle)
+            if current_final != self._canonical(root):
+                raise RegistryIOError("canonical anchored root path mismatch")
+            root_info = _ByHandleFileInformation()
+            self._kernel32.GetFileInformationByHandle(root_handle, ctypes.byref(root_info))
+            for component in relative.parts:
+                current = current / component
+                child_handle = self._open_anchor_directory(current, protect_rename=False)
+                handles.append(child_handle)
+                child_final = self._final_path(child_handle)
+                expected = self._canonical(os.path.join(current_final, component))
+                child_info = _ByHandleFileInformation()
+                self._kernel32.GetFileInformationByHandle(child_handle, ctypes.byref(child_info))
+                if child_final != expected or child_info.dwVolumeSerialNumber != root_info.dwVolumeSerialNumber:
+                    raise RegistryIOError("canonical anchored child path mismatch")
+                current_final = child_final
+            yield
+        finally:
+            for handle in reversed(handles):
+                self._kernel32.CloseHandle(handle)
+
+    def _open_path_handle(self, path: Path, access: int) -> int:
+        handle = self._kernel32.CreateFileW(str(path), access, 0x3, None, 3, 0x02000000 | 0x00200000, None)
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            raise RegistryIOError("registry path handle cannot be opened safely")
+        try:
+            information = _ByHandleFileInformation()
+            if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+                raise RegistryIOError("registry path handle verification failed")
+            if information.dwFileAttributes & self._REPARSE:
+                raise RegistryIOError("registry path handle is a reparse point")
+            if self._final_path(handle) != self._canonical(path):
+                raise RegistryIOError("canonical registry path handle mismatch")
+        except Exception:
+            self._kernel32.CloseHandle(handle)
+            raise
         return handle
 
     def create_private_directory(self, path: Path) -> None:
@@ -444,6 +610,10 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             self._kernel32.CloseHandle(handle)
 
     def _verify_private_handle(self, handle: int) -> None:
+        file_information = _ByHandleFileInformation()
+        if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(file_information)):
+            raise RegistryIOError("private ACL verification failed")
+        expected_ace_flags = 0x03 if file_information.dwFileAttributes & 0x10 else 0x00
         owner = wintypes.LPVOID()
         dacl = wintypes.LPVOID()
         descriptor = wintypes.LPVOID()
@@ -482,7 +652,7 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             header = ctypes.cast(ace, ctypes.POINTER(_AceHeader)).contents
             mask = ctypes.c_ulong.from_address(ace_address + 4).value
             sid = wintypes.LPVOID(ace_address + 8)
-            if header.AceType != 0 or header.AceFlags != 0x03 or mask != 0x001F01FF:
+            if header.AceType != 0 or header.AceFlags != expected_ace_flags or mask != 0x001F01FF:
                 self._kernel32.LocalFree(descriptor)
                 raise RegistryIOError("private ACL verification failed")
             if self._advapi32.EqualSid(sid, self._owner_sid_pointer):
@@ -507,8 +677,9 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
                 self._kernel32.LocalFree(rendered)
         finally:
             self._kernel32.LocalFree(descriptor)
-        owner_ace = f"(A;OICI;FA;;;{self._owner_sid})"
-        system_ace = "(A;OICI;FA;;;SY)"
+        flag_text = "OICI" if expected_ace_flags else ""
+        owner_ace = f"(A;{flag_text};FA;;;{self._owner_sid})"
+        system_ace = f"(A;{flag_text};FA;;;SY)"
         if f"O:{self._owner_sid}" not in sddl or "D:P" not in sddl or sddl.count("(A;") != 2:
             raise RegistryIOError("private ACL verification failed")
         if owner_ace not in sddl or system_ace not in sddl:
@@ -517,9 +688,9 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
     def open_nofollow_fd(self, path: Path, *, write: bool, create: bool, exclusive: bool = True) -> int:
         import msvcrt
 
-        access = 0x80000000 | (0x40000000 if write else 0)
+        access = 0x80000000 | ((0x40000000 | 0x00060000) if write else 0)
         creation = (1 if exclusive else 4) if create else 3
-        handle = self._kernel32.CreateFileW(str(path), access, 0x7, None, creation, 0x80 | 0x00200000, None)
+        handle = self._kernel32.CreateFileW(str(path), access, 0x3, None, creation, 0x80 | 0x00200000, None)
         invalid = ctypes.c_void_p(-1).value
         if handle == invalid:
             raise RegistryIOError("registry file handle cannot be opened safely")
@@ -529,6 +700,8 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
                 raise RegistryIOError("registry handle verification failed")
             if information.dwFileAttributes & (self._REPARSE | 0x10):
                 raise RegistryIOError("registry handle is not a regular non-reparse file")
+            if self._final_path(handle) != self._canonical(path):
+                raise RegistryIOError("canonical registry file path mismatch")
             flags = getattr(os, "O_BINARY", 0) | (os.O_RDWR if write else os.O_RDONLY)
             descriptor = msvcrt.open_osfhandle(handle, flags)
             handle = invalid
@@ -549,17 +722,48 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         if not self._kernel32.FlushFileBuffers(handle):
             raise RegistryIOError("file durability flush failed")
 
-    def move_write_through(self, source: Path, destination: Path) -> None:
-        if not self._kernel32.MoveFileExW(str(source), str(destination), 0x1 | 0x8):
+    def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None:
+        flags = 0x8 | (0x1 if replace else 0)
+        ctypes.set_last_error(0)
+        if not self._kernel32.MoveFileExW(str(source), str(destination), flags):
+            error = ctypes.get_last_error()
+            if not replace and error in {80, 183}:
+                raise RegistryIOExistsError("registry revision already exists")
             raise RegistryIOError("write-through atomic move failed")
+
+
+class _HeldAnchorStream:
+    def __init__(self, stream: BufferedRandom, guard: Any) -> None:
+        self._stream = stream
+        self._guard = guard
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+    def close(self) -> None:
+        try:
+            self._stream.close()
+        finally:
+            self._guard.__exit__(None, None, None)
 
 
 class WindowsRegistryIO:
     def __init__(self, *, api: _WindowsAPI | None = None) -> None:
         self._api = api or WindowsAPI()
+        self._root: Path | None = None
+        self._bootstrap_root: Path | None = None
+
+    def _guard(self, path: Path) -> Any:
+        anchor = getattr(self._api, "anchor_guard", None)
+        root = self._root or self._bootstrap_root
+        if anchor is None or root is None:
+            return nullcontext()
+        return anchor(root, path)
 
     def ensure_directory(self, path: Path) -> None:
         path = path.absolute()
+        if self._root is None and self._bootstrap_root is None:
+            self._bootstrap_root = Path(path.anchor)
         for component in (path, *path.parents):
             self._api.reject_reparse(component)
         missing: list[Path] = []
@@ -570,54 +774,80 @@ class WindowsRegistryIO:
             cursor = cursor.parent
         self._api.reject_reparse(cursor)
         for directory in reversed(missing):
-            try:
-                create_private = getattr(self._api, "create_private_directory", None)
-                if create_private is None:
-                    directory.mkdir(mode=0o700)
-                else:
-                    create_private(directory)
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                raise RegistryIOError("private registry directory creation failed") from exc
-            self._api.reject_reparse(directory)
-            self._api.apply_private_acl(directory)
-            self._api.verify_private_acl(directory)
+            with self._guard(directory.parent):
+                try:
+                    create_private = getattr(self._api, "create_private_directory", None)
+                    if create_private is None:
+                        directory.mkdir(mode=0o700)
+                    else:
+                        create_private(directory)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise RegistryIOError("private registry directory creation failed") from exc
+            with self._guard(directory):
+                self._api.reject_reparse(directory)
+                self._api.apply_private_acl(directory)
+                self._api.verify_private_acl(directory)
         if not missing:
-            self._api.reject_reparse(path)
-            self._api.apply_private_acl(path)
-            self._api.verify_private_acl(path)
+            with self._guard(path):
+                self._api.reject_reparse(path)
+                self._api.apply_private_acl(path)
+                self._api.verify_private_acl(path)
+        if self._root is None:
+            self._root = path
+            self._bootstrap_root = None
 
     def verify_private(self, path: Path) -> None:
-        self._api.reject_reparse(path)
-        self._api.verify_private_acl(path)
+        with self._guard(path):
+            self._api.reject_reparse(path)
+            self._api.verify_private_acl(path)
 
     def reject_link(self, path: Path) -> None:
-        self._api.reject_reparse(path)
+        with self._guard(path.parent):
+            self._api.reject_reparse(path)
 
     def atomic_write(self, path: Path, payload: bytes) -> None:
+        self._atomic_publish(path, payload, replace=True)
+
+    def atomic_publish_noreplace(self, path: Path, payload: bytes) -> None:
+        self._atomic_publish(path, payload, replace=False)
+
+    def _atomic_publish(self, path: Path, payload: bytes, *, replace: bool) -> None:
         self.ensure_directory(path.parent)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         descriptor = -1
         try:
-            self._api.reject_reparse(temporary)
-            secure_open = getattr(self._api, "open_nofollow_fd", None)
-            descriptor = (
-                secure_open(temporary, write=True, create=True)
-                if secure_open is not None
-                else os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-            )
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise RegistryIOError("registry output is not a regular file")
-            _write_all(descriptor, payload)
-            self._api.flush_file(descriptor)
-            os.close(descriptor)
-            descriptor = -1
-            self._api.apply_private_acl(temporary)
-            self._api.verify_private_acl(temporary)
-            self._api.reject_reparse(path)
-            self._api.move_write_through(temporary, path)
-            self._api.verify_private_acl(path)
+            with self._guard(path.parent):
+                self._api.reject_reparse(temporary)
+                secure_open = getattr(self._api, "open_nofollow_fd", None)
+                descriptor = (
+                    secure_open(temporary, write=True, create=True)
+                    if secure_open is not None
+                    else os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+                )
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise RegistryIOError("registry output is not a regular file")
+                _write_all(descriptor, payload)
+                self._api.flush_file(descriptor)
+                apply_fd = getattr(self._api, "apply_private_fd", None)
+                if apply_fd is None:
+                    self._api.apply_private_acl(temporary)
+                    self._api.verify_private_acl(temporary)
+                else:
+                    apply_fd(descriptor)
+                    self._api.verify_private_fd(descriptor, temporary)
+                os.close(descriptor)
+                descriptor = -1
+                self._api.reject_reparse(path)
+                mover = self._api.move_write_through
+                if replace:
+                    mover(temporary, path)
+                else:
+                    mover(temporary, path, replace=False)
+                self._api.verify_private_acl(path)
+        except RegistryIOExistsError:
+            raise
         except OSError as exc:
             raise RegistryIOError("atomic durable registry write failed") from exc
         finally:
@@ -629,26 +859,27 @@ class WindowsRegistryIO:
                 pass
 
     def read_bounded(self, path: Path, limit: int) -> bytes:
-        self._api.reject_reparse(path)
         descriptor = -1
         try:
-            secure_open = getattr(self._api, "open_nofollow_fd", None)
-            descriptor = (
-                secure_open(path, write=False, create=False)
-                if secure_open is not None
-                else os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-            )
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise RegistryIOError("registry input is not a regular file")
-            if metadata.st_size > limit:
-                raise RegistryIOSizeError("file exceeds maximum bytes")
-            verify_fd = getattr(self._api, "verify_private_fd", None)
-            if verify_fd is None:
-                self._api.verify_private_acl(path)
-            else:
-                verify_fd(descriptor, path)
-            return _read_limit(descriptor, limit)
+            with self._guard(path.parent):
+                self._api.reject_reparse(path)
+                secure_open = getattr(self._api, "open_nofollow_fd", None)
+                descriptor = (
+                    secure_open(path, write=False, create=False)
+                    if secure_open is not None
+                    else os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                )
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise RegistryIOError("registry input is not a regular file")
+                if metadata.st_size > limit:
+                    raise RegistryIOSizeError("file exceeds maximum bytes")
+                verify_fd = getattr(self._api, "verify_private_fd", None)
+                if verify_fd is None:
+                    self._api.verify_private_acl(path)
+                else:
+                    verify_fd(descriptor, path)
+                return _read_limit(descriptor, limit)
         except OSError as exc:
             raise RegistryIOError("registry input cannot be opened safely") from exc
         finally:
@@ -657,23 +888,26 @@ class WindowsRegistryIO:
 
     def durable_move(self, source: Path, destination: Path) -> None:
         self.ensure_directory(destination.parent)
-        is_reparse = getattr(self._api, "is_reparse", None)
-        if is_reparse is None:
-            self._api.reject_reparse(source)
-            source_is_reparse = False
-        else:
-            source_is_reparse = bool(is_reparse(source))
-        self._api.reject_reparse(destination)
-        self._api.move_write_through(source, destination)
-        if not source_is_reparse:
-            self._api.apply_private_acl(destination)
-            self._api.verify_private_acl(destination)
+        with self._guard(source.parent), self._guard(destination.parent):
+            is_reparse = getattr(self._api, "is_reparse", None)
+            if is_reparse is None:
+                self._api.reject_reparse(source)
+                source_is_reparse = False
+            else:
+                source_is_reparse = bool(is_reparse(source))
+            self._api.reject_reparse(destination)
+            self._api.move_write_through(source, destination)
+            if not source_is_reparse:
+                self._api.apply_private_acl(destination)
+                self._api.verify_private_acl(destination)
 
-    def open_lock(self, path: Path) -> BufferedRandom:
+    def open_lock(self, path: Path) -> Any:
         self.ensure_directory(path.parent)
-        self._api.reject_reparse(path)
+        guard = self._guard(path.parent)
+        guard.__enter__()
         descriptor = -1
         try:
+            self._api.reject_reparse(path)
             secure_open = getattr(self._api, "open_nofollow_fd", None)
             descriptor = (
                 secure_open(path, write=True, create=True, exclusive=False)
@@ -691,9 +925,13 @@ class WindowsRegistryIO:
                 verify_fd(descriptor, path)
             stream = os.fdopen(descriptor, "r+b")
             descriptor = -1
-            return stream
+            return _HeldAnchorStream(stream, guard)
         except OSError as exc:
+            guard.__exit__(None, None, None)
             raise RegistryIOError("registry lock cannot be opened safely") from exc
+        except Exception:
+            guard.__exit__(None, None, None)
+            raise
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -703,4 +941,11 @@ def default_registry_io() -> RegistryIO:
     return WindowsRegistryIO() if os.name == "nt" else PosixRegistryIO()
 
 
-__all__ = ["RegistryIO", "RegistryIOError", "RegistryIOSizeError", "WindowsRegistryIO", "default_registry_io"]
+__all__ = [
+    "RegistryIO",
+    "RegistryIOError",
+    "RegistryIOExistsError",
+    "RegistryIOSizeError",
+    "WindowsRegistryIO",
+    "default_registry_io",
+]

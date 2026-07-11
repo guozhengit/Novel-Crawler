@@ -62,14 +62,14 @@ def _process_hold_lock(root: str, entered: multiprocessing.synchronize.Event) ->
 
 def _process_crash_after_revision(root: str) -> None:
     registry = ConfigRegistry(root)
-    original = registry._io.atomic_write
+    original = registry._io.atomic_publish_noreplace
 
     def crash(path: Path, payload: bytes) -> None:
         original(path, payload)
         if path.name.startswith("rev-"):
             os._exit(77)
 
-    registry._io.atomic_write = crash  # type: ignore[method-assign]
+    registry._io.atomic_publish_noreplace = crash  # type: ignore[method-assign]
     registry.register(config())
 
 
@@ -79,10 +79,10 @@ def _process_crash_before_revision_replace(root: str) -> None:
         api = registry._io._api  # type: ignore[attr-defined]
         original = api.move_write_through
 
-        def crash(source: Path, destination: Path) -> None:
+        def crash(source: Path, destination: Path, *, replace: bool = True) -> None:
             if destination.name.startswith("rev-"):
                 os._exit(78)
-            original(source, destination)
+            original(source, destination, replace=replace)
 
         api.move_write_through = crash
     else:
@@ -568,6 +568,7 @@ def test_revision_is_durable_before_manifest_and_manifest_crash_recovers(
 ) -> None:
     registry = ConfigRegistry(tmp_path)
     original = registry._io.atomic_write
+    original_publish = registry._io.atomic_publish_noreplace
     writes: list[str] = []
     manifest_writes = 0
 
@@ -580,7 +581,12 @@ def test_revision_is_durable_before_manifest_and_manifest_crash_recovers(
                 raise RegistryIOError("injected manifest crash")
         original(path, payload)
 
+    def record_revision(path: Path, payload: bytes) -> None:
+        writes.append(path.name)
+        original_publish(path, payload)
+
     monkeypatch.setattr(registry._io, "atomic_write", fail_manifest)
+    monkeypatch.setattr(registry._io, "atomic_publish_noreplace", record_revision)
     with pytest.raises(RegistryIOError, match="injected"):
         registry.register(config())
 
@@ -686,6 +692,40 @@ def test_unexplained_deletion_of_all_history_fails_closed(tmp_path: Path) -> Non
         revision.unlink()
     with pytest.raises(Exception, match="missing config history"):
         ConfigRegistry(tmp_path)
+
+
+def test_revision_publish_never_clobbers_adversarial_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ConfigRegistry(tmp_path)
+    original_publish = registry._io.atomic_publish_noreplace
+    inserted = b"adversarial-existing-revision"
+
+    def insert_then_publish(path: Path, payload: bytes) -> None:
+        registry._io.atomic_write(path, inserted)
+        original_publish(path, payload)
+
+    monkeypatch.setattr(registry._io, "atomic_publish_noreplace", insert_then_publish)
+    with pytest.raises(Exception, match="conflict|already exists"):
+        registry.register(config())
+    revision = next((tmp_path / "configs").rglob("rev-*.json"))
+    assert registry._io.read_bounded(revision, 1_048_576) == inserted
+
+
+def test_revision_publish_existing_identical_bytes_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ConfigRegistry(tmp_path)
+    original_publish = registry._io.atomic_publish_noreplace
+
+    def insert_same_then_publish(path: Path, payload: bytes) -> None:
+        registry._io.atomic_write(path, payload)
+        original_publish(path, payload)
+
+    monkeypatch.setattr(registry._io, "atomic_publish_noreplace", insert_same_then_publish)
+    entry = registry.register(config())
+    assert entry.version == 1
+    assert registry.load(entry) == config()
 
 
 def test_cross_process_lock_is_released_after_holder_crash(tmp_path: Path) -> None:

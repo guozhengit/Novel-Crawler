@@ -4,10 +4,10 @@
 
 ## Storage and crash guarantees
 
-- Revisions are immutable, content-address-checked history. A revision is durably committed before the safe manifest is replaced. If manifest replacement fails, the next open rebuilds it by scanning durable revisions.
+- Revisions are immutable, content-address-checked history. Revision publication is atomic and no-replace: POSIX links a durable anchored temporary file into its final name, while Windows uses write-through `MoveFileExW` without `REPLACE_EXISTING`. A pre-existing final name is compared under the registry lock and is never overwritten. A revision is durably committed before the safe manifest is replaced; if manifest replacement fails, the next open rebuilds it by scanning durable revisions.
 - Writes use exclusive temporary files, file durability flushes, atomic replacement, and parent-directory durability where the platform supports directory handles.
 - POSIX IO uses owner-only directories/files, `openat`-style directory descriptors, `O_NOFOLLOW`, same-descriptor `fstat` plus bounded reads, and directory `fsync` after mkdir, replace, and quarantine moves.
-- Windows IO establishes and verifies a protected DACL granting full control only to OWNER and SYSTEM. It rejects reparse points immediately before opens, calls `FlushFileBuffers` for files, and commits replacements with `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`.
+- Windows IO establishes DACLs through handle-level `SetSecurityInfo` and verifies a protected ACL containing exactly current-owner and SYSTEM full-control ACEs. Every operation holds trusted-root and ancestor directory handles opened with read/write sharing but no delete sharing, verifies canonical handle paths component by component, rejects reparse points, calls `FlushFileBuffers` for files, and uses write-through `MoveFileExW` for publication. Manifest and quarantine moves permit replacement where their protocols require it; revisions never do.
 - If any permission, ACL verification, no-follow, or required durability operation fails, the registry operation fails closed.
 
 ## Recovery and quarantine
