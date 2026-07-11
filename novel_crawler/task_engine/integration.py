@@ -48,6 +48,7 @@ class InteractionKind(StrEnum):
     VERIFICATION = "verification"
     CONFIRMATION = "confirmation"
     CLEANUP = "cleanup"
+    CANCEL_PENDING = "cancel_pending"
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,12 @@ class _PrivateInteraction:
 class _ProbeFlight:
     condition: threading.Condition = field(repr=False)
     done: bool = False
+
+
+@dataclass(frozen=True)
+class _CancelAttempt:
+    outcome: AdaptiveResult | None = None
+    failed: bool = False
 
 
 _RECOVERABLE_ERRORS = {
@@ -207,16 +214,22 @@ class AdaptiveTaskController:
                 interaction = self._interactions.get(task_id)
             if interaction is None:
                 continue
-            if interaction.kind is InteractionKind.CLEANUP:
+            if interaction.kind in {InteractionKind.CLEANUP, InteractionKind.CANCEL_PENDING}:
                 result = self.retry_cleanup(task_id)
                 if self.interaction(task_id) is not None:
                     complete = False
                     continue
                 del result
             else:
-                outcome = self._best_effort_cancel(interaction)
-                if outcome is not None and outcome.kind is ResolutionKind.CLEANUP_REQUIRED:
-                    self._store_result_handle(task_id, outcome)
+                attempt = self._best_effort_cancel(interaction)
+                if attempt.failed:
+                    current = self._repository.get_task(task_id)
+                    self._enter_cancel_pending(task_id, current, interaction)
+                    complete = False
+                    continue
+                if attempt.outcome is not None and attempt.outcome.kind is ResolutionKind.CLEANUP_REQUIRED:
+                    current = self._repository.get_task(task_id)
+                    self._apply_result(current, attempt.outcome)
                     complete = False
                     continue
             self._release_lease(task_id)
@@ -248,6 +261,19 @@ class AdaptiveTaskController:
                     return self._repository.get_task(task_id)
             if not self._owns_lease(task_id):
                 return self._repository.get_task(task_id)
+            leased = self._repository.get_task(task_id)
+            if leased.status is TaskStatus.WAITING_FOR_USER:
+                try:
+                    if not self._repository.renew_interaction_lease(
+                        task_id,
+                        expected_version=leased.version,
+                        owner_id=self._owner_id,
+                        owner_epoch=self._owner_epoch,
+                        expires_at=self._lease_expiry(),
+                    ):
+                        return self._repository.get_task(task_id)
+                except (TaskVersionConflict, InvalidTaskTransition):
+                    return self._repository.get_task(task_id)
             try:
                 if interaction.kind is InteractionKind.VERIFICATION:
                     outcome = self._adaptive.cancel(interaction.handle)
@@ -260,15 +286,7 @@ class AdaptiveTaskController:
                     return self._repository.get_task(task_id)
             except Exception:
                 current = self._repository.get_task(task_id)
-                return self._apply_result(
-                    current,
-                    AdaptiveResult(
-                        ConfigResolution(
-                            ResolutionKind.VERIFICATION_FAILED,
-                            reason_ids=("interaction_cancel_failed",),
-                        )
-                    ),
-                )
+                return self._enter_cancel_pending(task_id, current, interaction)
             current = self._repository.get_task(task_id)
             result = self._transition(current, TaskStatus.CANCELLED, "interaction_cancelled")
             self._release_lease(task_id)
@@ -278,13 +296,62 @@ class AdaptiveTaskController:
     def retry_cleanup(self, task_id: str) -> TaskRecord:
         with self._lock:
             interaction = self._interactions.get(task_id)
-        if interaction is None or interaction.kind is not InteractionKind.CLEANUP:
+        if interaction is None or interaction.kind not in {
+            InteractionKind.CLEANUP,
+            InteractionKind.CANCEL_PENDING,
+        }:
             return self._repository.get_task(task_id)
         with interaction.lock:
             with self._lock:
                 if self._interactions.get(task_id) is not interaction:
                     return self._repository.get_task(task_id)
+            if interaction.kind is InteractionKind.CANCEL_PENDING:
+                return self._retry_cancel_pending_locked(task_id, interaction)
             return self._retry_cleanup_locked(task_id, interaction)
+
+    retry_cancel_cleanup = retry_cleanup
+
+    def _enter_cancel_pending(
+        self,
+        task_id: str,
+        current: TaskRecord,
+        interaction: _PrivateInteraction,
+    ) -> TaskRecord:
+        self._store_cancel_pending(task_id, interaction)
+        if current.status in TERMINAL_STATUSES:
+            return current
+        try:
+            return self._repository.require_cleanup(
+                task_id,
+                expected_version=current.version,
+                error_code="interaction_cleanup_required",
+            )
+        except (TaskVersionConflict, InvalidTaskTransition):
+            return self._repository.get_task(task_id)
+
+    def _retry_cancel_pending_locked(
+        self, task_id: str, interaction: _PrivateInteraction
+    ) -> TaskRecord:
+        try:
+            outcome = self._adaptive.cancel(interaction.handle)
+        except Exception:
+            interaction.deadline = self._monotonic() + self._ttl
+            return self._repository.get_task(task_id)
+        current = self._repository.get_task(task_id)
+        if outcome.kind is ResolutionKind.CLEANUP_REQUIRED:
+            self._store_result_handle(task_id, outcome)
+            return current
+        if current.cleanup_required:
+            try:
+                resumed = self._repository.complete_cleanup_gate(
+                    task_id, expected_version=current.version
+                )
+            except (TaskVersionConflict, InvalidTaskTransition):
+                return self._repository.get_task(task_id)
+            self._drop(task_id)
+            return self._apply_result(resumed, outcome)
+        self._drop(task_id)
+        return self._apply_result(current, outcome)
 
     def sweep(self) -> int:
         try:
@@ -303,13 +370,22 @@ class AdaptiveTaskController:
             if terminal:
                 with self._lock:
                     interaction = self._interactions.get(task_id)
-                if interaction is not None and interaction.kind is InteractionKind.CLEANUP:
+                if interaction is not None and interaction.kind in {
+                    InteractionKind.CLEANUP,
+                    InteractionKind.CANCEL_PENDING,
+                }:
                     with interaction.lock:
-                        self._retry_cleanup_locked(task_id, interaction)
+                        if interaction.kind is InteractionKind.CANCEL_PENDING:
+                            self._retry_cancel_pending_locked(task_id, interaction)
+                        else:
+                            self._retry_cleanup_locked(task_id, interaction)
                 elif interaction is not None:
-                    outcome = self._best_effort_cancel(interaction)
-                    if outcome is not None and outcome.kind is ResolutionKind.CLEANUP_REQUIRED:
-                        self._store_result_handle(task_id, outcome)
+                    attempt = self._best_effort_cancel(interaction)
+                    if attempt.failed:
+                        current = self._repository.get_task(task_id)
+                        self._enter_cancel_pending(task_id, current, interaction)
+                    elif attempt.outcome is not None and attempt.outcome.kind is ResolutionKind.CLEANUP_REQUIRED:
+                        self._store_result_handle(task_id, attempt.outcome)
                         with self._lock:
                             cleanup = self._interactions.get(task_id)
                         if cleanup is not None:
@@ -331,14 +407,24 @@ class AdaptiveTaskController:
                 with self._lock:
                     if self._interactions.get(task_id) is not interaction:
                         continue
-                if interaction.kind is InteractionKind.CLEANUP:
-                    self._retry_cleanup_locked(task_id, interaction)
+                if interaction.kind in {InteractionKind.CLEANUP, InteractionKind.CANCEL_PENDING}:
+                    if interaction.kind is InteractionKind.CANCEL_PENDING:
+                        self._retry_cancel_pending_locked(task_id, interaction)
+                    else:
+                        self._retry_cleanup_locked(task_id, interaction)
                     swept += 1
                     continue
-                cancel_outcome = self._best_effort_cancel(interaction)
+                cancel_attempt = self._best_effort_cancel(interaction)
                 task = self._repository.get_task(task_id)
-                if cancel_outcome is not None and cancel_outcome.kind is ResolutionKind.CLEANUP_REQUIRED:
-                    self._apply_result(task, cancel_outcome)
+                if cancel_attempt.failed:
+                    self._enter_cancel_pending(task_id, task, interaction)
+                    swept += 1
+                    continue
+                if (
+                    cancel_attempt.outcome is not None
+                    and cancel_attempt.outcome.kind is ResolutionKind.CLEANUP_REQUIRED
+                ):
+                    self._apply_result(task, cancel_attempt.outcome)
                     swept += 1
                     continue
                 if task.status is TaskStatus.WAITING_FOR_USER:
@@ -448,12 +534,14 @@ class AdaptiveTaskController:
                 with self._lock:
                     abandoned = self._interactions.get(task.task_id)
                 if abandoned is not None:
-                    cancel_outcome = self._best_effort_cancel(abandoned)
+                    cancel_attempt = self._best_effort_cancel(abandoned)
                     if (
-                        cancel_outcome is not None
-                        and cancel_outcome.kind is ResolutionKind.CLEANUP_REQUIRED
+                        cancel_attempt.outcome is not None
+                        and cancel_attempt.outcome.kind is ResolutionKind.CLEANUP_REQUIRED
                     ):
-                        self._store_result_handle(task.task_id, cancel_outcome)
+                        self._store_result_handle(task.task_id, cancel_attempt.outcome)
+                    elif cancel_attempt.failed:
+                        self._store_cancel_pending(task.task_id, abandoned)
                     else:
                         self._drop(task.task_id)
                 return self._repository.get_task(task.task_id)
@@ -581,6 +669,28 @@ class AdaptiveTaskController:
             )
             self._interactions.move_to_end(task_id)
 
+    def _store_cancel_pending(
+        self, task_id: str, interaction: _PrivateInteraction
+    ) -> None:
+        expiry = self._wall_clock() + timedelta(seconds=self._ttl)
+        summary = InteractionSummary(
+            InteractionKind.CANCEL_PENDING,
+            safe_origin=interaction.summary.safe_origin,
+            attempt=interaction.summary.attempt,
+            expires_at=expiry.isoformat(),
+            cleanup_source="visible",
+            cleanup_required=True,
+        )
+        with self._lock:
+            self._interactions[task_id] = _PrivateInteraction(
+                InteractionKind.CANCEL_PENDING,
+                interaction.handle,
+                summary,
+                self._monotonic() + self._ttl,
+                interaction.lock,
+            )
+            self._interactions.move_to_end(task_id)
+
     def _reserve_capacity(self, task_id: str) -> bool:
         self.sweep()
         with self._lock:
@@ -625,7 +735,10 @@ class AdaptiveTaskController:
         if self._repository.get_task(task_id).status in TERMINAL_STATUSES:
             with self._lock:
                 interaction = self._interactions.get(task_id)
-            if interaction is None or interaction.kind is not InteractionKind.CLEANUP:
+            if interaction is None or interaction.kind not in {
+                InteractionKind.CLEANUP,
+                InteractionKind.CANCEL_PENDING,
+            }:
                 self._drop(task_id)
 
     def _recover_orphaned_waiting(self) -> int:
@@ -652,16 +765,19 @@ class AdaptiveTaskController:
                 break
         return count
 
-    def _best_effort_cancel(self, interaction: _PrivateInteraction) -> AdaptiveResult | None:
+    def _best_effort_cancel(self, interaction: _PrivateInteraction) -> _CancelAttempt:
         try:
-            if interaction.kind is InteractionKind.VERIFICATION:
-                return self._adaptive.cancel(interaction.handle)
+            if interaction.kind in {
+                InteractionKind.VERIFICATION,
+                InteractionKind.CANCEL_PENDING,
+            }:
+                return _CancelAttempt(self._adaptive.cancel(interaction.handle))
             elif interaction.kind is InteractionKind.CONFIRMATION:
                 token = interaction.handle.token if isinstance(interaction.handle, VerificationTicket) else interaction.handle
                 self._adaptive.config_manager.cancel(token)
         except Exception:
-            return None
-        return None
+            return _CancelAttempt(failed=True)
+        return _CancelAttempt()
 
 
 def _validate_overrides(overrides: Mapping[str, str] | None) -> dict[str, str]:
