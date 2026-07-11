@@ -159,6 +159,42 @@ def test_status_transitions_append_immutable_revisions_and_validate_reasons(tmp_
         registry.mark_invalid(active.config_id, ["secret=raw-token"])
 
 
+def test_transition_state_machine_makes_revoked_terminal_except_admin_unrevoke(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    active = registry.register(config())
+    stale = registry.mark_stale(active.config_id, expected_version=active.version, expected_status=ConfigStatus.ACTIVE)
+    validated = registry.mark_validated(
+        active.config_id,
+        "2026-07-11T09:00:00Z",
+        expected_version=stale.version,
+        expected_status=ConfigStatus.STALE,
+    )
+    revoked = registry.mark_revoked(
+        active.config_id,
+        expected_version=validated.version,
+        expected_status=ConfigStatus.ACTIVE,
+    )
+    for transition in (
+        lambda: registry.mark_stale(active.config_id, expected_version=revoked.version, expected_status=ConfigStatus.REVOKED),
+        lambda: registry.mark_invalid(active.config_id, ["hard_error"], expected_version=revoked.version, expected_status=ConfigStatus.REVOKED),
+        lambda: registry.mark_validated(active.config_id, "2026-07-11T10:00:00Z", expected_version=revoked.version, expected_status=ConfigStatus.REVOKED),
+        lambda: registry.mark_revoked(active.config_id, expected_version=revoked.version, expected_status=ConfigStatus.REVOKED),
+    ):
+        with pytest.raises(ConfigConflictError):
+            transition()
+    assert registry.list()[0] == revoked
+    restored = registry.unrevoke(active.config_id, expected_version=revoked.version, expected_status=ConfigStatus.REVOKED)
+    assert restored.status is ConfigStatus.STALE and restored.version == revoked.version + 1
+
+
+def test_transition_checks_expected_version_and_status_atomically(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    active = registry.register(config())
+    with pytest.raises(ConfigConflictError):
+        registry.mark_stale(active.config_id, expected_version=active.version, expected_status=ConfigStatus.STALE)
+    assert registry.list()[0] == active
+
+
 def test_manifest_is_safe_and_serializer_keeps_selectors_and_salt_only_in_revision(tmp_path: Path) -> None:
     registry = ConfigRegistry(tmp_path)
     registry.register(config())

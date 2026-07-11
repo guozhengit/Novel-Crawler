@@ -183,16 +183,26 @@ def _samples(value: object) -> tuple[Mapping[str, object], ...]:
     for sample in value:
         if not isinstance(sample, Mapping) or not set(sample) <= _SAMPLE_FIELDS or "page_kind" not in sample:
             raise ValueError("validation samples may contain structural summaries only")
-        if sample["page_kind"] not in {"book", "chapter", "catalog"}:
+        if sample["page_kind"] not in {"book", "chapter", "catalog", "chapter_first", "chapter_second"}:
             raise ValueError("invalid sample page_kind")
+        if "fingerprint" in sample and set(sample) != {"page_kind", "fingerprint"}:
+            raise ValueError("fingerprint samples contain only page_kind and fingerprint")
         clean: dict[str, object] = {}
         for key, item in sample.items():
             if key == "selector_match_counts":
                 if not isinstance(item, Mapping) or not all(isinstance(k, str) and _SCORE_KEY.fullmatch(k) and isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 1_000_000 for k, v in item.items()):
                     raise ValueError("invalid selector match summary")
                 clean[key] = MappingProxyType(dict(item))
-            elif key == "fingerprint" and (not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)):
-                raise ValueError("invalid structural fingerprint")
+            elif key == "fingerprint":
+                from .fingerprint import StructureFingerprint
+
+                if not isinstance(item, Mapping):
+                    raise ValueError("invalid structural fingerprint")
+                fingerprint = StructureFingerprint.from_dict(item)
+                expected_kind = "book" if sample["page_kind"] == "book" else "chapter"
+                if sample["page_kind"] not in {"book", "chapter_first", "chapter_second"} or fingerprint.page_kind != expected_kind:
+                    raise ValueError("structural fingerprint does not match sample kind")
+                clean[key] = MappingProxyType(fingerprint.to_dict())
             elif key == "matched_fields" and (not isinstance(item, int) or isinstance(item, bool) or item < 0):
                 raise ValueError("invalid matched_fields")
             elif key == "node_count_bucket" and (not isinstance(item, str) or not re.fullmatch(r"(?:0|[0-9]+-[0-9]+|[0-9]+\+)", item)):
@@ -302,6 +312,41 @@ class SiteConfig:
     def new(cls, *, site: str, domain: str, url_patterns: Sequence[str], selectors: Mapping[str, object], request_policy: Mapping[str, object] | None = None, generated_at: str | None = None) -> SiteConfig:
         now = generated_at or datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         return cls(schema_version=CURRENT_SCHEMA_VERSION, config_id=f"cfg_{secrets.token_urlsafe(18)}", site=site, domain=domain, url_patterns=url_patterns, selectors=selectors, request_policy=request_policy or {"timeout_seconds": 15.0, "max_retries": 2, "rate_limit_seconds": 0.5}, generated_at=now, last_validated=now, field_scores={}, validation_samples=[], fingerprint_salt=secrets.token_bytes(32))
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        site: str,
+        domain: str,
+        url_patterns: Sequence[str],
+        selectors: Mapping[str, object],
+        validation_samples: Sequence[Mapping[str, object]],
+        fingerprint_salt: bytes,
+        field_scores: Mapping[str, float] | None = None,
+        request_policy: Mapping[str, object] | None = None,
+        generated_at: str | None = None,
+    ) -> SiteConfig:
+        """Create an auto-generated active config with a complete replay baseline."""
+        labels = [sample.get("page_kind") for sample in validation_samples]
+        if len(labels) != 3 or not all(isinstance(label, str) for label in labels) or set(labels) != {"book", "chapter_first", "chapter_second"}:
+            raise ValueError("validation_samples must contain book, chapter_first and chapter_second exactly once")
+        now = generated_at or datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        return cls(
+            schema_version=CURRENT_SCHEMA_VERSION,
+            config_id=f"cfg_{secrets.token_urlsafe(18)}",
+            site=site,
+            domain=domain,
+            url_patterns=url_patterns,
+            selectors=selectors,
+            request_policy=request_policy
+            or {"timeout_seconds": 15.0, "max_retries": 2, "rate_limit_seconds": 0.5},
+            generated_at=now,
+            last_validated=now,
+            field_scores=field_scores or {},
+            validation_samples=validation_samples,
+            fingerprint_salt=fingerprint_salt,
+        )
 
 
 def _salt(value: object) -> bytes:

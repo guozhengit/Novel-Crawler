@@ -307,30 +307,94 @@ class ConfigRegistry:
             entries = [entry for entry in entries if entry.status is status]
         return tuple(sorted(entries, key=lambda item: (item.config_id, item.version)))
 
-    def mark_stale(self, config_id: str, *, expected_version: int | None = None) -> RegistryEntry:
-        return self._transition(config_id, ConfigStatus.STALE, (), expected_version=expected_version)
+    def mark_stale(
+        self,
+        config_id: str,
+        *,
+        expected_version: int | None = None,
+        expected_status: ConfigStatus | None = None,
+    ) -> RegistryEntry:
+        return self._transition(
+            config_id,
+            ConfigStatus.STALE,
+            (),
+            allowed_from=frozenset({ConfigStatus.ACTIVE, ConfigStatus.STALE}),
+            expected_version=expected_version,
+            expected_status=expected_status,
+        )
 
     def mark_invalid(
-        self, config_id: str, invalid_reason_ids: Sequence[str], *, expected_version: int | None = None
+        self,
+        config_id: str,
+        invalid_reason_ids: Sequence[str],
+        *,
+        expected_version: int | None = None,
+        expected_status: ConfigStatus | None = None,
     ) -> RegistryEntry:
         reasons = tuple(sorted(set(invalid_reason_ids)))
         if len(reasons) > 64:
             raise ValueError("at most 64 invalid reason ids are allowed")
         if not reasons or any(not isinstance(reason, str) or not _REASON_ID.fullmatch(reason) for reason in reasons):
             raise ValueError("invalid reason ids must be non-empty safe identifiers")
-        return self._transition(config_id, ConfigStatus.INVALID, reasons, expected_version=expected_version)
+        return self._transition(
+            config_id,
+            ConfigStatus.INVALID,
+            reasons,
+            allowed_from=frozenset({ConfigStatus.ACTIVE, ConfigStatus.STALE, ConfigStatus.INVALID}),
+            expected_version=expected_version,
+            expected_status=expected_status,
+        )
 
-    def mark_revoked(self, config_id: str, *, expected_version: int | None = None) -> RegistryEntry:
-        return self._transition(config_id, ConfigStatus.REVOKED, (), expected_version=expected_version)
+    def mark_revoked(
+        self,
+        config_id: str,
+        *,
+        expected_version: int | None = None,
+        expected_status: ConfigStatus | None = None,
+    ) -> RegistryEntry:
+        return self._transition(
+            config_id,
+            ConfigStatus.REVOKED,
+            (),
+            allowed_from=frozenset({ConfigStatus.ACTIVE, ConfigStatus.STALE, ConfigStatus.INVALID}),
+            expected_version=expected_version,
+            expected_status=expected_status,
+        )
 
-    def mark_validated(self, config_id: str, validated: str, *, expected_version: int | None = None) -> RegistryEntry:
+    def mark_validated(
+        self,
+        config_id: str,
+        validated: str,
+        *,
+        expected_version: int | None = None,
+        expected_status: ConfigStatus | None = None,
+    ) -> RegistryEntry:
         """Append an active revision whose only config-content change is validation time."""
         return self._transition(
             config_id,
             ConfigStatus.ACTIVE,
             (),
+            allowed_from=frozenset({ConfigStatus.ACTIVE, ConfigStatus.STALE}),
             expected_version=expected_version,
+            expected_status=expected_status,
             validated=validated,
+        )
+
+    def unrevoke(
+        self,
+        config_id: str,
+        *,
+        expected_version: int,
+        expected_status: ConfigStatus = ConfigStatus.REVOKED,
+    ) -> RegistryEntry:
+        """Explicit administrative recovery; restored configs must be revalidated."""
+        return self._transition(
+            config_id,
+            ConfigStatus.STALE,
+            (),
+            allowed_from=frozenset({ConfigStatus.REVOKED}),
+            expected_version=expected_version,
+            expected_status=expected_status,
         )
 
     def _transition(
@@ -339,7 +403,9 @@ class ConfigRegistry:
         status: ConfigStatus,
         invalid_reason_ids: tuple[str, ...],
         *,
+        allowed_from: frozenset[ConfigStatus],
         expected_version: int | None = None,
+        expected_status: ConfigStatus | None = None,
         validated: str | None = None,
     ) -> RegistryEntry:
         with self._config_lock(config_id):
@@ -351,6 +417,10 @@ class ConfigRegistry:
                 current = records[-1]
                 if expected_version is not None and current.entry.version != expected_version:
                     raise ConfigConflictError("config revision changed concurrently")
+                if expected_status is not None and current.entry.status is not expected_status:
+                    raise ConfigConflictError("config status changed concurrently")
+                if current.entry.status not in allowed_from:
+                    raise ConfigConflictError("config status transition is not allowed")
                 if sum(len(items) for items in self._history.values()) >= self._max_files:
                     raise RegistryLimitError("registry exceeds maximum files")
                 config = self._read_envelope(current.path).get("config")

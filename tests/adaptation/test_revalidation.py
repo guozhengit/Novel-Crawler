@@ -10,6 +10,7 @@ from novel_crawler.acquisition.classifier import PageKind
 from novel_crawler.acquisition.http import AcquisitionError
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.adaptation.config_schema import SiteConfig
+from novel_crawler.adaptation.extractor import CandidateExtractor
 from novel_crawler.adaptation.fingerprint import fingerprint_html
 from novel_crawler.adaptation.registry import ConfigConflictError, ConfigRegistry, ConfigStatus
 from novel_crawler.adaptation.revalidation import ConfigRevalidator, RevalidationResult, RevalidationStatus
@@ -20,14 +21,15 @@ C2 = "https://example.test/c2"
 
 
 def _index(*, wrapper: str = "", text: str = "Book A") -> str:
-    links = '<nav class="chapters"><a href="/c1">Chapter 1</a><a href="/c2">Chapter 2</a></nav>'
+    links = '<div id="chapters">' + "".join(f'<a class="chapter-link" href="/c{number}">Chapter {number}</a>' for number in range(1, 11)) + "</div>"
     return f"<html><body>{wrapper}<h1>{text}</h1>{links}</body></html>"
 
 
 def _chapter(number: int, *, wrapper: str = "", prose: str = "x" * 100) -> str:
+    paragraphs = "".join(f"<p>{prose}</p>" for _ in range(8))
     return (
-        f"<html><body>{wrapper}<h1>Chapter {number}</h1><article><p>{prose}</p></article>"
-        + (f'<a rel="next" href="/c{number + 1}">Next</a>' if number == 1 else "")
+        f"<html><body>{wrapper}<h1>Chapter {number}</h1><article>{paragraphs}</article>"
+        + f'<a rel="next" href="/c{number + 1}">Next</a>'
         + '<a class="index" href="/book">Contents</a></body></html>'
     )
 
@@ -53,16 +55,6 @@ class FakeAcquirer:
         return AcquiredPage(_snapshot(url, html), url)
 
 
-class AlwaysHighScorer:
-    def score_selector(self, field: str, selector: str, snapshot: PageSnapshot, page_kind: object) -> float:
-        del field, selector, snapshot, page_kind
-        return 0.95
-
-
-class Noop:
-    pass
-
-
 class MemoryRegistry:
     def __init__(self, config: SiteConfig | None, *, conflict: str | None = None) -> None:
         self.config = config
@@ -75,20 +67,20 @@ class MemoryRegistry:
             raise KeyError("missing")
         return self.config
 
-    def mark_validated(self, config_id: str, checked_at: str, *, expected_version: int) -> None:
-        del config_id, checked_at, expected_version
+    def mark_validated(self, config_id: str, checked_at: str, *, expected_version: int, expected_status: ConfigStatus) -> None:
+        del config_id, checked_at, expected_version, expected_status
         if self.conflict == "valid":
             raise ConfigConflictError("changed")
         self.transitions.append(("valid", ()))
 
-    def mark_stale(self, config_id: str, *, expected_version: int) -> None:
-        del config_id, expected_version
+    def mark_stale(self, config_id: str, *, expected_version: int, expected_status: ConfigStatus) -> None:
+        del config_id, expected_version, expected_status
         if self.conflict == "stale":
             raise ConfigConflictError("changed")
         self.transitions.append(("stale", ()))
 
-    def mark_invalid(self, config_id: str, reasons: tuple[str, ...], *, expected_version: int) -> None:
-        del config_id, expected_version
+    def mark_invalid(self, config_id: str, reasons: tuple[str, ...], *, expected_version: int, expected_status: ConfigStatus) -> None:
+        del config_id, expected_version, expected_status
         if self.conflict == "invalid":
             raise ConfigConflictError("changed")
         self.transitions.append(("invalid", reasons))
@@ -96,9 +88,15 @@ class MemoryRegistry:
 
 def _config(pages: dict[str, str], *, validated: str = "2026-07-11T08:00:00Z") -> SiteConfig:
     salt = b"s" * 32
+    extractor = CandidateExtractor()
+    book_candidates = {item.field.value: item.selector for item in extractor.extract(_snapshot(INDEX, pages[INDEX]), PageKind.BOOK_INDEX)}
+    chapter_candidates = {item.field.value: item.selector for item in extractor.extract(_snapshot(C1, pages[C1]), PageKind.CHAPTER)}
+    book_selectors = {key: book_candidates[key] for key in ("title", "chapter_list")}
+    chapter_selectors = {key: chapter_candidates[key] for key in ("chapter_title", "content", "next_link", "index_link")}
     samples = [
-        {"page_kind": "book", "fingerprint": fingerprint_html(pages[INDEX], "book", {"title": "h1", "chapter_list": ".chapters a"}, salt).digest},
-        {"page_kind": "chapter", "fingerprint": fingerprint_html(pages[C1], "chapter", {"chapter_title": "h1", "content": "article", "next_link": "a[rel=next]", "index_link": "a.index"}, salt).digest},
+        {"page_kind": "book", "fingerprint": fingerprint_html(pages[INDEX], "book", book_selectors, salt).to_dict()},
+        {"page_kind": "chapter_first", "fingerprint": fingerprint_html(pages[C1], "chapter", chapter_selectors, salt).to_dict()},
+        {"page_kind": "chapter_second", "fingerprint": fingerprint_html(pages[C2], "chapter", chapter_selectors, salt).to_dict()},
     ]
     return SiteConfig.from_dict(
         {
@@ -109,13 +107,13 @@ def _config(pages: dict[str, str], *, validated: str = "2026-07-11T08:00:00Z") -
             "url_patterns": ["/book", "/*"],
             "selectors": {
                 "clean": [],
-                "book": {"title": "h1", "chapter_list": ".chapters a"},
-                "chapter": {"chapter_title": "h1", "content": "article", "next_link": "a[rel=next]", "index_link": "a.index"},
+                "book": book_selectors,
+                "chapter": chapter_selectors,
             },
             "request_policy": {"timeout_seconds": 5, "max_retries": 0, "rate_limit_seconds": 0},
             "generated_at": "2026-07-11T07:00:00Z",
             "last_validated": validated,
-            "field_scores": {"title": 0.95, "chapter_list": 0.95, "chapter_title": 0.95, "content": 0.95},
+            "field_scores": {"title": 0.91, "chapter_list": 0.90, "chapter_title": 0.96, "content": 0.96},
             "validation_samples": samples,
             "fingerprint_salt": salt,
         }
@@ -123,7 +121,7 @@ def _config(pages: dict[str, str], *, validated: str = "2026-07-11T08:00:00Z") -
 
 
 def _service(registry: object, acquirer: FakeAcquirer) -> ConfigRevalidator:
-    return ConfigRevalidator(acquirer, Noop(), Noop(), AlwaysHighScorer(), Noop(), registry)
+    return ConfigRevalidator(acquirer=acquirer, registry=registry)  # type: ignore[arg-type]
 
 
 def _entry(config: SiteConfig, *, domain: str | None = None) -> object:
@@ -147,6 +145,7 @@ def test_valid_revalidation_appends_revision_and_only_updates_last_validated(tmp
     assert latest.validated == result.checked_at and latest.validated != entry.validated
     assert registry.load(entry, version=1).last_validated == entry.validated
     assert registry.load(latest).last_validated == result.checked_at
+    assert result.fingerprint_matches == {"book": True, "chapter_first": True, "chapter_second": True}
 
 
 def test_content_only_change_keeps_fingerprints_stable(tmp_path: Path) -> None:
@@ -169,6 +168,21 @@ def test_layout_drift_with_good_selectors_is_stale_and_never_valid(tmp_path: Pat
     assert "fingerprint_mismatch" in result.reason_ids
 
 
+def test_second_chapter_only_drift_is_stale_and_chapter_start_checks_input_fingerprint(tmp_path: Path) -> None:
+    original = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    second_drift = {**original, C2: _chapter(2, wrapper="<header></header>")}
+    registry, entry = _registered(tmp_path / "second", original)
+    second_result = _service(registry, FakeAcquirer(second_drift)).revalidate(entry, INDEX)
+    assert second_result.status is RevalidationStatus.STALE
+    assert second_result.fingerprint_matches["chapter_second"] is False
+
+    first_drift = {**original, C1: _chapter(1, wrapper="<header></header>")}
+    registry2, entry2 = _registered(tmp_path / "first", original)
+    first_result = _service(registry2, FakeAcquirer(first_drift)).revalidate(entry2, C1)
+    assert first_result.status is RevalidationStatus.STALE
+    assert first_result.fingerprint_matches["chapter_first"] is False
+
+
 def test_broken_selector_is_invalid_and_marks_registry(tmp_path: Path) -> None:
     pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
     payload = _config(pages).to_dict(include_sensitive=True)
@@ -179,6 +193,15 @@ def test_broken_selector_is_invalid_and_marks_registry(tmp_path: Path) -> None:
     assert result.status is RevalidationStatus.INVALID
     assert registry.list()[0].status is ConfigStatus.INVALID
     assert "selector_match_invalid" in result.reason_ids
+
+
+def test_real_scoring_or_aggregate_decision_below_high_confidence_is_stale(tmp_path: Path) -> None:
+    original = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    weak = {**original, C2: _chapter(2, prose="short prose")}
+    registry, entry = _registered(tmp_path, original)
+    result = _service(registry, FakeAcquirer(weak)).revalidate(entry, INDEX)
+    assert result.status is RevalidationStatus.STALE
+    assert result.reason_ids == ("score_below_threshold",)
 
 
 @pytest.mark.parametrize("code", ["timeout", "http_429", "http_500"])
@@ -206,6 +229,41 @@ def test_auth_is_stale_and_hard_404_is_invalid(tmp_path: Path) -> None:
     assert registry2.list()[0].status is ConfigStatus.INVALID
 
 
+def test_secondary_auth_and_error_are_classified_before_selector_replay(tmp_path: Path) -> None:
+    pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    auth_pages = {**pages, C2: "<title>Sign in</title><form><input type=password></form>"}
+    registry, entry = _registered(tmp_path / "auth", pages)
+    auth = _service(registry, FakeAcquirer(auth_pages)).revalidate(entry, INDEX)
+    assert auth.status is RevalidationStatus.STALE and auth.reason_ids == ("auth_required",)
+
+    error_pages = {**pages, C2: "<title>404 not found</title>"}
+    registry2, entry2 = _registered(tmp_path / "error", pages)
+    error = _service(registry2, FakeAcquirer(error_pages)).revalidate(entry2, INDEX)
+    assert error.status is RevalidationStatus.INVALID and error.reason_ids == ("hard_error",)
+
+
+def test_revoked_entry_is_terminal_without_fetch_or_mutation(tmp_path: Path) -> None:
+    pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    registry, active = _registered(tmp_path, pages)
+    revoked = registry.mark_revoked(active.config_id, expected_version=active.version, expected_status=ConfigStatus.ACTIVE)
+    acquirer = FakeAcquirer(pages)
+    result = _service(registry, acquirer).revalidate(revoked, INDEX)
+    assert result.status is RevalidationStatus.INVALID and result.reason_ids == ("config_revoked",)
+    assert acquirer.calls == [] and registry.list()[0] == revoked
+
+
+def test_missing_fingerprint_baseline_is_stale_not_valid(tmp_path: Path) -> None:
+    pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    payload = _config(pages).to_dict(include_sensitive=True)
+    payload["validation_samples"] = []
+    registry = ConfigRegistry(tmp_path)
+    entry = registry.register(SiteConfig.from_dict(payload))
+    result = _service(registry, FakeAcquirer(pages)).revalidate(entry, INDEX)
+    assert result.status is RevalidationStatus.STALE
+    assert result.reason_ids == ("fingerprint_baseline_missing",)
+    assert registry.list()[0].status is ConfigStatus.STALE
+
+
 def test_budget_and_cross_origin_are_enforced_before_fetch(tmp_path: Path) -> None:
     pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
     registry, entry = _registered(tmp_path, pages)
@@ -216,13 +274,13 @@ def test_budget_and_cross_origin_are_enforced_before_fetch(tmp_path: Path) -> No
 
     registry2, entry2 = _registered(tmp_path / "budget", pages)
     acquirer2 = FakeAcquirer(pages)
-    result2 = ConfigRevalidator(acquirer2, Noop(), Noop(), AlwaysHighScorer(), Noop(), registry2, max_revalidation_bytes=1).revalidate(entry2, INDEX)
+    result2 = ConfigRevalidator(acquirer=acquirer2, registry=registry2, max_revalidation_bytes=1).revalidate(entry2, INDEX)
     assert result2.status is RevalidationStatus.INVALID
     assert len(acquirer2.calls) == 1 and acquirer2.calls[0][1] == 1
 
 
 def test_result_is_immutable_and_safe() -> None:
-    result = RevalidationResult(RevalidationStatus.STALE, ("fingerprint_mismatch",), {"content": 0.9}, {"chapter": False}, "2026-07-11T09:00:00Z")
+    result = RevalidationResult(RevalidationStatus.STALE, ("fingerprint_mismatch",), {"content": 0.9}, {"chapter_second": False}, "2026-07-11T09:00:00Z")
     with pytest.raises((AttributeError, TypeError)):
         result.reason_ids = ()  # type: ignore[misc]
     serialized = json.loads(result.to_json())
@@ -249,45 +307,12 @@ def test_chapter_input_reuses_start_and_fetches_only_index_and_neighbor() -> Non
     assert [call[0] for call in acquirer.calls] == [C1, INDEX, C2]
 
 
-def test_low_scores_are_stale_and_valid_transition_conflict_is_not_retried() -> None:
+def test_valid_transition_conflict_is_not_retried() -> None:
     pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
     config = _config(pages)
-
-    class Low:
-        def score_selector(self, field: str, selector: str, snapshot: PageSnapshot, page_kind: object) -> float:
-            del field, selector, snapshot, page_kind
-            return 0.5
-
-    low_registry = MemoryRegistry(config)
-    low = ConfigRevalidator(FakeAcquirer(pages), Noop(), Noop(), Low(), Noop(), low_registry).revalidate(_entry(config), INDEX)  # type: ignore[arg-type]
-    assert low.status is RevalidationStatus.STALE and low.reason_ids == ("score_below_threshold",)
-
     conflict_registry = MemoryRegistry(config, conflict="valid")
     conflict = _service(conflict_registry, FakeAcquirer(pages)).revalidate(_entry(config), INDEX)  # type: ignore[arg-type]
     assert conflict.status is RevalidationStatus.STALE and conflict.reason_ids == ("concurrent_revision",)
-
-
-def test_configurable_minor_score_drift_still_requires_absolute_high_confidence() -> None:
-    pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
-    config = _config(pages)
-
-    class SlightlyLower:
-        def score_selector(self, field: str, selector: str, snapshot: PageSnapshot, page_kind: object) -> float:
-            del field, selector, snapshot, page_kind
-            return 0.90
-
-    strict = ConfigRevalidator(FakeAcquirer(pages), Noop(), Noop(), SlightlyLower(), Noop(), MemoryRegistry(config))
-    assert strict.revalidate(_entry(config), INDEX).status is RevalidationStatus.STALE  # type: ignore[arg-type]
-    tolerant = ConfigRevalidator(
-        FakeAcquirer(pages),
-        Noop(),
-        Noop(),
-        SlightlyLower(),
-        Noop(),
-        MemoryRegistry(config),
-        minor_drift_tolerance=0.05,
-    )
-    assert tolerant.revalidate(_entry(config), INDEX).status is RevalidationStatus.VALID  # type: ignore[arg-type]
 
 
 def test_config_identity_url_and_terminal_hard_errors_fail_closed_before_navigation() -> None:
@@ -350,37 +375,9 @@ def test_constructor_and_origin_boundaries_are_strict() -> None:
             ConfigRevalidator._origin_key(url)
 
 
-def test_repr_default_scoring_and_invalid_scorer_outputs_are_safe() -> None:
-    pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
-    config = _config(pages)
-    entry = _entry(config)
+def test_result_repr_is_safe() -> None:
     result = RevalidationResult(RevalidationStatus.VALID, (), {}, {}, "2026-07-11T09:00:00Z")
     assert "selector" not in repr(result)
-    default = ConfigRevalidator(registry=MemoryRegistry(config))
-    score = default._score("title", "h1", _snapshot(INDEX, pages[INDEX]), PageKind.BOOK_INDEX, 1)
-    assert 0 <= score <= 1
-    assert default._score("future_field", "h1", _snapshot(INDEX, pages[INDEX]), PageKind.BOOK_INDEX, 1) == 1
-
-    class Missing:
-        pass
-
-    class BadDirect:
-        def score_selector(self, *args: object) -> bool:
-            del args
-            return True
-
-    class BadScored:
-        score = None
-
-    class BadIndirect:
-        def score(self, *args: object) -> BadScored:
-            del args
-            return BadScored()
-
-    for scorer in (Missing(), BadDirect(), BadIndirect()):
-        service = ConfigRevalidator(FakeAcquirer(pages), Noop(), Noop(), scorer, Noop(), MemoryRegistry(config))  # type: ignore[arg-type]
-        invalid = service.revalidate(entry, INDEX)  # type: ignore[arg-type]
-        assert invalid.status is RevalidationStatus.INVALID
 
 
 def test_fetch_catalog_and_anchor_guards_cover_every_bounded_boundary() -> None:
@@ -432,9 +429,7 @@ def test_fetch_catalog_and_anchor_guards_cover_every_bounded_boundary() -> None:
             del max_body_bytes, locked_origin
             return AcquiredPage(_snapshot(url, "xx"), url)
 
-    oversized = ConfigRevalidator(
-        Oversized(pages), Noop(), Noop(), AlwaysHighScorer(), Noop(), MemoryRegistry(config), max_revalidation_bytes=1
-    )
+    oversized = ConfigRevalidator(acquirer=Oversized(pages), registry=MemoryRegistry(config), max_revalidation_bytes=1)  # type: ignore[arg-type]
     oversized._origin = oversized._origin_key(INDEX)
     with pytest.raises(AcquisitionError):
         oversized._fetch(INDEX)

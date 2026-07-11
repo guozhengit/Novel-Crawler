@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError, is_dataclass
 import pytest
 
 from novel_crawler.adaptation.config_schema import SafeUrlPattern, SiteConfig
+from novel_crawler.adaptation.fingerprint import StructureFingerprint
 
 
 def valid_payload() -> dict[str, object]:
@@ -99,6 +100,34 @@ def test_rejects_missing_fields_and_generates_safe_id() -> None:
     assert generated.config_id.startswith("cfg_")
     assert len(generated.config_id) >= 20
     assert len(generated.fingerprint_salt) == 32
+
+
+def test_create_requires_complete_three_page_fingerprint_baseline() -> None:
+    payload = valid_payload()
+    with pytest.raises(ValueError, match="validation_samples"):
+        SiteConfig.create(
+            site="Example",
+            domain="example.com",
+            url_patterns=["/book/*"],
+            selectors=payload["selectors"],
+            validation_samples=[],
+            fingerprint_salt=b"s" * 32,
+        )
+
+    samples = [
+        {"page_kind": "book", "fingerprint": StructureFingerprint(1, "book", "1" * 64).to_dict()},
+        {"page_kind": "chapter_first", "fingerprint": StructureFingerprint(1, "chapter", "2" * 64).to_dict()},
+        {"page_kind": "chapter_second", "fingerprint": StructureFingerprint(1, "chapter", "3" * 64).to_dict()},
+    ]
+    created = SiteConfig.create(
+        site="Example",
+        domain="example.com",
+        url_patterns=["/book/*"],
+        selectors=payload["selectors"],
+        validation_samples=samples,
+        fingerprint_salt=b"s" * 32,
+    )
+    assert [sample["page_kind"] for sample in created.validation_samples] == ["book", "chapter_first", "chapter_second"]
 
 
 @pytest.mark.parametrize("field,value", [

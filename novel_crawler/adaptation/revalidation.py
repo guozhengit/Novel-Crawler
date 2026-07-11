@@ -6,6 +6,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -15,19 +16,20 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup, Tag
 from soupsieve.util import SelectorSyntaxError
 
-from novel_crawler.acquisition.classifier import PageClassifier, PageKind
+from novel_crawler.acquisition.classifier import Classification, PageClassifier, PageKind
 from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
-from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
+from novel_crawler.acquisition.models import AcquiredPage
 
 from .config_schema import SiteConfig
-from .fingerprint import fingerprint_html
-from .models import Candidate, FieldKind
-from .registry import ConfigConflictError, ConfigRegistry, RegistryEntry, RegistryError
-from .scoring import CandidateScorer, ScoringContext
+from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, ScoredPageBatch
+from .extractor import CandidateExtractor
+from .fingerprint import StructureFingerprint, fingerprint_html
+from .models import ExtractionResult
+from .registry import ConfigConflictError, ConfigRegistry, ConfigStatus, RegistryEntry, RegistryError
+from .scoring import CandidateScorer, ScoredCandidate, ScoringContext
 
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
-_FINGERPRINT_KINDS = {"book": PageKind.BOOK_INDEX, "chapter": PageKind.CHAPTER}
-_FIELD_KINDS = {item.value: item for item in FieldKind}
+_FINGERPRINT_KINDS = {"book": PageKind.BOOK_INDEX, "chapter_first": PageKind.CHAPTER, "chapter_second": PageKind.CHAPTER}
 _CORE_FIELDS = frozenset({"title", "chapter_list", "chapter_title", "content"})
 _OPTIONAL_ANCHORS = frozenset({"prev_link", "next_link"})
 
@@ -119,16 +121,33 @@ class PageAcquirer(Protocol):
     ) -> AcquiredPage: ...
 
 
+@dataclass(frozen=True)
+class _AnalyzedPage:
+    acquired: AcquiredPage
+    classification: Classification
+    extraction: ExtractionResult
+    scored: tuple[ScoredCandidate, ...]
+    decision: AdaptationDecision
+
+
+class _AuthRequired(RuntimeError):
+    pass
+
+
+class _HardPageError(RuntimeError):
+    pass
+
+
 class ConfigRevalidator:
     """Revalidate an existing config without widening the probe surface."""
 
     def __init__(
         self,
         acquirer: PageAcquirer | None = None,
-        classifier: object | None = None,
-        extractor: object | None = None,
-        scorer: object | None = None,
-        decision: object | None = None,
+        classifier: PageClassifier | None = None,
+        extractor: CandidateExtractor | None = None,
+        scorer: CandidateScorer | None = None,
+        decision: DecisionPolicy | None = None,
         registry: ConfigRegistry | None = None,
         *,
         max_pages: int = 3,
@@ -146,9 +165,9 @@ class ConfigRevalidator:
             raise ValueError("minor_drift_tolerance must be finite and bounded")
         self.acquirer = acquirer or HttpPageAcquirer(max_body_bytes=min(20 * 1024, max_revalidation_bytes))
         self.classifier = classifier or PageClassifier()
-        self.extractor = extractor
+        self.extractor = extractor or CandidateExtractor()
         self.scorer = scorer or CandidateScorer()
-        self.decision = decision
+        self.decision = decision or DecisionPolicy()
         self.registry = registry
         self.max_pages = 3
         self.max_revalidation_bytes = min(20 * 1024, max_revalidation_bytes)
@@ -161,12 +180,16 @@ class ConfigRevalidator:
     def revalidate(self, entry: RegistryEntry, input_url: str) -> RevalidationResult:
         checked_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
         self._fetches = self._bytes = 0
+        if entry.status is ConfigStatus.REVOKED:
+            return RevalidationResult(RevalidationStatus.INVALID, ("config_revoked",), {}, {}, checked_at)
         try:
             config = self.registry.load(entry)
         except (KeyError, RegistryError, TypeError, ValueError):
             return self._invalid(entry, ("config_invalid",), checked_at)
         if config.config_id != entry.config_id or config.domain != entry.domain:
             return self._invalid(entry, ("config_identity_mismatch",), checked_at)
+        if self._fingerprint_baselines(config) is None:
+            return self._stale(entry, ("fingerprint_baseline_missing",), {}, {}, checked_at)
         try:
             self._origin = self._origin_key(input_url)
         except ValueError:
@@ -175,17 +198,14 @@ class ConfigRevalidator:
             return self._invalid(entry, ("domain_mismatch",), checked_at)
         try:
             start = self._fetch(input_url)
-            terminal = self._terminal_status(start.snapshot)
-            if terminal is RevalidationStatus.STALE:
-                return self._stale(entry, ("auth_required",), {}, {}, checked_at)
-            if terminal is RevalidationStatus.INVALID:
-                return self._invalid(entry, ("hard_error",), checked_at)
-
             index, first, second = self._collect_pages(start, config)
             scores: dict[str, float] = {}
-            self._replay(config, "book", index.snapshot, scores)
-            self._replay(config, "chapter", first.snapshot, scores)
-            self._replay(config, "chapter", second.snapshot, scores)
+            self._replay(config, "book", index, scores)
+            self._replay(config, "chapter", first, scores)
+            self._replay(config, "chapter", second, scores)
+            decisions_are_high_confidence = all(
+                page.decision.kind is DecisionKind.AUTO_ACCEPT for page in (index, first, second)
+            )
             low = tuple(
                 sorted(
                     key
@@ -195,14 +215,18 @@ class ConfigRevalidator:
                     < float(config.field_scores.get(key, scores.get(key, 0.0))) - self.minor_drift_tolerance
                 )
             )
-            if low:
+            if low or not decisions_are_high_confidence:
                 return self._stale(entry, ("score_below_threshold",), scores, {}, checked_at)
-            matches = self._fingerprint_matches(config, index.snapshot, first.snapshot)
+            matches = self._fingerprint_matches(config, index, first, second)
             if not matches or not all(matches.values()):
                 return self._stale(entry, ("fingerprint_mismatch",), scores, matches, checked_at)
             if not self._mark_valid(entry, checked_at):
                 return self._conflict_result(entry, scores, matches, checked_at)
             return RevalidationResult(RevalidationStatus.VALID, (), scores, matches, checked_at)
+        except _AuthRequired:
+            return self._stale(entry, ("auth_required",), {}, {}, checked_at)
+        except _HardPageError:
+            return self._invalid(entry, ("hard_error",), checked_at)
         except AcquisitionError as exc:
             if exc.recoverable or exc.code in {"timeout", "http_408", "http_429"} or exc.code.startswith("http_5"):
                 return RevalidationResult(RevalidationStatus.TRANSIENT_FAILURE, ("acquisition_transient",), {}, {}, checked_at)
@@ -210,27 +234,33 @@ class ConfigRevalidator:
         except (SelectorSyntaxError, TypeError, ValueError):
             return self._invalid(entry, ("selector_match_invalid",), checked_at)
 
-    def _collect_pages(self, start: AcquiredPage, config: SiteConfig) -> tuple[AcquiredPage, AcquiredPage, AcquiredPage]:
+    def _collect_pages(
+        self, start: _AnalyzedPage, config: SiteConfig
+    ) -> tuple[_AnalyzedPage, _AnalyzedPage, _AnalyzedPage]:
         book = self._selector_group(config, "book")
-        links = self._catalog_links(start, book.get("chapter_list", ""))
-        prefetched: AcquiredPage | None = None
-        if links:
+        links = self._catalog_links(start.acquired, book.get("chapter_list", "")) if start.classification.kind is PageKind.BOOK_INDEX else []
+        prefetched: _AnalyzedPage | None = None
+        if start.classification.kind is PageKind.BOOK_INDEX and links:
             index = start
-        else:
+        elif start.classification.kind is PageKind.CHAPTER:
             chapter = self._selector_group(config, "chapter")
             index_selector = chapter.get("index_link")
             if not index_selector:
                 raise ValueError("chapter config requires index_link")
-            index_url = self._single_anchor(start, index_selector, required=True)
+            index_url = self._single_anchor(start.acquired, index_selector, required=True)
             assert index_url is not None
             prefetched = start
             index = self._fetch(index_url)
-            links = self._catalog_links(index, book.get("chapter_list", ""))
+            if index.classification.kind is not PageKind.BOOK_INDEX:
+                raise ValueError("index page kind is invalid")
+            links = self._catalog_links(index.acquired, book.get("chapter_list", ""))
+        else:
+            raise ValueError("start page kind is unsupported")
         if len(links) < 2:
             raise ValueError("catalog requires adjacent chapters")
         if prefetched is None:
             return index, self._fetch(links[0]), self._fetch(links[1])
-        current = self._canonical(prefetched.navigation_url)
+        current = self._canonical(prefetched.acquired.navigation_url)
         position = next((number for number, link in enumerate(links) if self._canonical(link) == current), -1)
         if position < 0:
             raise ValueError("chapter missing from catalog")
@@ -238,8 +268,12 @@ class ConfigRevalidator:
         other = self._fetch(links[neighbor])
         return (index, prefetched, other) if neighbor > position else (index, other, prefetched)
 
-    def _replay(self, config: SiteConfig, kind: str, snapshot: PageSnapshot, scores: dict[str, float]) -> None:
+    def _replay(self, config: SiteConfig, kind: str, page: _AnalyzedPage, scores: dict[str, float]) -> None:
+        expected_kind = PageKind.BOOK_INDEX if kind == "book" else PageKind.CHAPTER
+        if page.classification.kind is not expected_kind:
+            raise ValueError("page kind does not satisfy replay contract")
         selectors = self._selector_group(config, kind)
+        snapshot = page.acquired.snapshot
         soup = BeautifulSoup(snapshot.html, "lxml")
         for clean_selector in config.selectors["clean"]:
             soup.select(str(clean_selector))
@@ -259,46 +293,47 @@ class ConfigRevalidator:
                 not isinstance(nodes[0], Tag) or nodes[0].name != "a" or not nodes[0].get("href")
             ):
                 raise ValueError("navigation selector must match an anchor")
-            score = self._score(field, selector, snapshot, _FINGERPRINT_KINDS[kind], len(nodes))
+            scored = next(
+                (
+                    item
+                    for item in page.scored
+                    if item.candidate.field.value == field and item.candidate.selector == selector
+                ),
+                None,
+            )
+            if scored is None:
+                raise ValueError("saved selector is absent from extracted candidates")
+            score = scored.score
             scores[field] = min(scores.get(field, 1.0), score)
 
-    def _score(self, field: str, selector: str, snapshot: PageSnapshot, kind: PageKind, count: int) -> float:
-        direct = getattr(self.scorer, "score_selector", None)
-        if callable(direct):
-            value = direct(field, selector, snapshot, kind)
-            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
-                raise TypeError("score_selector returned an invalid score")
-            return max(0.0, min(1.0, float(value)))
-        field_kind = _FIELD_KINDS.get(field)
-        if field_kind is None:
-            return 1.0
-        candidate = Candidate(field_kind, selector, f"matches={count}", 1.0, 1.0, (), {})
-        score_method = getattr(self.scorer, "score", None)
-        if not callable(score_method):
-            raise TypeError("scorer must provide score or score_selector")
-        scored = score_method(candidate, ScoringContext(kind, snapshot))
-        value = getattr(scored, "score", None)
-        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
-            raise TypeError("scorer returned an invalid score")
-        return max(0.0, min(1.0, float(value)))
-
     def _fingerprint_matches(
-        self, config: SiteConfig, index: PageSnapshot, chapter: PageSnapshot
+        self,
+        config: SiteConfig,
+        index: _AnalyzedPage,
+        first: _AnalyzedPage,
+        second: _AnalyzedPage,
     ) -> dict[str, bool]:
-        expected: dict[str, set[str]] = {}
-        for sample in config.validation_samples:
-            fingerprint = sample.get("fingerprint")
-            kind = sample.get("page_kind")
-            if isinstance(kind, str) and isinstance(fingerprint, str):
-                expected.setdefault(kind, set()).add(fingerprint)
+        expected = self._fingerprint_baselines(config)
+        if expected is None:
+            return {}
         matches: dict[str, bool] = {}
-        for kind, snapshot in (("book", index), ("chapter", chapter)):
+        for label, page in (("book", index), ("chapter_first", first), ("chapter_second", second)):
+            kind = "book" if label == "book" else "chapter"
             candidates = self._selector_group(config, kind)
-            actual = fingerprint_html(snapshot.html, kind, candidates, config.fingerprint_salt).digest
-            matches[kind] = actual in expected.get(kind, set())
+            actual = fingerprint_html(page.acquired.snapshot.html, kind, candidates, config.fingerprint_salt)
+            matches[label] = actual == expected[label]
         return matches
 
-    def _fetch(self, url: str) -> AcquiredPage:
+    @staticmethod
+    def _fingerprint_baselines(config: SiteConfig) -> dict[str, StructureFingerprint] | None:
+        expected: dict[str, StructureFingerprint] = {}
+        for sample in config.validation_samples:
+            label, raw = sample.get("page_kind"), sample.get("fingerprint")
+            if isinstance(label, str) and label in _FINGERPRINT_KINDS and isinstance(raw, Mapping):
+                expected[label] = StructureFingerprint.from_dict(raw)
+        return expected if set(expected) == set(_FINGERPRINT_KINDS) else None
+
+    def _fetch(self, url: str) -> _AnalyzedPage:
         if self._fetches >= self.max_pages:
             raise ValueError("revalidation page budget exceeded")
         if self._origin_key(url) != self._origin:
@@ -314,7 +349,23 @@ class ConfigRevalidator:
             raise AcquisitionError("response_too_large", self._origin_display(url), False)
         self._fetches += 1
         self._bytes += size
-        return page
+        return self._analyze(page)
+
+    def _analyze(self, page: AcquiredPage) -> _AnalyzedPage:
+        snapshot = page.snapshot
+        classification = self.classifier.classify(snapshot)
+        if classification.kind is PageKind.AUTH_OR_CHALLENGE:
+            raise _AuthRequired
+        if classification.kind is PageKind.ERROR:
+            raise _HardPageError
+        extraction = self.extractor.extract(snapshot, classification.kind)
+        context = ScoringContext(classification.kind, snapshot)
+        scored = tuple(self.scorer.score(candidate, context) for candidate in extraction)
+        decision = self.decision.decide(
+            classification,
+            ScoredPageBatch(context.sample_id, context.origin_key, classification.kind, scored),
+        )
+        return _AnalyzedPage(page, classification, extraction, scored, decision)
 
     def _catalog_links(self, page: AcquiredPage, selector: str) -> list[str]:
         if not selector:
@@ -347,16 +398,6 @@ class ConfigRevalidator:
             raise AcquisitionError("cross_origin", self._origin_display(link), False)
         return link
 
-    def _terminal_status(self, snapshot: PageSnapshot) -> RevalidationStatus | None:
-        classify = getattr(self.classifier, "classify", None)
-        classification = classify(snapshot) if callable(classify) else PageClassifier().classify(snapshot)
-        kind = getattr(classification, "kind", None)
-        if kind is PageKind.AUTH_OR_CHALLENGE:
-            return RevalidationStatus.STALE
-        if kind is PageKind.ERROR or snapshot.status_code == 404:
-            return RevalidationStatus.INVALID
-        return None
-
     @staticmethod
     def _selector_group(config: SiteConfig, kind: str) -> dict[str, str]:
         raw = config.selectors[kind]
@@ -366,7 +407,12 @@ class ConfigRevalidator:
 
     def _mark_valid(self, entry: RegistryEntry, checked_at: str) -> bool:
         try:
-            self.registry.mark_validated(entry.config_id, checked_at, expected_version=entry.version)
+            self.registry.mark_validated(
+                entry.config_id,
+                checked_at,
+                expected_version=entry.version,
+                expected_status=entry.status,
+            )
             return True
         except ConfigConflictError:
             self.registry.load(entry.config_id)
@@ -381,7 +427,11 @@ class ConfigRevalidator:
         checked_at: str,
     ) -> RevalidationResult:
         try:
-            self.registry.mark_stale(entry.config_id, expected_version=entry.version)
+            self.registry.mark_stale(
+                entry.config_id,
+                expected_version=entry.version,
+                expected_status=entry.status,
+            )
         except ConfigConflictError:
             self.registry.load(entry.config_id)
             reasons = (*reasons, "concurrent_revision")
@@ -389,7 +439,12 @@ class ConfigRevalidator:
 
     def _invalid(self, entry: RegistryEntry, reasons: tuple[str, ...], checked_at: str) -> RevalidationResult:
         try:
-            self.registry.mark_invalid(entry.config_id, reasons, expected_version=entry.version)
+            self.registry.mark_invalid(
+                entry.config_id,
+                reasons,
+                expected_version=entry.version,
+                expected_status=entry.status,
+            )
         except (ConfigConflictError, KeyError, RegistryError):
             try:
                 self.registry.load(entry.config_id)
