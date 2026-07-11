@@ -187,6 +187,14 @@ class ConfigRegistry:
             self._io.verify_private(directory)
         self._history: dict[str, list[_Record]] = {}
         with self._global_lock():
+            resolution_stream = self._io.open_lock(self._locks / "resolution.lock")
+            try:
+                resolution_stream.seek(0, os.SEEK_END)
+                if resolution_stream.tell() == 0:
+                    resolution_stream.write(b"\0")
+                    resolution_stream.flush()
+            finally:
+                resolution_stream.close()
             self._recover()
 
     @contextmanager
@@ -202,6 +210,20 @@ class ConfigRegistry:
         key = f"{self.root.resolve(strict=False)}:{name}"
         with _bounded_thread_lock(_thread_lock(key), self._lock_timeout):
             with _FileLock(self._locks / f"{name}.lock", self._lock_timeout, self._io):
+                yield
+
+    @contextmanager
+    def resolution_lock(self, domain: str) -> Iterator[None]:
+        """Serialize reuse/probe/register decisions for one domain across processes."""
+        try:
+            normalized = domain.rstrip(".").encode("idna").decode("ascii").lower()
+        except (AttributeError, UnicodeError):
+            raise ValueError("domain is invalid") from None
+        if not normalized or any(char in normalized for char in "/@?#:"):
+            raise ValueError("domain is invalid")
+        key = f"{self.root.resolve(strict=False)}:resolution"
+        with _bounded_thread_lock(_thread_lock(key), self._lock_timeout):
+            with _FileLock(self._locks / "resolution.lock", self._lock_timeout, self._io):
                 yield
 
     def register(self, config: SiteConfig) -> RegistryEntry:
@@ -236,6 +258,19 @@ class ConfigRegistry:
                 return entry
 
     def lookup(self, url: str) -> RegistryEntry | None:
+        with self._global_lock():
+            self._recover()
+            matched = self._active_match(url)
+            return matched[0].entry if matched is not None else None
+
+    def load_active(self, url: str) -> SiteConfig | None:
+        """Atomically match and load the current active config for a URL."""
+        with self._global_lock():
+            self._recover()
+            matched = self._active_match(url)
+            return matched[1] if matched is not None else None
+
+    def _active_match(self, url: str) -> tuple[_Record, SiteConfig] | None:
         try:
             parsed = urlsplit(url)
             if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or not parsed.hostname:
@@ -246,21 +281,19 @@ class ConfigRegistry:
             return None
         relative = parsed.path or "/"
         absolute = f"{parsed.scheme}://{domain}" + (f":{port}" if port is not None else "") + relative
-        with self._global_lock():
-            self._recover()
-            matches: list[RegistryEntry] = []
-            for records in self._history.values():
-                current = records[-1]
-                if current.entry.status is not ConfigStatus.ACTIVE or current.entry.domain != domain:
-                    continue
-                config = self._load_record(current)
-                if config is None:
-                    continue
-                if any(pattern.matches(relative) or pattern.matches(absolute) for pattern in config.url_patterns):
-                    matches.append(current.entry)
-            if not matches:
-                return None
-            return max(matches, key=lambda item: (item.validated, item.version, item.config_id))
+        matches: list[tuple[_Record, SiteConfig]] = []
+        for records in self._history.values():
+            current = records[-1]
+            if current.entry.status is not ConfigStatus.ACTIVE or current.entry.domain != domain:
+                continue
+            config = self._load_record(current)
+            if config is None:
+                continue
+            if any(pattern.matches(relative) or pattern.matches(absolute) for pattern in config.url_patterns):
+                matches.append((current, config))
+        if not matches:
+            return None
+        return max(matches, key=lambda item: (item[0].entry.validated, item[0].entry.version, item[0].entry.config_id))
 
     def load(self, entry_or_id: RegistryEntry | str, *, version: int | None = None) -> SiteConfig:
         selected_version: int | None

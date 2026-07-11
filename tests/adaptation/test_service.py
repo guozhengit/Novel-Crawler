@@ -58,6 +58,23 @@ def test_probe_starting_at_chapter_fetches_index_and_two_adjacent_pages_only() -
     assert "/c1" not in result.to_json() and "secret" not in result.to_json()
 
 
+def test_each_probe_uses_a_fresh_private_salt_and_complete_structural_baseline() -> None:
+    pages = {
+        "https://example.test/book": '<h1>Book A</h1><div id="list"><a href="/c1">Chapter 1</a><a href="/c2">Chapter 2</a><a href="/c3">Chapter 3</a></div>',
+        "https://example.test/c1": '<h1>Chapter 1</h1><article><p>' + "a" * 80 + '</p><p>x</p></article><a rel="next" href="/c2">Next</a>',
+        "https://example.test/c2": '<h1>Chapter 2</h1><article><p>' + "b" * 90 + "</p><p>y</p></article>",
+    }
+    first = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/book")
+    second = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/book")
+    assert first.config_draft is not None and second.config_draft is not None
+    first_private = first.config_draft.to_config()
+    second_private = second.config_draft.to_config()
+    assert set(first_private["fingerprints"]) == {"book", "chapter_first", "chapter_second"}
+    assert first_private["fingerprint_salt"] != second_private["fingerprint_salt"]
+    assert first_private["fingerprints"] != second_private["fingerprints"]
+    assert "digest" not in first.to_json() and "salt" not in first.to_json()
+
+
 def test_probe_rejects_wrong_next_and_never_fetches_more_than_three_pages() -> None:
     pages = {
         "https://example.test/book": '<h1>Book A</h1><div id="list"><a href="/c1">Chapter 1</a><a href="/c2">Chapter 2</a><a href="/c3">Chapter 3</a></div>',

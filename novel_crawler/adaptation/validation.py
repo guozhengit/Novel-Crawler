@@ -13,6 +13,7 @@ from typing import Any
 from novel_crawler.acquisition.classifier import PageKind
 
 from .decision import DecisionKind
+from .fingerprint import StructureFingerprint
 
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 
@@ -20,14 +21,25 @@ _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 class ConfigDraft:
     """Draft configuration whose selectors remain process-private."""
 
-    __slots__ = ("_domain", "_scores", "_selectors", "_version")
+    __slots__ = ("_domain", "_fingerprint_salt", "_fingerprints", "_scores", "_selectors", "_version")
     _selectors: Mapping[str, str]
+    _fingerprints: Mapping[str, StructureFingerprint]
+    _fingerprint_salt: bytes | None
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
         raise AttributeError("ConfigDraft is immutable")
 
-    def __init__(self, version: str, domain: str, scores: Mapping[str, float], selectors: Mapping[str, str]) -> None:
+    def __init__(
+        self,
+        version: str,
+        domain: str,
+        scores: Mapping[str, float],
+        selectors: Mapping[str, str],
+        *,
+        fingerprints: Mapping[str, StructureFingerprint] | None = None,
+        fingerprint_salt: bytes | None = None,
+    ) -> None:
         if not _SAFE_ID.fullmatch(version) or not domain or "/" in domain:
             raise ValueError("invalid draft identity")
         if not all(_SAFE_ID.fullmatch(key) and math.isfinite(value) and 0 <= value <= 1 for key, value in scores.items()):
@@ -36,6 +48,20 @@ class ConfigDraft:
         object.__setattr__(self, "_domain", domain)
         object.__setattr__(self, "_scores", MappingProxyType(dict(scores)))
         object.__setattr__(self, "_selectors", MappingProxyType(dict(selectors)))
+        values = dict(fingerprints or {})
+        if values and (
+            set(values) != {"book", "chapter_first", "chapter_second"}
+            or values["book"].page_kind != "book"
+            or values["chapter_first"].page_kind != "chapter"
+            or values["chapter_second"].page_kind != "chapter"
+        ):
+            raise ValueError("fingerprints must contain the complete three-page baseline")
+        if fingerprint_salt is not None and (not isinstance(fingerprint_salt, bytes) or len(fingerprint_salt) != 32):
+            raise ValueError("fingerprint_salt must be exactly 32 bytes")
+        if bool(values) != (fingerprint_salt is not None):
+            raise ValueError("fingerprints and fingerprint_salt must be supplied together")
+        object.__setattr__(self, "_fingerprints", MappingProxyType(values))
+        object.__setattr__(self, "_fingerprint_salt", fingerprint_salt)
 
     version = property(lambda self: self._version)
     domain = property(lambda self: self._domain)
@@ -45,11 +71,17 @@ class ConfigDraft:
         return self._selectors.get(field)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"version": self.version, "domain": self.domain, "field_scores": dict(self.scores)}
+        return {"version": self.version, "domain_present": True, "field_scores": dict(self.scores)}
 
     def to_config(self) -> dict[str, Any]:
         """Explicit sensitive export for a caller that intends to persist selectors."""
-        return {**self.to_dict(), "selectors": dict(self._selectors)}
+        return {
+            **self.to_dict(),
+            "domain": self.domain,
+            "selectors": dict(self._selectors),
+            "fingerprints": dict(self._fingerprints),
+            "fingerprint_salt": self._fingerprint_salt,
+        }
 
 
 @dataclass(frozen=True, repr=False)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import posixpath
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -18,6 +19,7 @@ from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 
 from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
 from .extractor import CandidateExtractor
+from .fingerprint import fingerprint_html
 from .models import ExtractionResult, FieldKind
 from .scoring import CandidateScorer, ScoringContext
 from .validation import ConfigDraft, MultiPageValidator, PageValidation, ValidationResult
@@ -49,10 +51,12 @@ class ProbeService:
         self._fetches = 0
         self._bytes = 0
         self._origin: tuple[str, str, int] | None = None
+        self._fingerprint_salt = b""
 
     def probe(self, book_or_chapter_url: str) -> ValidationResult:
         self._fetches = self._bytes = 0
         self._origin = None
+        self._fingerprint_salt = secrets.token_bytes(32)
         try:
             try:
                 self._origin = self._origin_key(book_or_chapter_url)
@@ -198,7 +202,21 @@ class ProbeService:
         if not reusable:
             return None
         selectors[FieldKind.CONTENT.value] = reusable[0]
-        return ConfigDraft("draft-v1", urlsplit(index.navigation_url).hostname or "redacted", scores, selectors)
+        book_selectors = {key: value for key, value in selectors.items() if key in {"title", "author", "chapter_list"}}
+        chapter_selectors = {key: value for key, value in selectors.items() if key not in book_selectors and key != "clean_selector"}
+        fingerprints = {
+            "book": fingerprint_html(index.snapshot.html, "book", book_selectors, self._fingerprint_salt),
+            "chapter_first": fingerprint_html(first_acquired.snapshot.html, "chapter", chapter_selectors, self._fingerprint_salt),
+            "chapter_second": fingerprint_html(second_acquired.snapshot.html, "chapter", chapter_selectors, self._fingerprint_salt),
+        }
+        return ConfigDraft(
+            "draft-v1",
+            urlsplit(index.navigation_url).hostname or "redacted",
+            scores,
+            selectors,
+            fingerprints=fingerprints,
+            fingerprint_salt=self._fingerprint_salt,
+        )
 
     @staticmethod
     def _origin_key(url: str) -> tuple[str, str, int]:

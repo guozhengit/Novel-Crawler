@@ -1,5 +1,6 @@
 """Candidate extraction primitives for scored site adaptation."""
 
+from .config_manager import ConfigManager, ConfigResolution, ResolutionKind
 from .decision import AdaptationDecision, DecisionConfig, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
 from .diagnostics import Diagnostic, DiagnosticCode
 from .extractor import CandidateExtractor, ExtractionRule, ExtractorConfig
@@ -30,6 +31,8 @@ from .validation import ConfigDraft, MultiPageValidator, PageValidation, Validat
 
 __all__ = [
     "AdaptationDecision",
+    "ConfigManager",
+    "ConfigResolution",
     "Candidate",
     "DecisionKind",
     "DecisionConfig",
@@ -67,5 +70,6 @@ __all__ = [
     "RegistryLockTimeout",
     "RevalidationResult",
     "RevalidationStatus",
+    "ResolutionKind",
     "ValidationResult",
 ]
