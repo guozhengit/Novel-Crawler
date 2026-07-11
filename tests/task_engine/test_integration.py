@@ -809,6 +809,101 @@ def test_cancel_pending_retries_exceptions_then_completes_without_token_persiste
     assert secret.encode() not in path.read_bytes()
 
 
+def test_confirmation_cancel_pending_retries_only_config_manager_channel(tmp_path: Path) -> None:
+    secret = "confirmation-cancel-private-token"
+
+    class FlakyManager(FakeManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def cancel(self, token: str) -> bool:
+            self.attempts += 1
+            self.cancelled.append(token)
+            if self.attempts < 3:
+                raise RuntimeError(f"private {token}")
+            return True
+
+    path = tmp_path / "tasks.db"
+    adaptive = FakeAdaptive(result(ResolutionKind.CONFIRMATION_REQUIRED, token=secret))
+    manager = FlakyManager()
+    adaptive.config_manager = manager
+    with TaskRepository(path) as repo:
+        task = probing(repo)
+        controller = AdaptiveTaskController(repo, adaptive)
+        controller.probe_handler(None, task)
+        assert controller.cancel_interaction(task.task_id).cleanup_required is True
+        assert controller.retry_cancel_cleanup(task.task_id).cleanup_required is True
+        cancelled = controller.retry_cancel_cleanup(task.task_id)
+        assert cancelled.status is TaskStatus.CANCELLED
+        assert cancelled.cleanup_required is False
+        assert adaptive.cancelled == []
+        assert manager.cancelled == [secret, secret, secret]
+        safe = repr(controller) + json.dumps(cancelled.to_safe_dict())
+        assert secret not in safe
+    assert secret.encode() not in path.read_bytes()
+
+
+def test_confirmation_cancel_false_is_idempotent_terminal_completion(tmp_path: Path) -> None:
+    secret = "already-absent-confirmation"
+
+    class MissingManager(FakeManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def cancel(self, token: str) -> bool:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporarily unavailable")
+            self.cancelled.append(token)
+            return False
+
+    adaptive = FakeAdaptive(result(ResolutionKind.CONFIRMATION_REQUIRED, token=secret))
+    manager = MissingManager()
+    adaptive.config_manager = manager
+    with TaskRepository(tmp_path / "tasks.db") as repo:
+        task = probing(repo)
+        controller = AdaptiveTaskController(repo, adaptive)
+        controller.probe_handler(None, task)
+        assert controller.cancel_interaction(task.task_id).cleanup_required is True
+        assert controller.retry_cancel_cleanup(task.task_id).status is TaskStatus.CANCELLED
+        assert adaptive.cancelled == []
+        assert manager.cancelled == [secret]
+
+
+def test_confirmation_cancel_failure_in_expiry_and_close_stays_pending(tmp_path: Path) -> None:
+    class BrokenManager(FakeManager):
+        def cancel(self, token: str) -> bool:
+            raise RuntimeError(f"private {token}")
+
+    now = [20.0]
+    expiring = FakeAdaptive(result(ResolutionKind.CONFIRMATION_REQUIRED, token="expiry-confirmation"))
+    expiring.config_manager = BrokenManager()
+    with TaskRepository(tmp_path / "expiry-confirmation.db") as repo:
+        task = probing(repo)
+        controller = AdaptiveTaskController(
+            repo, expiring, interaction_ttl_seconds=1, monotonic=lambda: now[0]
+        )
+        controller.probe_handler(None, task)
+        now[0] += 2
+        controller.sweep()
+        assert repo.get_task(task.task_id).cleanup_required is True
+        assert controller.interaction(task.task_id).kind is InteractionKind.CANCEL_PENDING  # type: ignore[union-attr]
+        assert expiring.cancelled == []
+
+    closing = FakeAdaptive(result(ResolutionKind.CONFIRMATION_REQUIRED, token="close-confirmation"))
+    closing.config_manager = BrokenManager()
+    with TaskRepository(tmp_path / "close-confirmation.db") as repo:
+        task = probing(repo)
+        controller = AdaptiveTaskController(repo, closing)
+        controller.probe_handler(None, task)
+        assert controller.close() is False
+        assert repo.get_task(task.task_id).cleanup_required is True
+        assert controller.interaction(task.task_id).kind is InteractionKind.CANCEL_PENDING  # type: ignore[union-attr]
+        assert closing.cancelled == []
+
+
 def test_cancel_pending_switches_to_real_cleanup_ticket_then_retries_cleanup(tmp_path: Path) -> None:
     class CleanupCancel(FakeAdaptive):
         def cancel(self, ticket: VerificationTicket | str) -> AdaptiveResult:

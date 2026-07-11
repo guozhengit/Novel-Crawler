@@ -82,6 +82,7 @@ class _PrivateInteraction:
     summary: InteractionSummary
     deadline: float = field(repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    original_kind: InteractionKind | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -333,7 +334,7 @@ class AdaptiveTaskController:
         self, task_id: str, interaction: _PrivateInteraction
     ) -> TaskRecord:
         try:
-            outcome = self._adaptive.cancel(interaction.handle)
+            outcome = self._cancel_pending_operation(interaction)
         except Exception:
             interaction.deadline = self._monotonic() + self._ttl
             return self._repository.get_task(task_id)
@@ -352,6 +353,18 @@ class AdaptiveTaskController:
             return self._apply_result(resumed, outcome)
         self._drop(task_id)
         return self._apply_result(current, outcome)
+
+    def _cancel_pending_operation(self, interaction: _PrivateInteraction) -> AdaptiveResult:
+        if interaction.original_kind is InteractionKind.CONFIRMATION:
+            token = (
+                interaction.handle.token
+                if isinstance(interaction.handle, VerificationTicket)
+                else interaction.handle
+            )
+            # False is the ConfigManager's idempotent "already absent" result.
+            self._adaptive.config_manager.cancel(token)
+            return AdaptiveResult(ConfigResolution(ResolutionKind.CANCELLED))
+        return self._adaptive.cancel(interaction.handle)
 
     def sweep(self) -> int:
         try:
@@ -688,6 +701,11 @@ class AdaptiveTaskController:
                 summary,
                 self._monotonic() + self._ttl,
                 interaction.lock,
+                original_kind=(
+                    interaction.original_kind
+                    if interaction.kind is InteractionKind.CANCEL_PENDING
+                    else interaction.kind
+                ),
             )
             self._interactions.move_to_end(task_id)
 
@@ -771,6 +789,8 @@ class AdaptiveTaskController:
                 InteractionKind.VERIFICATION,
                 InteractionKind.CANCEL_PENDING,
             }:
+                if interaction.kind is InteractionKind.CANCEL_PENDING:
+                    return _CancelAttempt(self._cancel_pending_operation(interaction))
                 return _CancelAttempt(self._adaptive.cancel(interaction.handle))
             elif interaction.kind is InteractionKind.CONFIRMATION:
                 token = interaction.handle.token if isinstance(interaction.handle, VerificationTicket) else interaction.handle
