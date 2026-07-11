@@ -1,3 +1,4 @@
+from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
 from novel_crawler.task_engine.executor import (
     BackgroundTaskExecutor,
     ExecutorClosed,
@@ -29,6 +30,7 @@ __all__ = [
     "ALLOWED_TRANSITIONS",
     "BackgroundTaskExecutor",
     "CheckpointNotFound",
+    "ChapterBatchRunner",
     "CheckpointRecord",
     "ExecutorClosed",
     "ExecutorQueueFull",
