@@ -67,7 +67,7 @@ def test_classifier_terminal_pages_reject(page_kind: PageKind, code: DiagnosticC
 
 
 def test_diagnostic_serialization_is_frozen_and_privacy_safe() -> None:
-    result = DecisionPolicy().decide(Classification(PageKind.BOOK_INDEX, 1, ()), ScoredPageBatch("sample-1", "https://example.test:8443", PageKind.BOOK_INDEX, ()))
+    result = DecisionPolicy().decide(Classification(PageKind.BOOK_INDEX, 1, (), "sample-1", "https://example.test:8443"), ScoredPageBatch("sample-1", "https://example.test:8443", PageKind.BOOK_INDEX, ()))
     payload = result.diagnostic.to_dict()
     encoded = result.diagnostic.to_json()
     assert payload["origin"] == "https://example.test:8443"

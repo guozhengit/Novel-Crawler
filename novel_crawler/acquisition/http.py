@@ -93,7 +93,7 @@ class Urllib3PinnedTransport:
                 if declared_length is not None and declared_length > max_body_bytes:
                     raise AcquisitionError("response_too_large", safe_url, False)
                 body = bytearray()
-                for chunk in response.stream(64 * 1024, decode_content=True):
+                for chunk in response.stream(min(64 * 1024, max_body_bytes + 1), decode_content=True):
                     body.extend(chunk)
                     if len(body) > max_body_bytes:
                         raise AcquisitionError("response_too_large", safe_url, False)
@@ -130,10 +130,13 @@ class HttpPageAcquirer:
         self.user_agent = user_agent
         self.max_body_bytes = max_body_bytes
 
-    def fetch(self, url: str) -> PageSnapshot:
-        return self.fetch_page(url).snapshot
+    def fetch(self, url: str, *, max_body_bytes: int | None = None) -> PageSnapshot:
+        return self.fetch_page(url, max_body_bytes=max_body_bytes).snapshot
 
-    def fetch_page(self, url: str) -> AcquiredPage:
+    def fetch_page(self, url: str, *, max_body_bytes: int | None = None) -> AcquiredPage:
+        effective_max = self.max_body_bytes if max_body_bytes is None else min(self.max_body_bytes, max_body_bytes)
+        if effective_max <= 0:
+            raise ValueError("max_body_bytes must be positive")
         requested_url = redact_url(url)
         current_url = url
         seen = {current_url}
@@ -174,7 +177,7 @@ class HttpPageAcquirer:
                         path=self._request_target(parts.path, parts.query),
                         headers=headers,
                         timeout=remaining,
-                        max_body_bytes=self.max_body_bytes,
+                        max_body_bytes=effective_max,
                     )
                     break
                 except AcquisitionError:
@@ -220,9 +223,9 @@ class HttpPageAcquirer:
                     declared_length = int(content_length)
                 except ValueError:
                     declared_length = None
-                if declared_length is not None and declared_length > self.max_body_bytes:
+                if declared_length is not None and declared_length > effective_max:
                     raise AcquisitionError("response_too_large", redact_url(current_url), False)
-            if len(response.body) > self.max_body_bytes:
+            if len(response.body) > effective_max:
                 raise AcquisitionError("response_too_large", redact_url(current_url), False)
 
             filtered = {

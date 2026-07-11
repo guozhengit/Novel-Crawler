@@ -24,7 +24,7 @@ from .validation import ConfigDraft, MultiPageValidator, PageValidation, Validat
 
 
 class PageAcquirer(Protocol):
-    def fetch_page(self, url: str) -> AcquiredPage: ...
+    def fetch_page(self, url: str, *, max_body_bytes: int | None = None) -> AcquiredPage: ...
 
 
 @dataclass(frozen=True)
@@ -48,9 +48,11 @@ class ProbeService:
         self.validator = validator or MultiPageValidator()
         self._fetches = 0
         self._bytes = 0
+        self._origin: tuple[str, str, int] | None = None
 
     def probe(self, book_or_chapter_url: str) -> ValidationResult:
         self._fetches = self._bytes = 0
+        self._origin = None
         try:
             start = self._fetch(book_or_chapter_url)
             start_analysis = self._analyze(start.snapshot)
@@ -84,7 +86,9 @@ class ProbeService:
             index_identity = self._book_identity(index.snapshot.html)
             first_item = self._page_validation(first, first_analysis, second.navigation_url, index_identity)
             second_item = self._page_validation(second, second_analysis, None, index_identity)
-            draft = self._draft(index, index_analysis.decision, first_analysis.decision, second_analysis.decision, first_item, second_item)
+            draft = self._draft(index, index_analysis.decision, first_analysis, second_analysis, first, second, first_item, second_item)
+            if draft is None:
+                return self._safe_failure("selector_not_reusable")
             return self.validator.validate(first_item, second_item, draft, index_decision=index_analysis.decision.kind)
         except AcquisitionError as exc:
             return self._safe_failure(f"acquisition.{exc.code}")
@@ -94,7 +98,16 @@ class ProbeService:
     def _fetch(self, url: str) -> AcquiredPage:
         if self._fetches >= self.max_pages:
             raise RuntimeError("probe page limit")
-        page = self.acquirer.fetch_page(url)
+        requested_origin = self._origin_key(url)
+        if self._origin is not None and requested_origin != self._origin:
+            raise AcquisitionError("cross_origin", self._origin_display(url), False)
+        remaining = self.max_probe_bytes - self._bytes
+        page = self.acquirer.fetch_page(url, max_body_bytes=remaining)
+        actual_origin = self._origin_key(page.navigation_url)
+        if self._origin is None:
+            self._origin = actual_origin
+        elif actual_origin != self._origin:
+            raise AcquisitionError("cross_origin", self._origin_display(page.navigation_url), False)
         size = len(page.snapshot.body)
         if size > self.max_probe_bytes or self._bytes + size > self.max_probe_bytes:
             raise ValueError("probe byte budget")
@@ -156,16 +169,47 @@ class ProbeService:
         normalized = re.sub(r"\s+", " ", value).strip().casefold()
         return normalized or None
 
-    def _draft(self, index: AcquiredPage, index_decision: AdaptationDecision, first: AdaptationDecision, second: AdaptationDecision, first_page: PageValidation, second_page: PageValidation) -> ConfigDraft:
+    def _draft(self, index: AcquiredPage, index_decision: AdaptationDecision, first_analysis: _Analysis, second_analysis: _Analysis, first_acquired: AcquiredPage, second_acquired: AcquiredPage, first_page: PageValidation, second_page: PageValidation) -> ConfigDraft | None:
+        first, second = first_analysis.decision, second_analysis.decision
         all_fields = (*index_decision.fields, *first.fields, *second.fields)
         grouped: dict[FieldKind, list[FieldDecision]] = {}
         for item in all_fields:
             grouped.setdefault(item.field, []).append(item)
         scores = {field.value: min(item.score for item in items) for field, items in grouped.items()}
         selectors = {field.value: items[0].best_selector for field, items in grouped.items() if all(item.best_selector == items[0].best_selector for item in items) and items[0].best_selector}
-        if first_page.content_fingerprint and first_page.content_fingerprint == second_page.content_fingerprint:
-            selectors[FieldKind.CONTENT.value] = first_page.content_selector
+        first_candidates = {item.selector for item in first_analysis.extraction.for_field(FieldKind.CONTENT)}
+        second_candidates = {item.selector for item in second_analysis.extraction.for_field(FieldKind.CONTENT)}
+        if not first_page.content_selector or not second_page.content_selector:
+            return None
+        first_soup = BeautifulSoup(first_acquired.snapshot.html, "lxml")
+        second_soup = BeautifulSoup(second_acquired.snapshot.html, "lxml")
+        first_selected = first_soup.select(first_page.content_selector)
+        second_selected = second_soup.select(second_page.content_selector)
+        if len(first_selected) != 1 or len(second_selected) != 1:
+            return None
+        reusable = []
+        for selector in sorted(first_candidates & second_candidates):
+            first_nodes = first_soup.select(selector)
+            second_nodes = second_soup.select(selector)
+            if len(first_nodes) == len(second_nodes) == 1 and first_nodes[0] is first_selected[0] and second_nodes[0] is second_selected[0]:
+                reusable.append(selector)
+        if not reusable:
+            return None
+        selectors[FieldKind.CONTENT.value] = reusable[0]
         return ConfigDraft("draft-v1", urlsplit(index.navigation_url).hostname or "redacted", scores, selectors)
+
+    @staticmethod
+    def _origin_key(url: str) -> tuple[str, str, int]:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").encode("idna").decode("ascii").lower()
+        return scheme, host, parts.port or (443 if scheme == "https" else 80)
+
+    @staticmethod
+    def _origin_display(url: str) -> str:
+        scheme, host, port = ProbeService._origin_key(url)
+        default = 443 if scheme == "https" else 80
+        return f"{scheme}://{host}" + (f":{port}" if port != default else "")
 
     @staticmethod
     def _selector(decision: AdaptationDecision, field: FieldKind) -> str | None:

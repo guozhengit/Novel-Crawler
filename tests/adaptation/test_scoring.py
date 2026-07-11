@@ -38,6 +38,9 @@ def test_context_requires_real_snapshot_and_results_do_not_retain_derived_conten
     scored = CandidateScorer().score(item(FieldKind.TITLE, "h1"), context)
     assert scored.score > 0 and scored.confidence == scored.score
     assert "Private Book Title" not in repr(scored)
+    assert "h1" not in repr(scored)
+    with pytest.raises(TypeError):
+        asdict(scored)  # type: ignore[arg-type]
     assert "Private Book Title" not in repr(context)
     assert "Private Book Title" not in str(context)
     with pytest.raises(AttributeError):
@@ -233,7 +236,7 @@ def test_scoring_provenance_is_safe_and_set_only_from_context() -> None:
     page = snapshot("<h1>Book</h1>")
     first = ScoringContext(PageKind.BOOK_INDEX, page)
     second = ScoringContext(PageKind.BOOK_INDEX, page)
-    assert first.sample_id != second.sample_id
+    assert first.sample_id == second.sample_id == page.sample_id
     with pytest.raises(TypeError):
         ScoringContext(PageKind.BOOK_INDEX, page, "caller-id")  # type: ignore[call-arg]
     scored_value = CandidateScorer().score(item(FieldKind.TITLE, "h1"), first)
@@ -242,7 +245,7 @@ def test_scoring_provenance_is_safe_and_set_only_from_context() -> None:
     assert scored_value.page_kind is PageKind.BOOK_INDEX
 
 
-def test_two_contexts_for_same_snapshot_cannot_be_mixed_in_one_batch() -> None:
+def test_two_contexts_for_same_snapshot_share_the_snapshot_identity() -> None:
     from novel_crawler.adaptation.decision import ScoredPageBatch
 
     page = snapshot("<h1>Book</h1>")
@@ -250,5 +253,5 @@ def test_two_contexts_for_same_snapshot_cannot_be_mixed_in_one_batch() -> None:
     first = ScoringContext(PageKind.BOOK_INDEX, page)
     second = ScoringContext(PageKind.BOOK_INDEX, page)
     values = (scorer.score(item(FieldKind.TITLE, "h1"), first), scorer.score(item(FieldKind.TITLE, "h1"), second))
-    with pytest.raises(ValueError, match="sample_id"):
-        ScoredPageBatch(first.sample_id, first.origin_key, PageKind.BOOK_INDEX, values)
+    batch = ScoredPageBatch(first.sample_id, first.origin_key, PageKind.BOOK_INDEX, values)
+    assert len(batch.candidates) == 2

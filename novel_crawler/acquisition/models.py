@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import re
+import secrets
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TypeVar
 
 from .security import redact_url
 
 _V = TypeVar("_V")
+_SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 
 
 class _FrozenMapping(Mapping[str, _V]):
@@ -55,8 +58,11 @@ class PageSnapshot:
     method: str
     redirects: tuple[RedirectHop, ...]
     retrieved_at: datetime
+    sample_id: str = field(default_factory=lambda: f"sample-{secrets.token_hex(16)}", repr=False)
 
     def __post_init__(self) -> None:
+        if not _SAFE_ID.fullmatch(self.sample_id):
+            raise ValueError("sample_id must be a safe structural identifier")
         object.__setattr__(self, "requested_url", redact_url(self.requested_url))
         object.__setattr__(self, "final_url", redact_url(self.final_url))
         object.__setattr__(self, "headers", _FrozenMapping(self.headers))

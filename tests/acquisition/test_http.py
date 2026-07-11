@@ -95,6 +95,15 @@ def test_fetch_pins_transport_to_policy_ip_and_preserves_original_authority() ->
     assert call["max_body_bytes"] == 10 * 1024 * 1024
 
 
+def test_per_call_body_limit_is_forwarded_and_cannot_exceed_instance_cap() -> None:
+    policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
+    transport = FakeTransport([response(body=b"12345"), response(body=b"12345")])
+    acquirer = HttpPageAcquirer(transport, policy, max_body_bytes=10)
+    acquirer.fetch("https://example.test/", max_body_bytes=5)
+    acquirer.fetch_page("https://example.test/", max_body_bytes=100)
+    assert [call["max_body_bytes"] for call in transport.calls] == [5, 10]
+
+
 def test_fetch_page_retains_private_navigation_url_while_snapshot_stays_redacted() -> None:
     policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
     page = HttpPageAcquirer(FakeTransport([response()]), policy).fetch_page("https://example.test/nested/c1?q=kept#fragment")
@@ -456,7 +465,7 @@ def test_default_transport_streams_decoded_body_and_never_reads_redirect_body(
             path="/next", headers={}, timeout=2, max_body_bytes=5,
         )
     assert caught.value.code == "response_too_large"
-    assert stream_calls == [(64 * 1024, True)]
+    assert stream_calls == [(6, True)]
     assert all(call["preload_content"] is False for call in urlopen_calls)
 
 

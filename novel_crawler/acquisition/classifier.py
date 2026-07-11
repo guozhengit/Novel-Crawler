@@ -25,6 +25,8 @@ class Classification:
     kind: PageKind
     confidence: float
     evidence: tuple[str, ...]
+    sample_id: str = "sample-1"
+    safe_origin: str = "https://example.test"
 
     def __post_init__(self) -> None:
         if not 0 <= self.confidence <= 1:
@@ -44,8 +46,10 @@ class PageClassifier:
     """Classify a snapshot using stable rules in security-first precedence order."""
 
     def classify(self, snapshot: PageSnapshot) -> Classification:
+        def result(kind: PageKind, confidence: float, evidence: tuple[str, ...]) -> Classification:
+            return Classification(kind, confidence, evidence, snapshot.sample_id, snapshot.final_url.removesuffix("/"))
         if snapshot.status_code >= 400:
-            return Classification(PageKind.ERROR, 1.0, ("error.http_status",))
+            return result(PageKind.ERROR, 1.0, ("error.http_status",))
 
         soup = BeautifulSoup(snapshot.html, "lxml")
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
@@ -68,19 +72,19 @@ class PageClassifier:
         book_index = len(chapter_links) >= 3
 
         if self._challenge_score(soup, title) >= 2:
-            return Classification(PageKind.AUTH_OR_CHALLENGE, 0.96, ("auth.challenge_signals",))
+            return result(PageKind.AUTH_OR_CHALLENGE, 0.96, ("auth.challenge_signals",))
         if self._login_form(soup, title, primary_heading):
-            return Classification(PageKind.AUTH_OR_CHALLENGE, 0.98, ("auth.password_input",))
+            return result(PageKind.AUTH_OR_CHALLENGE, 0.98, ("auth.password_input",))
         if _ERROR_TITLE.search(title):
-            return Classification(PageKind.ERROR, 0.9, ("error.title_marker",))
+            return result(PageKind.ERROR, 0.9, ("error.title_marker",))
         if chapter_by_title:
-            return Classification(PageKind.CHAPTER, 0.95, ("chapter.title_and_content",))
+            return result(PageKind.CHAPTER, 0.95, ("chapter.title_and_content",))
         if book_index:
-            return Classification(PageKind.BOOK_INDEX, 0.93, ("book_index.chapter_link_cluster",))
+            return result(PageKind.BOOK_INDEX, 0.93, ("book_index.chapter_link_cluster",))
 
         if _SEARCH_TEXT.search(title) or soup.select_one("form[role=search], input[type=search]") is not None:
-            return Classification(PageKind.SEARCH_OR_LIST, 0.88, ("list.search_marker",))
-        return Classification(PageKind.UNKNOWN, 0.0, ())
+            return result(PageKind.SEARCH_OR_LIST, 0.88, ("list.search_marker",))
+        return result(PageKind.UNKNOWN, 0.0, ())
 
     @staticmethod
     def _login_form(soup: BeautifulSoup, title: str, primary_heading: str) -> bool:

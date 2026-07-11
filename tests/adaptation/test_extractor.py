@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -23,13 +23,18 @@ def snapshot(html: str) -> PageSnapshot:
 def test_models_are_deeply_immutable_private_and_validated() -> None:
     evidence = Evidence("title.h1", 0.8, "text_len=4")
     preview = "length_bucket=1-16"
-    candidate = Candidate(FieldKind.TITLE, "h1", preview, 0.8, 0.8, (evidence,), {"rank": 1})
+    candidate = Candidate(FieldKind.TITLE, "#private-selector", preview, 0.8, 0.8, (evidence,), {"rank": 1})
     result = ExtractionResult((candidate,), "builtin", "v1")
     assert result.for_field(FieldKind.TITLE) == (candidate,)
     with pytest.raises(FrozenInstanceError):
         candidate.confidence = 0.1  # type: ignore[misc]
     with pytest.raises(TypeError):
         candidate.metadata["rank"] = 2  # type: ignore[index]
+    assert "#private-selector" not in repr(candidate) and "#private-selector" not in repr(result)
+    with pytest.raises(TypeError):
+        asdict(candidate)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        asdict(result)  # type: ignore[arg-type]
     bad = (
         dict(selector="https://x.test?a=secret", value_preview=preview, raw_score=1.0, confidence=0.5),
         dict(selector="a[href*='token=secret']", value_preview=preview, raw_score=1.0, confidence=0.5),

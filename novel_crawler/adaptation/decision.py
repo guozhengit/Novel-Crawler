@@ -173,6 +173,10 @@ class DecisionPolicy:
             raise TypeError("batch must be exactly one ScoredPageBatch")
         if classification.kind is not batch.page_kind:
             raise ValueError("classification page_kind must match batch page_kind")
+        if classification.sample_id != batch.sample_id:
+            raise ValueError("classification sample_id must match batch sample_id")
+        if classification.safe_origin != batch.safe_origin:
+            raise ValueError("classification safe_origin must match batch safe_origin")
         values = batch.candidates
         terminal = {PageKind.AUTH_OR_CHALLENGE: DiagnosticCode.AUTH_REQUIRED, PageKind.ERROR: DiagnosticCode.ERROR_PAGE, PageKind.UNKNOWN: DiagnosticCode.UNSUPPORTED_PAGE, PageKind.SEARCH_OR_LIST: DiagnosticCode.UNSUPPORTED_PAGE}
         if classification.kind in terminal:

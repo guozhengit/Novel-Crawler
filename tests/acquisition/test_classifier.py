@@ -103,7 +103,7 @@ def snapshot(status: int, html: str, url: str = "https://example.test/page") -> 
 
 def test_classification_is_frozen_bounded_and_uses_stable_evidence_ids() -> None:
     result = PageClassifier().classify(snapshot(200, "<title>Login</title><form><input type='password'></form>"))
-    assert result == Classification(PageKind.AUTH_OR_CHALLENGE, result.confidence, ("auth.password_input",))
+    assert result == Classification(PageKind.AUTH_OR_CHALLENGE, result.confidence, ("auth.password_input",), result.sample_id, result.safe_origin)
     assert 0 <= result.confidence <= 1
     assert all("Login" not in item for item in result.evidence)
     with pytest.raises(FrozenInstanceError):

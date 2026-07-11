@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import math
 import re
-import secrets
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from typing import Protocol, TypeAlias, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
@@ -51,10 +50,9 @@ class ScoringContext:
         """Create one scoring context per snapshot and reuse it for every candidate."""
         if not isinstance(page_kind, PageKind) or not isinstance(snapshot, PageSnapshot):
             raise TypeError("ScoringContext requires PageKind and PageSnapshot")
-        sample_id = f"sample-{secrets.token_hex(16)}"
         object.__setattr__(self, "_page_kind", page_kind)
         object.__setattr__(self, "_snapshot", snapshot)
-        object.__setattr__(self, "_sample_id", sample_id)
+        object.__setattr__(self, "_sample_id", snapshot.sample_id)
         object.__setattr__(self, "_origin_key", safe_origin(snapshot.final_url))
         object.__setattr__(self, "_locked", True)
 
@@ -121,8 +119,8 @@ class ScoreComponent:
         return self.score
 
 
-@dataclass(frozen=True)
 class ScoredCandidate:
+    __slots__ = ("calibration_id", "candidate", "components", "origin_key", "page_kind", "sample_id", "score", "version")
     candidate: Candidate
     score: float
     components: tuple[ScoreComponent, ...]
@@ -132,23 +130,30 @@ class ScoredCandidate:
     origin_key: str
     page_kind: PageKind
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.candidate, Candidate):
+    def __init__(self, candidate: Candidate, score: float, components: tuple[ScoreComponent, ...], calibration_id: str, version: str, sample_id: str, origin_key: str, page_kind: PageKind) -> None:
+        if not isinstance(candidate, Candidate):
             raise TypeError("candidate must be Candidate")
-        if not math.isfinite(self.score) or not 0 <= self.score <= 1:
+        if not math.isfinite(score) or not 0 <= score <= 1:
             raise ValueError("heuristic score must be finite and between zero and one")
-        values = tuple(self.components)
+        values = tuple(components)
         if not values or not all(isinstance(value, ScoreComponent) for value in values):
             raise ValueError("components must be a nonempty tuple of ScoreComponent")
-        if not _SAFE_ID.fullmatch(self.calibration_id) or not _SAFE_ID.fullmatch(self.version):
+        if not _SAFE_ID.fullmatch(calibration_id) or not _SAFE_ID.fullmatch(version):
             raise ValueError("calibration_id and version must be stable identifiers")
-        if not _SAFE_ID.fullmatch(self.sample_id):
+        if not _SAFE_ID.fullmatch(sample_id):
             raise ValueError("sample_id must be a safe structural identifier")
-        if self.origin_key != "redacted" and safe_origin(self.origin_key) != self.origin_key:
+        if origin_key != "redacted" and safe_origin(origin_key) != origin_key:
             raise ValueError("origin_key must contain only a safe origin")
-        if not isinstance(self.page_kind, PageKind):
+        if not isinstance(page_kind, PageKind):
             raise TypeError("page_kind must be PageKind")
-        object.__setattr__(self, "components", values)
+        for name, value in (("candidate", candidate), ("score", score), ("components", values), ("calibration_id", calibration_id), ("version", version), ("sample_id", sample_id), ("origin_key", origin_key), ("page_kind", page_kind)):
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError(f"cannot assign to field '{name}'")
+
+    def __repr__(self) -> str:
+        return f"ScoredCandidate(field={self.candidate.field.value!r}, score={self.score!r}, components={self.components!r}, calibration_id={self.calibration_id!r}, version={self.version!r}, sample_id={self.sample_id!r}, origin_key={self.origin_key!r}, page_kind={self.page_kind.value!r})"
 
     @property
     def confidence(self) -> float:
