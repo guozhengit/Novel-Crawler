@@ -52,8 +52,12 @@ class ProbeService:
 
     def probe(self, book_or_chapter_url: str) -> ValidationResult:
         self._fetches = self._bytes = 0
-        self._origin = self._origin_key(book_or_chapter_url)
+        self._origin = None
         try:
+            try:
+                self._origin = self._origin_key(book_or_chapter_url)
+            except ValueError:
+                return self._safe_failure("probe_invalid_url")
             start = self._fetch(book_or_chapter_url)
             start_analysis = self._analyze(start.snapshot)
             if start_analysis.classification.kind not in {PageKind.BOOK_INDEX, PageKind.CHAPTER}:
@@ -198,10 +202,17 @@ class ProbeService:
 
     @staticmethod
     def _origin_key(url: str) -> tuple[str, str, int]:
-        parts = urlsplit(url)
-        scheme = parts.scheme.lower()
-        host = (parts.hostname or "").encode("idna").decode("ascii").lower()
-        return scheme, host, parts.port or (443 if scheme == "https" else 80)
+        try:
+            parts = urlsplit(url)
+            scheme = parts.scheme.lower()
+            raw_host = parts.hostname or ""
+            host = raw_host.encode("idna").decode("ascii").lower()
+            port = parts.port or (443 if scheme == "https" else 80)
+        except (UnicodeError, ValueError):
+            raise ValueError("invalid origin") from None
+        if scheme not in {"http", "https"} or not host:
+            raise ValueError("invalid origin")
+        return scheme, host, port
 
     @staticmethod
     def _origin_display(url: str) -> str:

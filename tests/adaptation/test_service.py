@@ -114,6 +114,15 @@ def test_probe_budget_and_acquisition_failures_are_safe_rejections() -> None:
     assert "private" not in failed.to_json() and "secret" not in failed.to_json()
 
 
+@pytest.mark.parametrize("url", ["https://example.test:bad/private?secret=x", "https://\ud800.test/private?secret=x"])
+def test_probe_rejects_malformed_origin_before_fetch_without_leaking_input(url: str) -> None:
+    acquirer = FakeAcquirer({})
+    result = ProbeService(acquirer=acquirer).probe(url)
+    assert result.reason_ids == ("probe_invalid_url",)
+    assert acquirer.calls == []
+    assert "private" not in result.to_json() and "secret" not in result.to_json() and "bad" not in result.to_json()
+
+
 def _nested_pages() -> dict[str, str]:
     index = '<meta property="og:title" content="Book A"><h1>Book A</h1><div id="list">' + "".join(f'<a href="chapters/{n}.html">Chapter {n}</a>' for n in range(1, 4)) + "</div>"
     pages = {"https://example.test/books/1/index.html": index}
