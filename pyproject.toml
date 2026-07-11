@@ -47,6 +47,7 @@ novel_crawler = ["configs/*.json", "configs/*.yaml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = ["integration: optional tests requiring locally installed external runtimes"]
 
 [tool.coverage.run]
 branch = true
