@@ -16,6 +16,7 @@ from soupsieve.util import SelectorSyntaxError
 from novel_crawler.acquisition.classifier import Classification, PageClassifier, PageKind
 from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
+from novel_crawler.core.domains import canonical_domain
 
 from .config_schema import validate_candidate_selectors
 from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
@@ -298,7 +299,7 @@ class ProbeService:
             parts = urlsplit(url)
             scheme = parts.scheme.lower()
             raw_host = parts.hostname or ""
-            host = raw_host.encode("idna").decode("ascii").lower()
+            host = canonical_domain(raw_host)
             port = parts.port or (443 if scheme == "https" else 80)
         except (UnicodeError, ValueError):
             raise ValueError("invalid origin") from None

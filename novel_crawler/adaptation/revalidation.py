@@ -19,6 +19,7 @@ from soupsieve.util import SelectorSyntaxError
 from novel_crawler.acquisition.classifier import Classification, PageClassifier, PageKind
 from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage
+from novel_crawler.core.domains import canonical_domain
 
 from .config_schema import SiteConfig
 from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, ScoredPageBatch
@@ -494,7 +495,7 @@ class ConfigRevalidator:
         try:
             parts = urlsplit(url)
             scheme = parts.scheme.lower()
-            host = (parts.hostname or "").rstrip(".").encode("idna").decode("ascii").lower()
+            host = canonical_domain(parts.hostname or "")
             port = parts.port or (443 if scheme == "https" else 80)
         except (UnicodeError, ValueError):
             raise ValueError("invalid origin") from None

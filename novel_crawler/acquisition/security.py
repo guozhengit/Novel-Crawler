@@ -14,6 +14,8 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import dns.exception
 import dns.resolver
 
+from novel_crawler.core.domains import canonical_domain
+
 
 class Resolver(Protocol):
     def __call__(self, host: str, port: int, timeout: float | None = None) -> Iterable[str]: ...
@@ -53,7 +55,7 @@ def redact_url(url: str) -> str:
             return urlunsplit((parts.scheme.lower(), "", "/", "", ""))
         host = host.lower()
         if ":" not in host:
-            host = host.encode("idna").decode("ascii").rstrip(".")
+            host = canonical_domain(host)
         display_host = f"[{host}]" if ":" in host else host
         try:
             port = parts.port
@@ -185,8 +187,8 @@ class UrlSafetyPolicy:
         if not host or any(character.isspace() for character in host):
             raise UrlSafetyError("malformed_host", safe_url)
         try:
-            normalized = host.encode("idna").decode("ascii").rstrip(".")
-        except UnicodeError as exc:
+            normalized = host.rstrip(".") if ":" in host else canonical_domain(host)
+        except (TypeError, ValueError) as exc:
             raise UrlSafetyError("malformed_host", safe_url) from exc
         invalid_dns_label = ":" not in normalized and any(
             not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)

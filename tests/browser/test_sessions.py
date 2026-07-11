@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import re
 import stat
 import sys
 import threading
@@ -201,9 +202,9 @@ def test_corrupt_metadata_is_quarantined_and_recreated(tmp_path: Path) -> None:
     metadata = next((store.root / "metadata").glob("*.json"))
     metadata.write_bytes(b'{"cookie":"secret","profile_path":"C:/secret"}')
 
-    assert store.get("broken.example") is None
-    quarantined = list((store.root / "quarantine").glob("*.bad"))
-    assert len(quarantined) == 1
+    with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
+        store.get("broken.example")
+    assert not list((store.root / "quarantine").glob("*.bad"))
     with store.acquire("broken.example") as replacement:
         assert replacement.info.session_id != old_id
 
@@ -224,7 +225,7 @@ def test_session_count_and_profile_size_are_bounded(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "sessions", max_sessions=1, max_profile_bytes=3)
     with store.acquire("one.example") as lease:
         (lease.profile_path / "data").write_bytes(b"1234")
-        with pytest.raises(SessionLimitError, match="profile_size_limit"):
+        with pytest.raises(BrowserSessionError, match="release_failed"):
             lease.close()
     with pytest.raises(SessionLimitError, match="session_count_limit"):
         store.acquire("two.example")
@@ -241,7 +242,7 @@ def test_symlink_in_profile_is_never_followed_or_deleted(tmp_path: Path) -> None
     except OSError:
         lease.close()
         pytest.skip("symlink creation unavailable")
-    with pytest.raises(Exception, match="profile_measure_unsafe"):
+    with pytest.raises(Exception, match="release_failed"):
         lease.close()
     assert outside.read_text(encoding="utf-8") == "keep"
 
@@ -343,8 +344,9 @@ def test_invalid_safe_metadata_fields_are_quarantined(tmp_path: Path, field: str
     payload = json.loads(metadata.read_bytes())
     payload[field] = value
     metadata.write_text(json.dumps(payload), encoding="ascii")
-    assert store.get("invalid.example") is None
-    assert list((store.root / "quarantine").glob("*.bad"))
+    with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
+        store.get("invalid.example")
+    assert not list((store.root / "quarantine").glob("*.bad"))
 
 
 def test_domain_mismatch_is_quarantined_before_profile_reuse(tmp_path: Path) -> None:
@@ -370,8 +372,9 @@ def test_complete_metadata_swap_is_quarantined_by_filename_binding(tmp_path: Pat
     second = metadata[1].read_bytes()
     metadata[0].write_bytes(second)
     metadata[1].write_bytes(first)
-    assert store.list_sessions() == ()
-    assert len(list((store.root / "quarantine").glob("*.bad"))) == 2
+    with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
+        store.list_sessions()
+    assert not list((store.root / "quarantine").glob("*.bad"))
 
 
 def test_profile_and_metadata_scan_limits_are_independent(tmp_path: Path) -> None:
@@ -379,7 +382,7 @@ def test_profile_and_metadata_scan_limits_are_independent(tmp_path: Path) -> Non
     lease = store.acquire("scan.example")
     (lease.profile_path / "one").write_text("1", encoding="utf-8")
     (lease.profile_path / "two").write_text("2", encoding="utf-8")
-    with pytest.raises(SessionLimitError, match="profile_size_limit"):
+    with pytest.raises(BrowserSessionError, match="release_failed"):
         lease.close()
 
     metadata_store = BrowserSessionStore(tmp_path / "metadata", max_sessions=100, max_scan_entries=1)
@@ -482,14 +485,17 @@ def test_global_session_limit_includes_unpublished_concurrent_creation(
     assert sum(isinstance(item, SessionLimitError) for item in outcomes) == 1
 
 
-def test_domain_locks_use_a_fixed_64_shard_set(tmp_path: Path) -> None:
+def test_exact_domain_locks_are_bounded_by_tracked_sessions(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "sessions", max_sessions=100)
     for index in range(70):
         with store.acquire(f"domain-{index}.example"):
             pass
     lock_names = {path.name for path in (store.root / "locks").iterdir()}
-    assert len(lock_names - {"allocation.lock"}) <= 64
-    assert all(name == "allocation.lock" or name.startswith("shard-") for name in lock_names)
+    assert len(lock_names - {"allocation.lock"}) == 70
+    assert all(name == "allocation.lock" or re.fullmatch(r"[0-9a-f]{64}\.lock", name) for name in lock_names)
+    for info in store.list_sessions():
+        store.clear(info.domain, info.session_id, confirmation=True)
+    assert {path.name for path in (store.root / "locks").iterdir()} <= {"allocation.lock"}
 
 
 def test_interrupted_transactional_clear_is_completed_on_reopen(
@@ -569,6 +575,74 @@ def test_windows_child_swap_attack_executes_but_cannot_escape(
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership")
+def test_windows_secure_remove_closes_every_handle_after_mark_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    tree = store.root / "trash" / ("a" * 32)
+    store._io.ensure_directory(tree)
+    (tree / "state").write_text("x", encoding="ascii")
+    api = store._io._api
+    original_open = api.open_tree_handle
+    original_close = api.close_tree_handle
+    original_mark = api.mark_tree_handle_delete
+    opened: set[int] = set()
+
+    def tracked_open(path: Path, *, directory: bool) -> object:
+        handle, information = original_open(path, directory=directory)
+        opened.add(handle)
+        return handle, information
+
+    def tracked_close(handle: int) -> None:
+        opened.discard(handle)
+        original_close(handle)
+
+    def fail_mark(handle: int) -> None:
+        raise RegistryIOError("injected mark failure")
+
+    monkeypatch.setattr(api, "open_tree_handle", tracked_open)
+    monkeypatch.setattr(api, "close_tree_handle", tracked_close)
+    monkeypatch.setattr(api, "mark_tree_handle_delete", fail_mark)
+    with pytest.raises(RegistryIOError):
+        store._io.secure_remove_tree(tree, 100)
+    assert opened == set()
+    monkeypatch.setattr(api, "mark_tree_handle_delete", original_mark)
+    store._io.secure_remove_tree(tree, 100)
+    assert not tree.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dirfd swap defense")
+def test_posix_openat_swap_attack_executes_without_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    tree = store.root / "trash" / ("b" * 32)
+    store._io.ensure_directory(tree)
+    child = tree / "child"
+    child.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("keep", encoding="ascii")
+    original_open = os.open
+    swapped = False
+
+    def attack_open(path: str | bytes, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        nonlocal swapped
+        if path == "child" and dir_fd is not None and flags & getattr(os, "O_DIRECTORY", 0) and not swapped:
+            child.rmdir()
+            child.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", attack_open)
+    with pytest.raises(RegistryIOError):
+        store._io.secure_remove_tree(tree, 100)
+    assert swapped
+    assert sentinel.read_text(encoding="ascii") == "keep"
+
+
 def test_public_storage_errors_have_only_safe_code_and_domain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -582,11 +656,33 @@ def test_public_storage_errors_have_only_safe_code_and_domain(
     monkeypatch.setattr(store._io, "open_lock", unsafe_failure)
     with pytest.raises(BrowserSessionError) as caught:
         store.acquire("safe.example")
-    assert caught.value.code == "lock_io"
+    assert caught.value.code == "allocation_io"
     assert caught.value.domain == "safe.example"
     assert "cookie" not in str(caught.value)
     assert str(tmp_path) not in str(caught.value)
     assert caught.value.__suppress_context__
+
+
+def test_lease_release_failure_is_safe_and_still_unlocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    lease = store.acquire("release.example")
+
+    def fail(path: Path, info: object) -> None:
+        raise OSError(f"cookie=secret path={path}")
+
+    monkeypatch.setattr(store, "_write_info", fail)
+    with pytest.raises(BrowserSessionError) as caught:
+        lease.close()
+    assert caught.value.code == "release_failed"
+    assert caught.value.domain == "release.example"
+    assert "cookie" not in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    assert caught.value.__suppress_context__
+    monkeypatch.undo()
+    with store.acquire("release.example", timeout=0.5):
+        pass
 
 
 def test_invalid_deletion_binding_is_quarantined(tmp_path: Path) -> None:
@@ -598,8 +694,9 @@ def test_invalid_deletion_binding_is_quarantined(tmp_path: Path) -> None:
     value["status"] = "deleting"
     value["tombstone_id"] = "not-an-id"
     metadata.write_text(json.dumps(value), encoding="ascii")
-    assert store.get("deleting.example") is None
-    assert list((store.root / "quarantine").glob("*.bad"))
+    with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
+        store.get("deleting.example")
+    assert not list((store.root / "quarantine").glob("*.bad"))
 
 
 def test_nonquarantining_read_and_profile_escape_fail_safely(tmp_path: Path) -> None:
@@ -607,7 +704,7 @@ def test_nonquarantining_read_and_profile_escape_fail_safely(tmp_path: Path) -> 
     with store.acquire("corrupt.example") as lease:
         metadata = next((store.root / "metadata").glob("*.json"))
         metadata.write_text("{}", encoding="ascii")
-        with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
+        with pytest.raises(BrowserSessionError, match="release_failed"):
             lease.close()
     store._safe_delete_profile(store.root / "profiles" / ("f" * 64))
     with pytest.raises(BrowserSessionError, match="profile_escape"):

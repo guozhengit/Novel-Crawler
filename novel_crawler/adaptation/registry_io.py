@@ -129,7 +129,18 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
                                     raise RegistryIOError("tree directory changed during traversal")
                                 descriptors.append(child_fd)
                             elif stat.S_ISREG(metadata.st_mode):
-                                total += metadata.st_size
+                                file_fd = os.open(
+                                    entry.name,
+                                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                                    dir_fd=directory_fd,
+                                )
+                                try:
+                                    file_metadata = os.fstat(file_fd)
+                                    if not stat.S_ISREG(file_metadata.st_mode):
+                                        raise RegistryIOError("tree file changed during traversal")
+                                    total += file_metadata.st_size
+                                finally:
+                                    os.close(file_fd)
                                 if total > max_bytes:
                                     raise RegistryIOSizeError("tree byte limit exceeded")
                             else:
@@ -1166,14 +1177,18 @@ class WindowsRegistryIO:
         if open_handle is None or close_handle is None or mark_delete is None:
             raise RegistryIOError("secure tree APIs are unavailable")
         root_handle, _ = open_handle(path, directory=True)
+        owned: set[int] = {root_handle}
         stack: list[tuple[Path, int, bool]] = [(path, root_handle, False)]
         count = 0
         try:
             while stack:
                 current, handle, visited = stack.pop()
                 if visited:
-                    mark_delete(handle)
-                    close_handle(handle)
+                    try:
+                        mark_delete(handle)
+                    finally:
+                        close_handle(handle)
+                        owned.discard(handle)
                     continue
                 stack.append((current, handle, True))
                 children: list[tuple[Path, int, bool]] = []
@@ -1192,16 +1207,20 @@ class WindowsRegistryIO:
                         if not is_directory and not stat.S_ISREG(metadata.st_mode):
                             raise RegistryIOError("tree contains an unsafe object")
                         child_handle, _ = open_handle(child, directory=is_directory)
+                        owned.add(child_handle)
                         children.append((child, child_handle, is_directory))
                 for child, child_handle, is_directory in children:
                     if is_directory:
                         stack.append((child, child_handle, False))
                     else:
-                        mark_delete(child_handle)
-                        close_handle(child_handle)
+                        try:
+                            mark_delete(child_handle)
+                        finally:
+                            close_handle(child_handle)
+                            owned.discard(child_handle)
             # Closing the root's delete-pending handle durably removes the name.
         finally:
-            for _, handle, _ in stack:
+            for handle in owned:
                 close_handle(handle)
 
 

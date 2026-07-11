@@ -14,6 +14,8 @@ from enum import StrEnum
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from novel_crawler.core.domains import canonical_domain
+
 from .config_schema import SafeUrlPattern, SiteConfig, validate_candidate_selectors
 from .decision import DecisionKind
 from .fingerprint import StructureFingerprint
@@ -301,7 +303,7 @@ class ConfigManager:
         if set(fingerprints) != {"book", "chapter_first", "chapter_second"}:
             return None
         domain = self._url_parts(url)[0]
-        if draft.domain.rstrip(".").encode("idna").decode("ascii").lower() != domain:
+        if canonical_domain(draft.domain) != domain:
             return None
         book_fields = {"title", "author", "chapter_list"}
         book = {key: value for key, value in selectors.items() if key in book_fields}
@@ -345,7 +347,7 @@ class ConfigManager:
             parsed = urlsplit(url)
             if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or not parsed.hostname:
                 raise ValueError("invalid URL")
-            domain = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+            domain = canonical_domain(parsed.hostname)
             _port = parsed.port
         except (UnicodeError, ValueError):
             raise ValueError("invalid URL") from None

@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 from soupsieve.util import SelectorSyntaxError
 
+from novel_crawler.core.domains import canonical_domain
+
 CURRENT_SCHEMA_VERSION = 1
 _V1_FIELDS = frozenset({"schema_version", "config_id", "site", "domain", "url_patterns", "selectors", "request_policy", "generated_at", "last_validated", "field_scores", "validation_samples", "fingerprint_salt"})
 _FIELDS = _V1_FIELDS
@@ -43,10 +45,7 @@ def _utc(value: object, field: str) -> str:
 def _domain(value: object) -> str:
     if not isinstance(value, str) or not value or any(char in value for char in "/@?#:"):
         raise ValueError("domain must be a bare hostname")
-    try:
-        normalized = value.rstrip(".").encode("idna").decode("ascii").lower()
-    except UnicodeError as exc:
-        raise ValueError("domain is not valid IDNA") from exc
+    normalized = canonical_domain(value)
     if len(normalized) > 253 or "." not in normalized or any(not _LDH_LABEL.fullmatch(part) for part in normalized.split(".")):
         raise ValueError("domain is not a valid hostname")
     return normalized

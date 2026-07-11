@@ -13,6 +13,8 @@ from urllib.parse import urljoin, urlsplit
 import urllib3
 from charset_normalizer import from_bytes
 
+from novel_crawler.core.domains import canonical_domain
+
 from .models import AcquiredPage, PageSnapshot, RedirectHop
 from .security import ResolvedTarget, UrlSafetyError, UrlSafetyPolicy, redact_url
 
@@ -261,7 +263,7 @@ class HttpPageAcquirer:
         parts = urlsplit(url)
         scheme = parts.scheme.lower()
         raw_host = (parts.hostname or "").lower()
-        host = raw_host if ":" in raw_host else raw_host.encode("idna").decode("ascii")
+        host = raw_host if ":" in raw_host else canonical_domain(raw_host)
         return scheme, host, parts.port or (443 if scheme == "https" else 80)
 
     @staticmethod

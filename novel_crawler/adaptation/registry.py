@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from novel_crawler.core.domains import canonical_domain
+
 from .config_schema import SiteConfig
 from .registry_io import RegistryIO, RegistryIOError, RegistryIOExistsError, RegistryIOSizeError, default_registry_io
 from .url_paths import canonical_path
@@ -209,7 +211,7 @@ class ConfigRegistry:
     def resolution_lock(self, domain: str) -> Iterator[None]:
         """Serialize reuse/probe/register decisions for one domain across processes."""
         try:
-            normalized = domain.rstrip(".").encode("idna").decode("ascii").lower()
+            normalized = canonical_domain(domain)
         except (AttributeError, UnicodeError):
             raise ValueError("domain is invalid") from None
         if not normalized or any(char in normalized for char in "/@?#:"):
@@ -279,7 +281,7 @@ class ConfigRegistry:
             parsed = urlsplit(url)
             if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or not parsed.hostname:
                 return None
-            domain = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+            domain = canonical_domain(parsed.hostname)
             port = parsed.port
         except (UnicodeError, ValueError):
             return None
