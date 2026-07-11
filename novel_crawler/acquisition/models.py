@@ -60,3 +60,25 @@ class PageSnapshot:
         object.__setattr__(self, "requested_url", redact_url(self.requested_url))
         object.__setattr__(self, "final_url", redact_url(self.final_url))
         object.__setattr__(self, "headers", _FrozenMapping(self.headers))
+
+
+class AcquiredPage:
+    """A safe snapshot paired with a process-private navigation URL."""
+
+    __slots__ = ("_navigation_url", "_snapshot")
+
+    def __init__(self, snapshot: PageSnapshot, navigation_url: str) -> None:
+        if not isinstance(snapshot, PageSnapshot) or not isinstance(navigation_url, str):
+            raise TypeError("invalid acquired page")
+        object.__setattr__(self, "_snapshot", snapshot)
+        object.__setattr__(self, "_navigation_url", navigation_url)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("AcquiredPage is immutable")
+
+    snapshot = property(lambda self: self._snapshot)
+    navigation_url = property(lambda self: self._navigation_url)
+
+    def __repr__(self) -> str:
+        return f"AcquiredPage(snapshot={self.snapshot!r}, navigation_url='<redacted>')"

@@ -95,6 +95,14 @@ def test_fetch_pins_transport_to_policy_ip_and_preserves_original_authority() ->
     assert call["max_body_bytes"] == 10 * 1024 * 1024
 
 
+def test_fetch_page_retains_private_navigation_url_while_snapshot_stays_redacted() -> None:
+    policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
+    page = HttpPageAcquirer(FakeTransport([response()]), policy).fetch_page("https://example.test/nested/c1?q=kept#fragment")
+    assert page.navigation_url == "https://example.test/nested/c1?q=kept#fragment"
+    assert page.snapshot.final_url == "https://example.test/"
+    assert "nested" not in repr(page) and "q=kept" not in repr(page)
+
+
 def test_default_port_host_header_omits_port() -> None:
     policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
     transport = FakeTransport([response()])

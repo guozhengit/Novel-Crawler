@@ -23,6 +23,10 @@ class ConfigDraft:
     __slots__ = ("_domain", "_scores", "_selectors", "_version")
     _selectors: Mapping[str, str]
 
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("ConfigDraft is immutable")
+
     def __init__(self, version: str, domain: str, scores: Mapping[str, float], selectors: Mapping[str, str]) -> None:
         if not _SAFE_ID.fullmatch(version) or not domain or "/" in domain:
             raise ValueError("invalid draft identity")
@@ -43,6 +47,10 @@ class ConfigDraft:
     def to_dict(self) -> dict[str, Any]:
         return {"version": self.version, "domain": self.domain, "field_scores": dict(self.scores)}
 
+    def to_config(self) -> dict[str, Any]:
+        """Explicit sensitive export for a caller that intends to persist selectors."""
+        return {**self.to_dict(), "selectors": dict(self._selectors)}
+
 
 @dataclass(frozen=True, repr=False)
 class PageValidation:
@@ -55,6 +63,7 @@ class PageValidation:
     paragraph_count: int
     next_matches_adjacent: bool
     auth_or_error: bool = False
+    content_fingerprint: str = ""
 
     def __repr__(self) -> str:
         return f"PageValidation(kind={self.kind.value!r}, decision={self.decision.value!r})"
@@ -80,7 +89,7 @@ class ValidationResult:
 
 
 class MultiPageValidator:
-    def validate(self, first: PageValidation, second: PageValidation, draft: ConfigDraft, *, catalog_order_ok: bool = True) -> ValidationResult:
+    def validate(self, first: PageValidation, second: PageValidation, draft: ConfigDraft, *, catalog_order_ok: bool = True, index_decision: DecisionKind = DecisionKind.AUTO_ACCEPT) -> ValidationResult:
         reasons: list[str] = []
         if not catalog_order_ok:
             reasons.append("catalog_order_invalid")
@@ -90,19 +99,19 @@ class MultiPageValidator:
             reasons.append("url_duplicate")
         if first.auth_or_error or second.auth_or_error:
             reasons.append("auth_or_error")
-        if not self._compatible(first.content_selector, second.content_selector):
+        if not first.content_fingerprint or first.content_fingerprint != second.content_fingerprint:
             reasons.append("content_structure_mismatch")
         if first.book_key and second.book_key and first.book_key != second.book_key:
             reasons.append("book_title_mismatch")
         if not self._reasonable(first, second):
             reasons.append("content_shape_invalid")
-        if DecisionKind.REJECT in (first.decision, second.decision):
+        if DecisionKind.REJECT in (index_decision, first.decision, second.decision):
             reasons.append("page_rejected")
         confidence = min((*draft.scores.values(), 1.0))
-        if DecisionKind.REQUIRE_CONFIRMATION in (first.decision, second.decision):
+        if DecisionKind.REQUIRE_CONFIRMATION in (index_decision, first.decision, second.decision):
             confidence = min(confidence, 0.84)
         unique = tuple(dict.fromkeys(reasons))
-        return ValidationResult(not unique, confidence if not unique else 0.0, unique, (first.decision, second.decision), {"pages": 2, "failures": len(unique)}, draft if not unique else None)
+        return ValidationResult(not unique, confidence if not unique else 0.0, unique, (index_decision, first.decision, second.decision), {"pages": 3, "failures": len(unique)}, draft if not unique else None)
 
     @staticmethod
     def _compatible(left: str, right: str) -> bool:

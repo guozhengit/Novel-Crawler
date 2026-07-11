@@ -13,7 +13,7 @@ from urllib.parse import urljoin, urlsplit
 import urllib3
 from charset_normalizer import from_bytes
 
-from .models import PageSnapshot, RedirectHop
+from .models import AcquiredPage, PageSnapshot, RedirectHop
 from .security import ResolvedTarget, UrlSafetyError, UrlSafetyPolicy, redact_url
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -131,6 +131,9 @@ class HttpPageAcquirer:
         self.max_body_bytes = max_body_bytes
 
     def fetch(self, url: str) -> PageSnapshot:
+        return self.fetch_page(url).snapshot
+
+    def fetch_page(self, url: str) -> AcquiredPage:
         requested_url = redact_url(url)
         current_url = url
         seen = {current_url}
@@ -226,7 +229,7 @@ class HttpPageAcquirer:
                 name.lower(): value for name, value in response.headers.items() if name.lower() in RETAINED_HEADERS
             }
             encoding, html = self._decode(response.body, filtered.get("content-type"))
-            return PageSnapshot(
+            snapshot = PageSnapshot(
                 requested_url=requested_url,
                 final_url=redact_url(current_url),
                 status_code=response.status_code,
@@ -238,6 +241,7 @@ class HttpPageAcquirer:
                 redirects=tuple(redirects),
                 retrieved_at=datetime.now(UTC),
             )
+            return AcquiredPage(snapshot, current_url)
 
     @staticmethod
     def _request_target(path: str, query: str) -> str:

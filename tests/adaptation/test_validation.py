@@ -10,7 +10,7 @@ from novel_crawler.adaptation.validation import ConfigDraft, MultiPageValidator,
 def page(name: str, *, selector: str = "#content", title: str = "book-a", length: int = 500,
          paragraphs: int = 5, next_matches: bool = True, auth: bool = False) -> PageValidation:
     return PageValidation(name, PageKind.CHAPTER, DecisionKind.AUTO_ACCEPT, title, selector,
-                          length, paragraphs, next_matches, auth)
+                          length, paragraphs, next_matches, auth, "html/body/article/content")
 
 
 def test_validation_accepts_semantically_compatible_content_containers() -> None:
@@ -30,7 +30,7 @@ def test_validation_rejects_wrong_next_auth_duplicate_and_bad_structure() -> Non
     draft = ConfigDraft("draft-v1", "example.test", {"content": 0.9}, {"content": "#content"})
     result = MultiPageValidator().validate(
         page("same", selector="#content", next_matches=False),
-        page("same", selector="article", auth=True), draft,
+        PageValidation("same", PageKind.CHAPTER, DecisionKind.AUTO_ACCEPT, "book-a", "article", 500, 5, True, True, "html/body/main/content"), draft,
     )
     assert not result.ok and result.outcome is DecisionKind.REJECT
     assert {"next_link_mismatch", "url_duplicate", "auth_or_error", "content_structure_mismatch"} <= set(result.reason_ids)

@@ -3,138 +3,179 @@
 from __future__ import annotations
 
 import hashlib
+import posixpath
+import re
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Tag
+from soupsieve.util import SelectorSyntaxError
 
 from novel_crawler.acquisition.classifier import Classification, PageClassifier, PageKind
-from novel_crawler.acquisition.http import HttpPageAcquirer
-from novel_crawler.acquisition.models import PageSnapshot
+from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
+from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 
-from .decision import AdaptationDecision, DecisionPolicy, ScoredPageBatch
+from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
 from .extractor import CandidateExtractor
-from .models import FieldKind
+from .models import ExtractionResult, FieldKind
 from .scoring import CandidateScorer, ScoringContext
 from .validation import ConfigDraft, MultiPageValidator, PageValidation, ValidationResult
 
 
 class PageAcquirer(Protocol):
-    def fetch(self, url: str) -> PageSnapshot: ...
+    def fetch_page(self, url: str) -> AcquiredPage: ...
+
+
+@dataclass(frozen=True)
+class _Analysis:
+    classification: Classification
+    extraction: ExtractionResult
+    decision: AdaptationDecision
 
 
 class ProbeService:
-    """Probe at most an index and two chapters; never starts a crawler."""
-
-    def __init__(self, acquirer: PageAcquirer | None = None, classifier: PageClassifier | None = None, extractor: CandidateExtractor | None = None, scorer: CandidateScorer | None = None, decision_policy: DecisionPolicy | None = None, validator: MultiPageValidator | None = None, max_pages: int = 3, max_probe_chars: int = 20_000) -> None:
-        self.acquirer = acquirer or HttpPageAcquirer(max_body_bytes=max_probe_chars)
+    def __init__(self, acquirer: PageAcquirer | None = None, classifier: PageClassifier | None = None, extractor: CandidateExtractor | None = None, scorer: CandidateScorer | None = None, decision_policy: DecisionPolicy | None = None, validator: MultiPageValidator | None = None, max_pages: int = 3, max_probe_bytes: int = 20_000) -> None:
+        if max_pages < 3 or max_probe_bytes <= 0:
+            raise ValueError("probe budgets must be positive and permit three pages")
+        self.max_pages = 3
+        self.max_probe_bytes = min(20 * 1024, max_probe_bytes)
+        self.acquirer = acquirer or HttpPageAcquirer(max_body_bytes=self.max_probe_bytes)
         self.classifier = classifier or PageClassifier()
         self.extractor = extractor or CandidateExtractor()
         self.scorer = scorer or CandidateScorer()
         self.decision_policy = decision_policy or DecisionPolicy()
         self.validator = validator or MultiPageValidator()
-        self.max_pages = min(3, max_pages)
-        self.max_probe_chars = min(20_000, max_probe_chars)
         self._fetches = 0
+        self._bytes = 0
 
     def probe(self, book_or_chapter_url: str) -> ValidationResult:
-        self._fetches = 0
-        start_url = self._strip_sensitive(book_or_chapter_url)
-        start = self._fetch(start_url)
-        start_class = self.classifier.classify(start)
-        start_decision = self._decide(start, start_class)
-        if start_class.kind in {PageKind.AUTH_OR_CHALLENGE, PageKind.ERROR, PageKind.UNKNOWN, PageKind.SEARCH_OR_LIST}:
-            return self._terminal(start_decision)
-        index = start
-        first_prefetched: PageSnapshot | None = None
-        if start_class.kind is PageKind.CHAPTER:
-            first_prefetched = start
-            href = self._selected_href(start, start_decision, FieldKind.INDEX_LINK)
-            if not href:
-                return self._terminal(start_decision, "missing_index_link")
-            index = self._fetch(urljoin(start.final_url, href))
-        index_class = self.classifier.classify(index)
-        index_decision = self._decide(index, index_class)
-        links = self._chapter_links(index, index_decision)
-        if len(links) < 2:
-            return self._terminal(index_decision, "catalog_order_invalid")
-        first_url, second_url = (urljoin(index.final_url, value) for value in links[:2])
-        first = first_prefetched if first_prefetched and self._same_resource(start_url, first_url) else self._fetch(first_url)
-        if self._fetches >= self.max_pages and first_prefetched is None:
-            return self._terminal(index_decision, "probe_limit")
-        second = self._fetch(second_url)
-        first_item = self._page_validation(first, first_url, second_url)
-        second_item = self._page_validation(second, second_url, None)
-        draft = self._draft(index, index_decision, first, self._decide(first, self.classifier.classify(first)))
-        return self.validator.validate(first_item, second_item, draft)
+        self._fetches = self._bytes = 0
+        try:
+            start = self._fetch(book_or_chapter_url)
+            start_analysis = self._analyze(start.snapshot)
+            if start_analysis.classification.kind not in {PageKind.BOOK_INDEX, PageKind.CHAPTER}:
+                return self._reject(start_analysis.decision, "page_rejected")
+            index = start
+            index_analysis = start_analysis
+            prefetched: AcquiredPage | None = None
+            if start_analysis.classification.kind is PageKind.CHAPTER:
+                prefetched = start
+                index_href = self._candidate_href(start, start_analysis.extraction, FieldKind.INDEX_LINK)
+                if not index_href:
+                    return self._reject(start_analysis.decision, "missing_index_link")
+                index = self._fetch(urljoin(start.navigation_url, index_href))
+                index_analysis = self._analyze(index.snapshot)
+            if index_analysis.classification.kind is not PageKind.BOOK_INDEX:
+                return self._reject(index_analysis.decision, "catalog_order_invalid")
+            links = self._chapter_links(index, index_analysis.decision)
+            if len(links) < 2 or len(set(map(self._canonical, links))) != len(links):
+                return self._reject(index_analysis.decision, "catalog_order_invalid")
+            if prefetched:
+                current = self._catalog_key(prefetched.navigation_url)
+                position = next((i for i, link in enumerate(links) if self._catalog_key(link) == current), -1)
+                if position < 0:
+                    return self._reject(index_analysis.decision, "chapter_not_in_catalog")
+                neighbor = position + 1 if position + 1 < len(links) else position - 1
+                first, second = (prefetched, self._fetch(links[neighbor])) if neighbor > position else (self._fetch(links[neighbor]), prefetched)
+            else:
+                first, second = self._fetch(links[0]), self._fetch(links[1])
+            first_analysis, second_analysis = self._analyze(first.snapshot), self._analyze(second.snapshot)
+            first_item = self._page_validation(first, first_analysis, second.navigation_url)
+            second_item = self._page_validation(second, second_analysis, None)
+            draft = self._draft(index, index_analysis.decision, first_analysis.decision, second_analysis.decision, first_item, second_item)
+            return self.validator.validate(first_item, second_item, draft, index_decision=index_analysis.decision.kind)
+        except AcquisitionError as exc:
+            return self._safe_failure(f"acquisition.{exc.code}")
+        except (SelectorSyntaxError, ValueError, TypeError, RuntimeError):
+            return self._safe_failure("probe_invalid_content")
 
-    def _fetch(self, url: str) -> PageSnapshot:
+    def _fetch(self, url: str) -> AcquiredPage:
         if self._fetches >= self.max_pages:
-            raise RuntimeError("probe page limit exceeded")
+            raise RuntimeError("probe page limit")
+        page = self.acquirer.fetch_page(url)
+        size = len(page.snapshot.body)
+        if size > self.max_probe_bytes or self._bytes + size > self.max_probe_bytes:
+            raise ValueError("probe byte budget")
         self._fetches += 1
-        snapshot = self.acquirer.fetch(url)
-        if len(snapshot.html) > self.max_probe_chars:
-            raise ValueError("probe response exceeds safe character limit")
-        return snapshot
+        self._bytes += size
+        return page
 
-    def _decide(self, snapshot: PageSnapshot, classification: Classification) -> AdaptationDecision:
+    def _analyze(self, snapshot: PageSnapshot) -> _Analysis:
+        classification = self.classifier.classify(snapshot)
         extraction = self.extractor.extract(snapshot, classification.kind)
         context = ScoringContext(classification.kind, snapshot)
-        scored = tuple(self.scorer.score(item, context) for item in extraction)
-        batch = ScoredPageBatch(context.sample_id, context.origin_key, classification.kind, scored)
-        return self.decision_policy.decide(classification, batch)
+        values = tuple(self.scorer.score(item, context) for item in extraction)
+        decision = self.decision_policy.decide(classification, ScoredPageBatch(context.sample_id, context.origin_key, classification.kind, values))
+        return _Analysis(classification, extraction, decision)
 
-    def _chapter_links(self, snapshot: PageSnapshot, decision: AdaptationDecision) -> list[str]:
+    def _chapter_links(self, index: AcquiredPage, decision: AdaptationDecision) -> list[str]:
         selector = self._selector(decision, FieldKind.CHAPTER_LIST)
         if not selector:
             return []
-        soup = BeautifulSoup(snapshot.html, "lxml")
-        return [str(node.get("href")) for node in soup.select(selector) if isinstance(node, Tag) and node.get("href")]
+        soup = BeautifulSoup(index.snapshot.html, "lxml")
+        return [urljoin(index.navigation_url, str(node.get("href"))) for node in soup.select(selector) if isinstance(node, Tag) and node.get("href")]
 
-    def _selected_href(self, snapshot: PageSnapshot, decision: AdaptationDecision, field: FieldKind) -> str | None:
-        selector = self._selector(decision, field)
-        soup = BeautifulSoup(snapshot.html, "lxml")
-        node = soup.select_one(selector) if selector else None
-        if node is None:
-            if field is FieldKind.NEXT_LINK:
-                node = soup.select_one('a[rel~=next]') or next((link for link in soup.find_all("a", href=True) if link.get_text(" ", strip=True).casefold() in {"next", "next chapter"}), None)
-            elif field is FieldKind.INDEX_LINK:
-                node = next((link for link in soup.find_all("a", href=True) if link.get_text(" ", strip=True).casefold() in {"contents", "index", "table of contents"}), None)
-        return str(node.get("href")) if isinstance(node, Tag) and node.get("href") else None
+    @staticmethod
+    def _candidate_href(page: AcquiredPage, extraction: ExtractionResult, field: FieldKind) -> str | None:
+        soup = BeautifulSoup(page.snapshot.html, "lxml")
+        for candidate in sorted(extraction.for_field(field), key=lambda item: (-item.raw_score, item.selector)):
+            node = soup.select_one(candidate.selector)
+            if isinstance(node, Tag) and node.get("href"):
+                return str(node.get("href"))
+        return None
 
-    def _page_validation(self, snapshot: PageSnapshot, resource_url: str, expected_next: str | None) -> PageValidation:
-        classification = self.classifier.classify(snapshot)
-        decision = self._decide(snapshot, classification)
-        content = self._selector(decision, FieldKind.CONTENT) or ""
-        soup = BeautifulSoup(snapshot.html, "lxml")
-        node = soup.select_one(content) if content else None
-        text_length = len(node.get_text(" ", strip=True)) if isinstance(node, Tag) else 0
-        paragraphs = len(node.find_all("p")) if isinstance(node, Tag) else 0
-        next_href = self._selected_href(snapshot, decision, FieldKind.NEXT_LINK)
-        matches = expected_next is None or next_href is not None and self._same_resource(urljoin(snapshot.final_url, next_href), expected_next)
-        return PageValidation(self._page_id(resource_url), classification.kind, decision.kind, "", content, text_length, paragraphs, matches, classification.kind in {PageKind.AUTH_OR_CHALLENGE, PageKind.ERROR})
+    def _page_validation(self, page: AcquiredPage, analysis: _Analysis, expected_next: str | None) -> PageValidation:
+        content = self._selector(analysis.decision, FieldKind.CONTENT) or ""
+        soup = BeautifulSoup(page.snapshot.html, "lxml")
+        nodes = soup.select(content) if content else []
+        node = nodes[0] if len(nodes) == 1 and isinstance(nodes[0], Tag) else None
+        next_href = self._candidate_href(page, analysis.extraction, FieldKind.NEXT_LINK)
+        matches = expected_next is None or next_href is not None and self._canonical(urljoin(page.navigation_url, next_href)) == self._canonical(expected_next)
+        fingerprint = self._fingerprint(node) if node else ""
+        return PageValidation(self._page_id(page.navigation_url), analysis.classification.kind, analysis.decision.kind, "", content, len(node.get_text(" ", strip=True)) if node else 0, len(node.find_all("p")) if node else 0, matches, analysis.classification.kind in {PageKind.AUTH_OR_CHALLENGE, PageKind.ERROR}, fingerprint)
 
-    def _draft(self, index: PageSnapshot, index_decision: AdaptationDecision, chapter: PageSnapshot, chapter_decision: AdaptationDecision) -> ConfigDraft:
-        fields = (*index_decision.fields, *chapter_decision.fields)
-        return ConfigDraft("draft-v1", urlsplit(index.final_url).hostname or "redacted", {item.field.value: item.score for item in fields}, {item.field.value: item.best_selector for item in fields if item.best_selector})
+    @staticmethod
+    def _fingerprint(node: Tag) -> str:
+        ancestry = [parent.name for parent in list(node.parents)[:2] if isinstance(parent, Tag)]
+        role = str(node.get("role", ""))
+        stable = next((str(value) for value in [node.get("id"), *node.get("class", [])] if value and not re.search(r"\d", str(value))), "")
+        return "/".join([*reversed(ancestry), node.name, role, stable])
+
+    def _draft(self, index: AcquiredPage, index_decision: AdaptationDecision, first: AdaptationDecision, second: AdaptationDecision, first_page: PageValidation, second_page: PageValidation) -> ConfigDraft:
+        all_fields = (*index_decision.fields, *first.fields, *second.fields)
+        grouped: dict[FieldKind, list[FieldDecision]] = {}
+        for item in all_fields:
+            grouped.setdefault(item.field, []).append(item)
+        scores = {field.value: min(item.score for item in items) for field, items in grouped.items()}
+        selectors = {field.value: items[0].best_selector for field, items in grouped.items() if all(item.best_selector == items[0].best_selector for item in items) and items[0].best_selector}
+        if first_page.content_fingerprint and first_page.content_fingerprint == second_page.content_fingerprint:
+            selectors[FieldKind.CONTENT.value] = first_page.content_selector
+        return ConfigDraft("draft-v1", urlsplit(index.navigation_url).hostname or "redacted", scores, selectors)
 
     @staticmethod
     def _selector(decision: AdaptationDecision, field: FieldKind) -> str | None:
         return next((item.best_selector for item in decision.fields if item.field is field), None)
 
     @staticmethod
-    def _strip_sensitive(url: str) -> str:
+    def _canonical(url: str) -> str:
         parts = urlsplit(url)
+        path = posixpath.normpath(parts.path or "/")
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
+
+    @staticmethod
+    def _catalog_key(url: str) -> str:
+        parts = urlsplit(ProbeService._canonical(url))
         return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
     @staticmethod
-    def _same_resource(left: str, right: str) -> bool:
-        return ProbeService._strip_sensitive(left) == ProbeService._strip_sensitive(right)
-
-    @staticmethod
     def _page_id(url: str) -> str:
-        return hashlib.sha256(ProbeService._strip_sensitive(url).encode()).hexdigest()[:16]
+        return hashlib.sha256(ProbeService._canonical(url).encode()).hexdigest()[:16]
 
     @staticmethod
-    def _terminal(decision: AdaptationDecision, reason: str = "page_rejected") -> ValidationResult:
-        return ValidationResult(False, 0.0, (reason,), (decision.kind,), {"pages": 1, "failures": 1}, None)
+    def _reject(decision: AdaptationDecision, reason: str) -> ValidationResult:
+        return ValidationResult(False, 0, (reason,), (decision.kind,), {"pages": 1, "failures": 1}, None)
+
+    @staticmethod
+    def _safe_failure(reason: str) -> ValidationResult:
+        return ValidationResult(False, 0, (reason,), (DecisionKind.REJECT,), {"pages": 0, "failures": 1}, None)
