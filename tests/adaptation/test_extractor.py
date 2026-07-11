@@ -1,109 +1,164 @@
 from __future__ import annotations
 
+import re
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 
 import pytest
+from bs4 import BeautifulSoup
 
 from novel_crawler.acquisition.classifier import PageKind
 from novel_crawler.acquisition.models import PageSnapshot
-from novel_crawler.adaptation.extractor import CandidateExtractor
+from novel_crawler.adaptation.extractor import CandidateExtractor, ExtractionRule, ExtractorConfig
 from novel_crawler.adaptation.models import Candidate, Evidence, ExtractionResult, FieldKind
 
 
 def snapshot(html: str) -> PageSnapshot:
-    return PageSnapshot(
-        "https://reader.example/book/7?token=secret",
-        "https://reader.example/book/7?token=secret",
-        200,
-        {},
-        "utf-8",
-        html,
-        html.encode(),
-        "GET",
-        (),
-        datetime.now(UTC),
-    )
+    return PageSnapshot("https://reader.example/book/7?token=secret", "https://reader.example/book/7?token=secret", 200, {}, "utf-8", html, html.encode(), "GET", (), datetime.now(UTC))
 
 
-def test_models_are_immutable_validate_confidence_and_query_by_field() -> None:
+def test_models_are_deeply_immutable_private_and_validated() -> None:
     evidence = Evidence("title.h1", 0.8, "text_len=4")
-    candidate = Candidate(FieldKind.TITLE, "h1", "星海纪元", 0.8, 0.8, (evidence,), {"rank": 1})
-    result = ExtractionResult((candidate,))
-
+    preview = "text_length=4;sha256=123456789abc"
+    candidate = Candidate(FieldKind.TITLE, "h1", preview, 0.8, 0.8, (evidence,), {"rank": 1})
+    result = ExtractionResult((candidate,), "builtin", "v1")
     assert result.for_field(FieldKind.TITLE) == (candidate,)
-    assert result.for_field(FieldKind.AUTHOR) == ()
     with pytest.raises(FrozenInstanceError):
         candidate.confidence = 0.1  # type: ignore[misc]
     with pytest.raises(TypeError):
         candidate.metadata["rank"] = 2  # type: ignore[index]
-    with pytest.raises(ValueError, match="confidence"):
-        Candidate(FieldKind.TITLE, "h1", "x", 1, 1.01, (), {})
+    bad = (
+        dict(selector="https://x.test?a=secret", value_preview=preview, raw_score=1.0, confidence=0.5),
+        dict(selector="a[href*='token=secret']", value_preview=preview, raw_score=1.0, confidence=0.5),
+        dict(selector="h1", value_preview="Secret title", raw_score=1.0, confidence=0.5),
+        dict(selector="h1", value_preview=preview, raw_score=float("nan"), confidence=0.5),
+        dict(selector="h1", value_preview=preview, raw_score=1.0, confidence=1.01),
+    )
+    for values in bad:
+        with pytest.raises(ValueError):
+            Candidate(FieldKind.CONTENT, evidence=(evidence,), metadata={}, **values)
+    with pytest.raises(ValueError):
+        Evidence("bad rule", float("inf"), "count=1")
 
 
 def test_evidence_detail_only_accepts_short_structured_features() -> None:
-    assert Evidence("content.length", 0.4, "text_len=120;paragraphs=3").detail == "text_len=120;paragraphs=3"
+    assert Evidence("content.length", 0.4, "text_len=120;paragraphs=3").detail
     for unsafe in ("https://private.example/read?id=7", "the complete secret narrative", "text_len=1\nsecret"):
         with pytest.raises(ValueError, match="structured"):
             Evidence("unsafe", 0.1, unsafe)
 
 
-def test_extracts_multiple_index_candidates_and_ignores_comment_recommendation_links() -> None:
-    html = """<html><head><title>星海纪元 - 章节目录</title></head><body>
-    <main><h1>星海纪元</h1><p class="writer">作者：林舟</p>
-      <section class="catalog"><a href="/c/1">第一章 启程</a><a href="/c/2">第二章 风暴</a>
-      <a href="/c/3">第三章 星门</a><a href="/c/4">第四章 归途</a></section>
-      <ul class="chapters"><li><a href="1.html">第1章</a></li><li><a href="2.html">第2章</a></li>
-      <li><a href="3.html">第3章</a></li></ul></main>
-    <section class="comments"><a href="/spam/1">第一章 真好看</a><a href="/spam/2">第二章 评论</a></section>
-    <aside class="recommendations"><a href="/ad/1">第一章 推荐</a><a href="/ad/2">第二章 推荐</a></aside>
-    </body></html>"""
+def test_index_candidates_are_anchor_selectors_and_noise_is_excluded() -> None:
+    html = """<main><h1>星海纪元</h1><p class="writer">作者：林舟</p>
+    <section class="catalog"><a href="/c/1">第一章</a><a href="/c/2">第二章</a><a href="/c/3">第三章</a></section>
+    <ul class="chapters"><li><a href="1">Chapter 1</a></li><li><a href="2">Chapter 2</a></li><li><a href="3">Chapter 3</a></li></ul>
+    <section class="comments"><a href="/s/1">第一章</a><a href="/s/2">第二章</a><a href="/s/3">第三章</a><a href="/s/4">第四章</a></section></main>"""
     result = CandidateExtractor().extract(snapshot(html), PageKind.BOOK_INDEX)
-
-    assert {item.value_preview for item in result.for_field(FieldKind.TITLE)} >= {"星海纪元"}
-    assert result.for_field(FieldKind.AUTHOR)[0].value_preview == "林舟"
+    soup = BeautifulSoup(html, "lxml")
+    assert result.for_field(FieldKind.TITLE) and result.for_field(FieldKind.AUTHOR)
     lists = result.for_field(FieldKind.CHAPTER_LIST)
-    assert len(lists) >= 2
-    assert all("comments" not in item.selector and "recommend" not in item.selector for item in lists)
-    assert all(item.metadata["link_count"] >= 3 for item in lists)
+    assert len(lists) == 2
+    assert all(item.metadata["link_count"] == 3 for item in lists)
+    assert all(soup.select(item.selector) and all(node.name == "a" for node in soup.select(item.selector)) for item in lists)
+    assert all("comments" not in item.selector for item in lists)
 
 
-def test_extracts_english_chapter_candidates_navigation_content_and_noise() -> None:
-    html = """<html><head><title>Chapter 12: The Gate | My Novel</title></head><body>
-    <header><h1>Chapter 12: The Gate</h1><span>By Ada Stone</span></header>
-    <div class="reader-body"><p>The rain crossed the old city and the travelers kept walking into the night.</p>
-    <p>A second substantial paragraph makes this the likely narrative body for the chapter.</p></div>
-    <article class="alternate-content"><p>Another plausible body is deliberately retained as a candidate.</p>
-    <p>It contains enough continuous prose to compete without being selected prematurely.</p></article>
-    <nav><a rel="prev" href="/chapter/11?session=private">Previous Chapter</a>
-    <a href="/novel">Table of Contents</a><a rel="next" href="/chapter/13">Next Chapter</a></nav>
-    <div id="comments">Reader comments and discussion</div><div class="ad-banner">Buy now sponsored offer</div>
-    </body></html>"""
+def test_chapter_extracts_multiple_content_navigation_and_noise_candidates() -> None:
+    html = """<h1>Chapter 12: The Gate</h1><span>Written by Ada Stone</span>
+    <div class="reader-body"><p>The rain crossed the old city and travelers walked into the night.</p><p>A second substantial paragraph makes the likely narrative body.</p></div>
+    <article class="alternate-content"><p>Another plausible body is deliberately retained as a candidate.</p><p>Enough continuous prose competes without premature selection.</p></article>
+    <nav><a rel="prev" href="/11?secret=x">Previous Chapter</a><a href="/novel">Table of Contents</a><a rel="next" href="/13">Next Chapter</a></nav>
+    <div id="comments">discussion</div><div class="ad-banner">Buy now</div>"""
     result = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER)
-
     assert len(result.for_field(FieldKind.CONTENT)) >= 2
-    assert result.for_field(FieldKind.CHAPTER_TITLE)[0].value_preview == "Chapter 12: The Gate"
-    assert result.for_field(FieldKind.AUTHOR)[0].value_preview == "Ada Stone"
-    assert result.for_field(FieldKind.PREV_LINK)
-    assert result.for_field(FieldKind.NEXT_LINK)
-    assert result.for_field(FieldKind.INDEX_LINK)
-    noise = result.for_field(FieldKind.CLEAN_SELECTOR)
-    assert {item.selector for item in noise} >= {"#comments", ".ad-banner"}
+    for field in (FieldKind.CHAPTER_TITLE, FieldKind.AUTHOR, FieldKind.PREV_LINK, FieldKind.NEXT_LINK, FieldKind.INDEX_LINK):
+        assert result.for_field(field)
+    assert {item.selector for item in result.for_field(FieldKind.CLEAN_SELECTOR)} >= {"#comments", ".ad-banner"}
 
 
-def test_previews_and_evidence_do_not_leak_body_or_urls() -> None:
-    secret = "SECRET-NARRATIVE-" + "x" * 160
-    html = f"""<h1>第九章 密令</h1><div id="content">{secret}</div>
-    <a rel="next" href="https://private.example/chapter/10?token=hunter2">下一章</a>"""
+def test_outputs_never_leak_body_title_author_or_urls() -> None:
+    secrets = ("SECRET-TITLE", "SECRET-AUTHOR", "SECRET-NARRATIVE-" + "x" * 160, "hunter2")
+    html = f"<h1 id='{secrets[0]}'>Chapter 9 {secrets[0]}</h1><p id='{secrets[1]}'>By {secrets[1]}</p><div id='content'>{secrets[2]}</div><a rel='next' href='https://private.example/10?token={secrets[3]}'>Next Chapter</a>"
     result = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER)
+    serialized = repr(result)
+    assert all(secret not in serialized for secret in secrets)
+    assert "private.example" not in serialized
+    assert all(len(item.value_preview) <= 80 for item in result)
 
-    candidates = result.candidates
-    assert all(len(item.value_preview) <= 80 for item in candidates)
-    assert all("hunter2" not in item.value_preview for item in candidates)
-    assert all("private.example" not in item.value_preview for item in candidates)
-    for item in candidates:
-        for evidence in item.evidence:
-            assert len(evidence.detail) <= 80
-            assert secret not in evidence.detail
-            assert "http" not in evidence.detail
-            assert "hunter2" not in evidence.detail
+
+def test_selectors_are_unique_with_duplicate_ids_classes_and_special_characters() -> None:
+    html = """<main><div class="card"><div id="body:main" class="reader body"><p>First substantial narrative paragraph with enough words.</p><p>Second paragraph provides a distinct body candidate.</p></div></div>
+    <div class="card"><div id="body:main" class="reader body"><p>Another substantial narrative paragraph with enough words.</p><p>Second paragraph provides another distinct body candidate.</p></div></div></main>"""
+    soup = BeautifulSoup(html, "lxml")
+    contents = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER).for_field(FieldKind.CONTENT)
+    assert len(contents) >= 2
+    assert len({item.selector for item in contents}) == len(contents)
+    assert all(len(soup.select(item.selector)) == 1 for item in contents)
+
+
+def test_nested_noise_is_removed_before_content_scoring() -> None:
+    clean = "A modest real chapter paragraph. " * 3
+    html = f"<article id='content'><p>{clean}</p><div class='comments'>{'BUY SECRET TOKEN ' * 100}</div></article>"
+    item = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER).for_field(FieldKind.CONTENT)[0]
+    assert item.metadata["text_length"] == len(clean.strip())
+
+
+def test_navigation_uses_exact_rel_and_anchored_text() -> None:
+    html = """<nav><a rel="nofollow prev" href="/1">Anything</a><a rel="next" href="/2">Anything</a><a href="/3">Previous Chapter</a><a href="/4">Next chapter</a>
+    <a href="/x">Preview</a><a href="/x">Nextdoor</a><a href="/x">reindex</a><a rel="nofollow" href="/x">Next offer</a></nav>"""
+    result = CandidateExtractor().extract(snapshot(html), PageKind.CHAPTER)
+    assert len(result.for_field(FieldKind.PREV_LINK)) == 2
+    assert len(result.for_field(FieldKind.NEXT_LINK)) == 2
+    assert not result.for_field(FieldKind.INDEX_LINK)
+
+
+@pytest.mark.parametrize("title", ["Prologue", "Epilogue", "Part II", "Book 3", "Chapter 1.5", "序章", "楔子", "番外 2", "第1.5章"])
+def test_configurable_bilingual_chapter_titles(title: str) -> None:
+    assert CandidateExtractor().extract(snapshot(f"<h1>{title}</h1>"), PageKind.CHAPTER).for_field(FieldKind.CHAPTER_TITLE)
+
+
+@pytest.mark.parametrize("markup", ["<p>Written by Ursula</p>", "<p>Author: Ursula</p>", "<b>作者</b><span>余华</span>"])
+def test_extended_author_labels(markup: str) -> None:
+    assert CandidateExtractor().extract(snapshot(markup), PageKind.BOOK_INDEX).for_field(FieldKind.AUTHOR)
+
+
+def test_config_can_limit_fields_and_reports_provenance() -> None:
+    config = ExtractorConfig(enabled_fields=frozenset({FieldKind.TITLE}), version="review-v2")
+    extractor = CandidateExtractor(config=config)
+    assert isinstance(extractor.rules[0], ExtractionRule)
+    result = extractor.extract(snapshot("<h1>Novel</h1><p>By Secret</p>"), PageKind.BOOK_INDEX)
+    assert {item.field for item in result} == {FieldKind.TITLE}
+    assert result.version == "review-v2" and result.provenance
+
+
+def test_invalid_config_rules_and_deep_result_values_are_rejected() -> None:
+    for values in (
+        {"min_chapter_links": 0},
+        {"min_content_chars": 0},
+        {"chapter_title_patterns": ()},
+        {"author_patterns": ()},
+        {"enabled_fields": frozenset()},
+    ):
+        with pytest.raises(ValueError):
+            ExtractorConfig(**values)  # type: ignore[arg-type]
+    with pytest.raises(re.error):
+        ExtractorConfig(noise_pattern="[")
+    with pytest.raises(TypeError):
+        CandidateExtractor(rules=[object()])  # type: ignore[list-item]
+    with pytest.raises(TypeError):
+        ExtractionResult(("bad",), "builtin", "v1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ExtractionResult((), "unsafe provenance", "v1")
+
+
+def test_candidate_rejects_invalid_nested_evidence_and_metadata() -> None:
+    evidence = Evidence("safe.rule", 1.0, "count=1")
+    base = dict(field=FieldKind.TITLE, selector="h1", value_preview="count=1", raw_score=1.0, confidence=1.0)
+    for extra in (
+        {"evidence": ("bad",), "metadata": {}},
+        {"evidence": (evidence,), "metadata": {"bad key": 1}},
+        {"evidence": (evidence,), "metadata": {"value": float("inf")}},
+        {"evidence": (evidence,), "metadata": {"value": "raw secret value"}},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            Candidate(**base, **extra)  # type: ignore[arg-type]

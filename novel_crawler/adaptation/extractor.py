@@ -1,10 +1,15 @@
-"""Heuristic extraction of multiple scored selector candidates."""
+"""Configurable heuristic extraction of scored selector candidates."""
 
 from __future__ import annotations
 
+import hashlib
+import math
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Protocol, cast, runtime_checkable
 
+import soupsieve
 from bs4 import BeautifulSoup, Tag
 
 from novel_crawler.acquisition.classifier import PageKind
@@ -12,139 +17,245 @@ from novel_crawler.acquisition.models import PageSnapshot
 
 from .models import Candidate, Evidence, ExtractionResult, FieldKind, MetadataValue
 
-_CHAPTER = re.compile(r"(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷]|chapter\s+\d+)", re.I)
-_AUTHOR = re.compile(r"^(?:作者[：:]?|作\s*者[：:]?|by\s+)(.+)$", re.I)
-_PREV = re.compile(r"(?:上一[章节页]|前一[章节页]|previous(?:\s+chapter)?|prev)", re.I)
-_NEXT = re.compile(r"(?:下一[章节页]|后一[章节页]|next(?:\s+chapter)?)", re.I)
-_INDEX = re.compile(r"(?:目录|章节列表|返回书页|table\s+of\s+contents|contents|index)", re.I)
-_NOISE = re.compile(r"(?:comment|recommend|related|advert|\bad\b|banner|footer|share|评论|推荐|广告)", re.I)
-_CONTENT_HINT = re.compile(r"(?:content|article|chapter|reader|read|正文|内容)", re.I)
-_SAFE_TOKEN = re.compile(r"^[A-Za-z_][\w-]{0,63}$")
+DEFAULT_CHAPTER_PATTERNS = (
+    r"第\s*[0-9零一二三四五六七八九十百千万两]+(?:\.[0-9]+)?\s*[章节回卷]",
+    r"(?:chapter|part|book)\s+(?:\d+(?:\.\d+)?|[ivxlcdm]+)\b",
+    r"(?:prologue|epilogue)\b",
+    r"(?:序章|楔子|番外(?:\s*\d+)?)",
+)
+DEFAULT_AUTHOR_PATTERNS = (r"^(?:作者\s*[：:]?|by\s+|written\s+by\s+|author\s*[：:]\s*)(.+)$",)
+DEFAULT_NOISE_PATTERN = r"(?:comment|recommend|related|advert|\bad\b|banner|footer|share|评论|推荐|广告)"
+
+
+@dataclass(frozen=True)
+class ExtractorConfig:
+    min_chapter_links: int = 3
+    min_content_chars: int = 45
+    chapter_title_patterns: tuple[str, ...] = DEFAULT_CHAPTER_PATTERNS
+    author_patterns: tuple[str, ...] = DEFAULT_AUTHOR_PATTERNS
+    noise_pattern: str = DEFAULT_NOISE_PATTERN
+    enabled_fields: frozenset[FieldKind] = frozenset(FieldKind)
+    version: str = "v2"
+
+    def __post_init__(self) -> None:
+        if self.min_chapter_links < 1 or self.min_content_chars < 1:
+            raise ValueError("thresholds must be positive")
+        if not self.chapter_title_patterns or not self.author_patterns:
+            raise ValueError("pattern sets must not be empty")
+        for pattern in (*self.chapter_title_patterns, *self.author_patterns, self.noise_pattern):
+            re.compile(pattern)
+        if not self.enabled_fields or not all(isinstance(field, FieldKind) for field in self.enabled_fields):
+            raise ValueError("enabled_fields must contain FieldKind values")
+
+
+@runtime_checkable
+class ExtractionRule(Protocol):
+    rule_id: str
+    fields: frozenset[FieldKind]
+
+    def extract(self, extractor: CandidateExtractor, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]: ...
+
+
+@dataclass(frozen=True)
+class _BuiltinRule:
+    rule_id: str
+    fields: frozenset[FieldKind]
+    method_name: str
+
+    def extract(self, extractor: CandidateExtractor, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
+        method: Callable[[BeautifulSoup, PageKind], Iterable[Candidate]] = getattr(extractor, self.method_name)
+        return method(soup, page_kind)
 
 
 class CandidateExtractor:
-    """Generate plausible candidates without prematurely selecting a winner."""
+    """Generate multiple private candidates from modular extraction rules."""
+
+    def __init__(self, rules: Sequence[ExtractionRule] | None = None, config: ExtractorConfig | None = None) -> None:
+        self.config = config or ExtractorConfig()
+        self._chapter = re.compile("|".join(f"(?:{item})" for item in self.config.chapter_title_patterns), re.I)
+        self._authors = tuple(re.compile(item, re.I) for item in self.config.author_patterns)
+        self._noise_pattern = re.compile(self.config.noise_pattern, re.I)
+        self.rules: tuple[ExtractionRule, ...] = tuple(rules) if rules is not None else self._builtin_rules()
+        if not self.rules or not all(isinstance(rule, ExtractionRule) for rule in self.rules):
+            raise TypeError("rules must implement ExtractionRule")
+
+    @staticmethod
+    def _builtin_rules() -> tuple[ExtractionRule, ...]:
+        return cast(tuple[ExtractionRule, ...], (
+            _BuiltinRule("heading", frozenset({FieldKind.TITLE, FieldKind.CHAPTER_TITLE}), "_headings"),
+            _BuiltinRule("author", frozenset({FieldKind.AUTHOR}), "_author_candidates"),
+            _BuiltinRule("chapter_list", frozenset({FieldKind.CHAPTER_LIST}), "_chapter_lists"),
+            _BuiltinRule("content", frozenset({FieldKind.CONTENT}), "_content"),
+            _BuiltinRule("navigation", frozenset({FieldKind.PREV_LINK, FieldKind.NEXT_LINK, FieldKind.INDEX_LINK}), "_navigation"),
+            _BuiltinRule("noise", frozenset({FieldKind.CLEAN_SELECTOR}), "_noise"),
+        ))
 
     def extract(self, snapshot: PageSnapshot, page_kind: PageKind) -> ExtractionResult:
         soup = BeautifulSoup(snapshot.html, "lxml")
-        candidates: list[Candidate] = []
-        candidates.extend(self._headings(soup, page_kind))
-        candidates.extend(self._authors(soup))
-        candidates.extend(self._chapter_lists(soup))
-        candidates.extend(self._content(soup, page_kind))
-        candidates.extend(self._navigation(soup))
-        candidates.extend(self._noise(soup))
-        return ExtractionResult(tuple(sorted(candidates, key=lambda item: (item.field.value, -item.raw_score))))
+        candidates = [candidate for rule in self.rules if rule.fields & self.config.enabled_fields for candidate in rule.extract(self, soup, page_kind) if candidate.field in self.config.enabled_fields]
+        candidates.sort(key=lambda item: (item.field.value, -item.raw_score, item.selector))
+        provenance = "builtin" if all(isinstance(rule, _BuiltinRule) for rule in self.rules) else "custom"
+        return ExtractionResult(tuple(candidates), provenance, self.config.version)
 
     def _headings(self, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
         seen: set[tuple[FieldKind, str]] = set()
         for node in soup.select("h1, h2, title"):
-            text = self._preview(node.get_text(" ", strip=True))
+            text = node.get_text(" ", strip=True)
             if not text:
                 continue
-            field = FieldKind.CHAPTER_TITLE if page_kind is PageKind.CHAPTER and _CHAPTER.search(text) else FieldKind.TITLE
-            key = (field, text)
-            if key in seen:
+            field = FieldKind.CHAPTER_TITLE if page_kind is PageKind.CHAPTER and self._chapter.search(text) else FieldKind.TITLE
+            summary = self._summary(text)
+            if (field, summary) in seen:
                 continue
-            seen.add(key)
-            score = 0.9 if node.name == "h1" else 0.65
-            if field is FieldKind.CHAPTER_TITLE:
-                score += 0.15
-            yield self._candidate(field, node, text, score, "heading.semantic", f"tag={node.name};text_len={len(text)}")
+            seen.add((field, summary))
+            score = (0.9 if node.name == "h1" else 0.65) + (0.15 if field is FieldKind.CHAPTER_TITLE else 0)
+            candidate = self._candidate(soup, field, node, summary, score, "heading.semantic", f"tag={node.name};text_len={len(text)}")
+            if candidate:
+                yield candidate
 
-    def _authors(self, soup: BeautifulSoup) -> Iterable[Candidate]:
-        for node in soup.select("[class*=author i], [id*=author i], [class*=writer i], [id*=writer i], p, span"):
+    def _author_candidates(self, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
+        del page_kind
+        nodes = soup.select("[class*=author i], [id*=author i], [class*=writer i], [id*=writer i], p, span")
+        for node in nodes:
             text = node.get_text(" ", strip=True)
-            match = _AUTHOR.match(text)
-            if match and 0 < len(match.group(1).strip()) <= 80:
-                value = self._preview(match.group(1).strip())
-                yield self._candidate(FieldKind.AUTHOR, node, value, 0.85, "author.label", f"text_len={len(value)}")
+            author = next((match.group(1).strip() for pattern in self._authors if (match := pattern.match(text))), "")
+            if author:
+                candidate = self._candidate(soup, FieldKind.AUTHOR, node, self._summary(author), 0.85, "author.label", f"text_len={len(author)}")
+                if candidate:
+                    yield candidate
+        for label in soup.find_all(string=lambda value: bool(value and re.fullmatch(r"\s*作者\s*[：:]?\s*", value))):
+            parent = label.parent
+            sibling = parent.find_next_sibling() if isinstance(parent, Tag) else None
+            if isinstance(sibling, Tag) and (text := sibling.get_text(" ", strip=True)):
+                candidate = self._candidate(soup, FieldKind.AUTHOR, sibling, self._summary(text), 0.75, "author.sibling", f"text_len={len(text)}")
+                if candidate:
+                    yield candidate
 
-    def _chapter_lists(self, soup: BeautifulSoup) -> Iterable[Candidate]:
+    def _chapter_lists(self, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
+        del page_kind
         for node in soup.find_all(["div", "section", "ul", "ol", "main"]):
-            if self._is_noise(node):
+            if self._in_noise(node):
                 continue
-            links = [link for link in node.find_all("a", href=True, recursive=True) if _CHAPTER.search(link.get_text(" ", strip=True))]
-            direct_clusters = [child for child in node.find_all(["div", "section", "ul", "ol"], recursive=False)]
-            if len(links) < 3 or any(sum(1 for link in child.find_all("a", href=True) if _CHAPTER.search(link.get_text(" ", strip=True))) >= 3 for child in direct_clusters):
+            anchors = node.find_all("a", href=True)
+            chapter_links = [link for link in anchors if self._chapter.search(link.get_text(" ", strip=True))]
+            children = node.find_all(["div", "section", "ul", "ol"], recursive=False)
+            if len(chapter_links) < self.config.min_chapter_links or len(chapter_links) != len(anchors):
                 continue
-            score = 0.55 + min(len(links), 10) * 0.04
-            yield self._candidate(
-                FieldKind.CHAPTER_LIST, node, f"chapter_links={len(links)}", score,
-                "chapter_list.cluster", f"link_count={len(links)}", {"link_count": len(links)},
-            )
+            if any(len([link for link in child.find_all("a", href=True) if self._chapter.search(link.get_text(" ", strip=True))]) >= self.config.min_chapter_links for child in children):
+                continue
+            container = self._unique_css(soup, node)
+            if not container:
+                continue
+            selector = f"{container} a"
+            selected = soup.select(selector)
+            if selected != chapter_links:
+                continue
+            score = 0.55 + min(len(chapter_links), 10) * 0.04
+            yield self._make(FieldKind.CHAPTER_LIST, selector, f"link_count={len(chapter_links)}", score, "chapter_list.cluster", f"link_count={len(chapter_links)}", {"link_count": len(chapter_links)})
 
     def _content(self, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
         if page_kind is not PageKind.CHAPTER:
             return
         for node in soup.find_all(["article", "main", "section", "div"]):
-            if self._is_noise(node) or node.find_parent(lambda tag: isinstance(tag, Tag) and self._is_noise(tag)):
+            if self._in_noise(node):
                 continue
-            text = node.get_text(" ", strip=True)
-            paragraphs = len(node.find_all("p", recursive=False))
-            hint = bool(_CONTENT_HINT.search(" ".join([str(node.get("id", "")), *node.get("class", [])])))
-            if len(text) < 45 or (not hint and paragraphs < 2):
+            clone = BeautifulSoup(str(node), "lxml").find(node.name)
+            if not isinstance(clone, Tag):
+                continue
+            for descendant in list(clone.find_all(True)):
+                if self._is_noise(descendant):
+                    descendant.decompose()
+            text = clone.get_text(" ", strip=True)
+            paragraphs = len(clone.find_all("p"))
+            marker = " ".join([str(node.get("id", "")), *node.get("class", [])])
+            hint = bool(re.search(r"(?:content|article|chapter|reader|read|正文|内容)", marker, re.I))
+            if len(text) < self.config.min_content_chars or not hint and paragraphs < 2:
                 continue
             score = min(1.2, 0.35 + len(text) / 500 + paragraphs * 0.12 + (0.25 if hint else 0))
-            yield self._candidate(
-                FieldKind.CONTENT, node, self._preview(text), score, "content.text_density",
-                f"text_len={len(text)};paragraphs={paragraphs}", {"text_length": len(text), "paragraph_count": paragraphs},
-            )
+            candidate = self._candidate(soup, FieldKind.CONTENT, node, self._summary(text), score, "content.text_density", f"text_len={len(text)};paragraphs={paragraphs}", {"text_length": len(text), "paragraph_count": paragraphs})
+            if candidate:
+                yield candidate
 
-    def _navigation(self, soup: BeautifulSoup) -> Iterable[Candidate]:
+    def _navigation(self, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
+        del page_kind
+        patterns = ((FieldKind.PREV_LINK, re.compile(r"^(?:上一[章节页]|前一[章节页]|previous(?:\s+chapter)?|prev)$", re.I)), (FieldKind.NEXT_LINK, re.compile(r"^(?:下一[章节页]|后一[章节页]|next(?:\s+chapter)?)$", re.I)), (FieldKind.INDEX_LINK, re.compile(r"^(?:目录|章节列表|返回书页|table\s+of\s+contents|contents|index)$", re.I)))
         for link in soup.find_all("a", href=True):
-            text = link.get_text(" ", strip=True)
-            rel = " ".join(link.get("rel", []))
-            marker = f"{rel} {text}"
-            matches = ((FieldKind.PREV_LINK, _PREV), (FieldKind.NEXT_LINK, _NEXT), (FieldKind.INDEX_LINK, _INDEX))
-            for field, pattern in matches:
-                if pattern.search(marker):
-                    yield self._candidate(field, link, self._preview(text), 0.9 if rel else 0.7, "navigation.semantic", f"rel={rel or 'none'};text_len={len(text)}")
-                    break
+            text = re.sub(r"\s+", " ", link.get_text(" ", strip=True))
+            rel_tokens = {str(item).lower() for item in link.get("rel", [])}
+            field = FieldKind.PREV_LINK if "prev" in rel_tokens else FieldKind.NEXT_LINK if "next" in rel_tokens else None
+            if field is None:
+                field = next((kind for kind, pattern in patterns if pattern.fullmatch(text)), None)
+            if field is None:
+                continue
+            candidate = self._candidate(soup, field, link, self._summary(text), 0.9 if field.value.removesuffix("_link") in rel_tokens else 0.7, "navigation.semantic", f"rel_count={len(rel_tokens)};text_len={len(text)}")
+            if candidate:
+                yield candidate
 
-    def _noise(self, soup: BeautifulSoup) -> Iterable[Candidate]:
-        seen: set[str] = set()
+    def _noise(self, soup: BeautifulSoup, page_kind: PageKind) -> Iterable[Candidate]:
+        del page_kind
         for node in soup.find_all(True):
-            marker = " ".join([str(node.get("id", "")), *node.get("class", [])])
-            if not marker or not _NOISE.search(marker):
+            if not self._is_noise(node):
                 continue
-            selector = self._css_path(node)
-            if selector in seen:
-                continue
-            seen.add(selector)
-            yield self._candidate(FieldKind.CLEAN_SELECTOR, node, "noise_region", 0.85, "noise.marker", f"tag={node.name};marker_len={len(marker)}")
+            candidate = self._candidate(soup, FieldKind.CLEAN_SELECTOR, node, "noise_region=1", 0.85, "noise.marker", f"tag={node.name};marker_len={len(self._marker(node))}")
+            if candidate:
+                yield candidate
+
+    def _candidate(self, soup: BeautifulSoup, field: FieldKind, node: Tag, preview: str, score: float, rule_id: str, detail: str, metadata: dict[str, MetadataValue] | None = None) -> Candidate | None:
+        selector = self._unique_css(soup, node)
+        return self._make(field, selector, preview, score, rule_id, detail, metadata) if selector else None
 
     @staticmethod
-    def _preview(value: str) -> str:
-        return re.sub(r"\s+", " ", value).strip()[:80]
+    def _make(field: FieldKind, selector: str, preview: str, score: float, rule_id: str, detail: str, metadata: dict[str, MetadataValue] | None = None) -> Candidate:
+        confidence = max(0.0, min(1.0, score)) if math.isfinite(score) else score
+        return Candidate(field, selector, preview, score, confidence, (Evidence(rule_id, score, detail),), metadata or {})
 
     @staticmethod
-    def _is_noise(node: Tag) -> bool:
-        marker = " ".join([node.name, str(node.get("id", "")), *node.get("class", [])])
-        return bool(_NOISE.search(marker))
+    def _summary(text: str) -> str:
+        normalized = re.sub(r"\s+", " ", text).strip()
+        digest = hashlib.sha256(normalized.encode()).hexdigest()[:12]
+        return f"text_length={len(normalized)};sha256={digest}"
 
-    def _candidate(
-        self, field: FieldKind, node: Tag, preview: str, raw_score: float, rule_id: str, detail: str,
-        metadata: dict[str, MetadataValue] | None = None,
-    ) -> Candidate:
-        return Candidate(
-            field, self._css_path(node), preview, raw_score, max(0.0, min(1.0, raw_score)),
-            (Evidence(rule_id, raw_score, detail[:80]),), metadata or {},
-        )
+    def _marker(self, node: Tag) -> str:
+        return " ".join([node.name, str(node.get("id", "")), *node.get("class", [])])
+
+    def _is_noise(self, node: Tag) -> bool:
+        return bool(self._noise_pattern.search(self._marker(node)))
+
+    def _in_noise(self, node: Tag) -> bool:
+        return self._is_noise(node) or any(self._is_noise(parent) for parent in node.parents if isinstance(parent, Tag))
 
     @staticmethod
-    def _css_path(node: Tag) -> str:
+    def _unique_css(soup: BeautifulSoup, node: Tag) -> str | None:
         node_id = node.get("id")
-        if isinstance(node_id, str) and _SAFE_TOKEN.fullmatch(node_id):
-            return f"#{node_id}"
-        classes = [item for item in node.get("class", []) if isinstance(item, str) and _SAFE_TOKEN.fullmatch(item)]
+        if isinstance(node_id, str) and node_id and not CandidateExtractor._private_attribute(node_id, node):
+            selector = f"#{soupsieve.escape(node_id)}"
+            if soup.select(selector) == [node]:
+                return selector
+        classes = [item for item in node.get("class", []) if isinstance(item, str) and item and not CandidateExtractor._private_attribute(item, node)]
         if classes:
-            return "." + ".".join(classes[:2])
+            selector = "." + ".".join(soupsieve.escape(item) for item in classes)
+            if soup.select(selector) == [node]:
+                return selector
         parts: list[str] = []
         current: Tag | None = node
-        while current is not None and current.name != "[document]" and len(parts) < 4:
-            siblings = [sibling for sibling in current.parent.find_all(current.name, recursive=False)] if isinstance(current.parent, Tag) else []
-            suffix = f":nth-of-type({siblings.index(current) + 1})" if len(siblings) > 1 else ""
-            parts.append(f"{current.name}{suffix}")
-            current = current.parent if isinstance(current.parent, Tag) else None
-        return " > ".join(reversed(parts))
+        while current is not None and current.name != "[document]":
+            if not isinstance(current.parent, Tag):
+                break
+            siblings = current.parent.find_all(current.name, recursive=False)
+            segment = soupsieve.escape(current.name)
+            if len(siblings) > 1:
+                segment += f":nth-of-type({siblings.index(current) + 1})"
+            parts.append(segment)
+            selector = " > ".join(reversed(parts))
+            if soup.select(selector) == [node]:
+                return selector
+            current = current.parent
+        return None
+
+    @staticmethod
+    def _private_attribute(value: str, node: Tag) -> bool:
+        if re.search(r"(?:token|secret|session|password)", value, re.I):
+            return True
+        compact_value = re.sub(r"\W+", "", value).casefold()
+        compact_text = re.sub(r"\W+", "", node.get_text(" ", strip=True)).casefold()
+        return len(compact_value) >= 4 and compact_value in compact_text
