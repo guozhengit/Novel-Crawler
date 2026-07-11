@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,7 +14,12 @@ from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.adaptation.extractor import CandidateExtractor
 from novel_crawler.adaptation.fingerprint import fingerprint_html
 from novel_crawler.adaptation.registry import ConfigConflictError, ConfigRegistry, ConfigStatus
-from novel_crawler.adaptation.revalidation import ConfigRevalidator, RevalidationResult, RevalidationStatus
+from novel_crawler.adaptation.revalidation import (
+    ConfigRevalidator,
+    RevalidationResult,
+    RevalidationStatus,
+    _RevalidationRunContext,
+)
 
 INDEX = "https://example.test/book"
 C1 = "https://example.test/c1"
@@ -293,6 +299,56 @@ def test_budget_and_cross_origin_are_enforced_before_fetch(tmp_path: Path) -> No
     assert len(acquirer2.calls) == 1 and acquirer2.calls[0][1] == 1
 
 
+def test_same_revalidator_concurrent_domains_keep_origin_and_budgets_per_run() -> None:
+    first_pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    second_pages = {url.replace("example.test", "other.test"): html for url, html in first_pages.items()}
+    first = _config(first_pages)
+    second_payload = first.to_sensitive_dict()
+    second_payload.update(config_id="cfg_qrstuvwxyzabcdef", domain="other.test")
+    second = SiteConfig.from_dict(second_payload)
+    entries = [_entry(first), _entry(second)]
+
+    class ConcurrentRegistry(MemoryRegistry):
+        def __init__(self) -> None:
+            super().__init__(None)
+
+        def load(self, entry: object) -> SiteConfig:
+            return first if entry.config_id == first.config_id else second  # type: ignore[attr-defined]
+
+    class BarrierAcquirer(FakeAcquirer):
+        def __init__(self) -> None:
+            super().__init__({**first_pages, **second_pages})
+            self.barrier = threading.Barrier(2)
+
+        def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
+            self.barrier.wait(timeout=5)
+            return super().fetch_page(url, max_body_bytes=max_body_bytes, locked_origin=locked_origin)
+
+    registry = ConcurrentRegistry()
+    acquirer = BarrierAcquirer()
+    service = _service(registry, acquirer)
+    results: list[RevalidationResult] = []
+    threads = [
+        threading.Thread(target=lambda entry=entry, url=url: results.append(service.revalidate(entry, url)))
+        for entry, url in zip(entries, (INDEX, INDEX.replace("example.test", "other.test")), strict=True)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert [result.status for result in results] == [RevalidationStatus.VALID, RevalidationStatus.VALID]
+    assert registry.transitions.count(("valid", ())) == 2
+    assert not any(kind == "invalid" for kind, _reasons in registry.transitions)
+    assert {origin for _url, _budget, origin in acquirer.calls} == {"https://example.test", "https://other.test"}
+    budgets_by_origin = {
+        origin: [budget for _url, budget, item_origin in acquirer.calls if item_origin == origin]
+        for origin in {"https://example.test", "https://other.test"}
+    }
+    assert all(values[0] == service.max_revalidation_bytes and values == sorted(values, reverse=True) for values in budgets_by_origin.values())
+
+
 def test_result_is_immutable_and_safe() -> None:
     result = RevalidationResult(RevalidationStatus.STALE, ("fingerprint_mismatch",), {"content": 0.9}, {"chapter_second": False}, "2026-07-11T09:00:00Z")
     with pytest.raises((AttributeError, TypeError)):
@@ -398,35 +454,35 @@ def test_fetch_catalog_and_anchor_guards_cover_every_bounded_boundary() -> None:
     pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
     config = _config(pages)
     service = _service(MemoryRegistry(config), FakeAcquirer(pages))
-    service._origin = service._origin_key(INDEX)
+    context = _RevalidationRunContext(service._origin_key(INDEX))
     page = AcquiredPage(_snapshot(INDEX, pages[INDEX]), INDEX)
     with pytest.raises(ValueError):
-        service._catalog_links(page, "")
+        service._catalog_links(page, "", context)
     invalid_catalog = AcquiredPage(_snapshot(INDEX, "<nav><div href='/c1'></div><div href='/c2'></div></nav>"), INDEX)
     with pytest.raises(ValueError):
-        service._catalog_links(invalid_catalog, "nav > *")
+        service._catalog_links(invalid_catalog, "nav > *", context)
     cross_catalog = AcquiredPage(_snapshot(INDEX, "<a href='https://other.test/1'>1</a><a href='/c2'>2</a>"), INDEX)
     with pytest.raises(AcquisitionError):
-        service._catalog_links(cross_catalog, "a")
+        service._catalog_links(cross_catalog, "a", context)
     duplicate_catalog = AcquiredPage(_snapshot(INDEX, "<a href='/c1'>1</a><a href='/c1'>1</a>"), INDEX)
     with pytest.raises(ValueError):
-        service._catalog_links(duplicate_catalog, "a")
-    assert service._single_anchor(page, ".missing", required=False) is None
+        service._catalog_links(duplicate_catalog, "a", context)
+    assert service._single_anchor(page, ".missing", context, required=False) is None
     with pytest.raises(ValueError):
-        service._single_anchor(page, "h1", required=True)
+        service._single_anchor(page, "h1", context, required=True)
     cross_anchor = AcquiredPage(_snapshot(INDEX, "<a href='https://other.test/x'>x</a>"), INDEX)
     with pytest.raises(AcquisitionError):
-        service._single_anchor(cross_anchor, "a", required=True)
+        service._single_anchor(cross_anchor, "a", context, required=True)
 
-    service._fetches = 3
+    context.page_count = 3
     with pytest.raises(ValueError):
-        service._fetch(INDEX)
-    service._fetches = 0
+        service._fetch(INDEX, context)
+    context.page_count = 0
     with pytest.raises(AcquisitionError):
-        service._fetch("https://other.test/x")
-    service._bytes = service.max_revalidation_bytes
+        service._fetch("https://other.test/x", context)
+    context.byte_count = service.max_revalidation_bytes
     with pytest.raises(AcquisitionError):
-        service._fetch(INDEX)
+        service._fetch(INDEX, context)
 
     class Redirecting(FakeAcquirer):
         def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
@@ -434,9 +490,8 @@ def test_fetch_catalog_and_anchor_guards_cover_every_bounded_boundary() -> None:
             return AcquiredPage(_snapshot("https://other.test/x", "x"), "https://other.test/x")
 
     redirected = _service(MemoryRegistry(config), Redirecting(pages))
-    redirected._origin = redirected._origin_key(INDEX)
     with pytest.raises(AcquisitionError):
-        redirected._fetch(INDEX)
+        redirected._fetch(INDEX, _RevalidationRunContext(redirected._origin_key(INDEX)))
 
     class Oversized(FakeAcquirer):
         def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
@@ -444,6 +499,5 @@ def test_fetch_catalog_and_anchor_guards_cover_every_bounded_boundary() -> None:
             return AcquiredPage(_snapshot(url, "xx"), url)
 
     oversized = ConfigRevalidator(acquirer=Oversized(pages), registry=MemoryRegistry(config), max_revalidation_bytes=1)  # type: ignore[arg-type]
-    oversized._origin = oversized._origin_key(INDEX)
     with pytest.raises(AcquisitionError):
-        oversized._fetch(INDEX)
+        oversized._fetch(INDEX, _RevalidationRunContext(oversized._origin_key(INDEX)))

@@ -423,6 +423,58 @@ def test_shared_stateful_probe_is_serialized_across_domains(tmp_path: Path) -> N
     assert probe.maximum == 1
 
 
+@pytest.mark.parametrize("other_action", ["confirm", "resolve"])
+def test_override_reprobe_shares_probe_lock_across_domains(tmp_path: Path, other_action: str) -> None:
+    class StatefulProbe:
+        def __init__(self) -> None:
+            self.active = 0
+            self.maximum = 0
+            self.measure = False
+            self.lock = threading.Lock()
+
+        def probe(self, url: str, *, overrides: Mapping[str, str] | None = None) -> ValidationResult:
+            domain = url.split("/")[2]
+            if self.measure:
+                with self.lock:
+                    self.active += 1
+                    self.maximum = max(self.maximum, self.active)
+                time.sleep(0.05)
+                with self.lock:
+                    self.active -= 1
+            draft = _draft(domain)
+            if overrides:
+                private = draft.to_config()
+                draft = ConfigDraft(
+                    draft.version,
+                    draft.domain,
+                    draft.scores,
+                    {**private["selectors"], **overrides},
+                    fingerprints=private["fingerprints"],
+                    fingerprint_salt=private["fingerprint_salt"],
+                    navigation_paths=private["navigation_paths"],
+                )
+            return _validation(DecisionKind.REQUIRE_CONFIRMATION, draft)
+
+    probe = StatefulProbe()
+    manager = ConfigManager(ConfigRegistry(tmp_path), Revalidator(RevalidationStatus.VALID), probe)
+    first = manager.resolve("https://one.test/book/1")
+    second = manager.resolve("https://two.test/book/1")
+    probe.measure = True
+    actions = [lambda: manager.confirm(first.confirmation_token, {"content": "main article"})]
+    if other_action == "confirm":
+        actions.append(lambda: manager.confirm(second.confirmation_token, {"content": "main article"}))
+    else:
+        actions.append(lambda: manager.resolve("https://three.test/book/1"))
+    threads = [threading.Thread(target=action) for action in actions]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert probe.maximum == 1
+
+
 def test_clean_selector_is_materialized_and_confirmation_retry_keeps_config_id(tmp_path: Path) -> None:
     draft = _draft()
     private = draft.to_config()
@@ -441,16 +493,23 @@ def test_clean_selector_is_materialized_and_confirmation_retry_keeps_config_id(t
     class FlakyRegistry:
         def __init__(self) -> None:
             self.ids: list[str] = []
+            self.config = None
 
         def lookup(self, url: str) -> None:
             del url
             return None
 
-        def register(self, config: object) -> object:
+        def register(self, config: object) -> RegistryEntry:
             self.ids.append(config.config_id)  # type: ignore[attr-defined]
+            self.config = config
             if len(self.ids) == 1:
                 raise RuntimeError("manifest publication failed")
-            return object()
+            return RegistryEntry(config.config_id, config.domain, ConfigStatus.ACTIVE, 1, config.generated_at, config.last_validated)  # type: ignore[attr-defined]
+
+        def load_exact(self, config_id: str, version: int, status: ConfigStatus) -> object:
+            assert self.config is not None
+            assert (config_id, version, status) == (self.config.config_id, 1, ConfigStatus.ACTIVE)
+            return self.config
 
     registry = FlakyRegistry()
     probe = Probe(_validation(DecisionKind.REQUIRE_CONFIRMATION, clean_draft))
@@ -479,6 +538,41 @@ def test_registration_that_resolves_to_non_active_revision_is_not_reported_regis
         Probe(_validation(DecisionKind.AUTO_ACCEPT, _draft())),
     ).resolve("https://example.test/book/1")
     assert result.kind is ResolutionKind.TRANSIENT_FAILURE and result.config is None
+
+
+def test_registration_retry_returns_exact_durable_revision_after_validated_advance(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    manager = ConfigManager(
+        registry,
+        Revalidator(RevalidationStatus.VALID),
+        Probe(_validation(DecisionKind.AUTO_ACCEPT, _draft())),
+    )
+    config = manager._materialize("https://example.test/book/1", _draft())
+    assert config is not None
+    original_write_manifest = registry._write_manifest
+    calls = 0
+
+    def fail_after_revision() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("manifest publication failed")
+        original_write_manifest()
+
+    registry._write_manifest = fail_after_revision  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="manifest publication"):
+        manager._register(config, "https://example.test/book/1")
+    registry._write_manifest = original_write_manifest  # type: ignore[method-assign]
+
+    concurrent = ConfigRegistry(tmp_path)
+    first = concurrent.list()[0]
+    latest = concurrent.mark_validated(first.config_id, "2026-07-11T10:00:00+00:00")
+    resolution = manager._register(config, "https://example.test/book/1")
+
+    assert resolution.kind is ResolutionKind.REGISTERED
+    assert resolution.config == concurrent.load_exact(latest.config_id, latest.version, ConfigStatus.ACTIVE)
+    assert resolution.config is not config
+    assert resolution.config.last_validated == "2026-07-11T10:00:00Z"
 
 
 def test_concurrent_resolve_is_idempotent(tmp_path: Path) -> None:

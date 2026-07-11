@@ -298,6 +298,10 @@ class SiteConfig:
     def to_json(self, *, include_sensitive: bool = False) -> str:
         return json.dumps(self.to_dict(include_sensitive=include_sensitive), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
+    def to_sensitive_dict(self) -> dict[str, object]:
+        """Return the complete normalized persistence representation."""
+        return self.to_dict(include_sensitive=True)
+
     def safe_summary(self) -> dict[str, object]:
         return {"schema_version": self.schema_version, "config_id_present": True, "site_present": True, "domain_present": True, "url_pattern_count": len(self.url_patterns), "selector_count": self._selector_count(), "generated_at": self.generated_at, "last_validated": self.last_validated, "fingerprint_salt_present": True}
 
@@ -371,31 +375,80 @@ def _parse_v1(value: Mapping[str, object]) -> dict[str, object]:
     return dict(value)
 
 
-_VERSION_PARSERS = {1: _parse_v1}
+ConfigParser = Callable[[Mapping[str, object]], dict[str, object]]
 Migration = Callable[[dict[str, object]], dict[str, object]]
-MIGRATIONS: dict[int, Migration] = {}
 
 
-def parse_config(value: Mapping[str, object], *, migrations: Mapping[int, Migration] | None = None) -> SiteConfig:
+@dataclass(frozen=True)
+class SchemaVersionRegistry:
+    """Immutable parser and migration registry for one schema runtime."""
+
+    parsers: Mapping[int, ConfigParser] = field(default_factory=dict)
+    migrations: Mapping[int, Migration] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(version, int) or isinstance(version, bool) or version < 1 or not callable(parser) for version, parser in self.parsers.items()):
+            raise ValueError("schema parsers must use positive integer versions and callable parsers")
+        if any(not isinstance(version, int) or isinstance(version, bool) or version < 1 or not callable(migration) for version, migration in self.migrations.items()):
+            raise ValueError("schema migrations must use positive integer versions and callable migrations")
+        object.__setattr__(self, "parsers", MappingProxyType(dict(self.parsers)))
+        object.__setattr__(self, "migrations", MappingProxyType(dict(self.migrations)))
+
+    def register_parser(self, version: int, parser: ConfigParser) -> SchemaVersionRegistry:
+        updated = dict(self.parsers)
+        updated[version] = parser
+        return SchemaVersionRegistry(updated, self.migrations)
+
+    def register_migration(self, source_version: int, migration: Migration) -> SchemaVersionRegistry:
+        updated = dict(self.migrations)
+        updated[source_version] = migration
+        return SchemaVersionRegistry(self.parsers, updated)
+
+    def require_current_parser(self, current_version: int) -> None:
+        if current_version not in self.parsers:
+            raise ValueError(f"missing parser for current schema_version {current_version}")
+
+
+DEFAULT_SCHEMA_REGISTRY = SchemaVersionRegistry({1: _parse_v1})
+DEFAULT_SCHEMA_REGISTRY.require_current_parser(CURRENT_SCHEMA_VERSION)
+_VERSION_PARSERS = DEFAULT_SCHEMA_REGISTRY.parsers
+MIGRATIONS: Mapping[int, Migration] = MappingProxyType({})
+
+
+def parse_config(
+    value: Mapping[str, object],
+    *,
+    migrations: Mapping[int, Migration] | None = None,
+    version_registry: SchemaVersionRegistry | None = None,
+) -> SiteConfig:
     if not isinstance(value, Mapping):
         raise TypeError("config must be a mapping")
+    if version_registry is not None and migrations is not None:
+        raise ValueError("version_registry and migrations cannot both be provided")
+    registry = version_registry or (
+        SchemaVersionRegistry(DEFAULT_SCHEMA_REGISTRY.parsers, migrations) if migrations is not None else DEFAULT_SCHEMA_REGISTRY
+    )
+    registry.require_current_parser(CURRENT_SCHEMA_VERSION)
     raw_version = value.get("schema_version")
     if not isinstance(raw_version, int) or isinstance(raw_version, bool):
         raise ValueError(f"unsupported schema_version: {raw_version!r}")
-    parser = _VERSION_PARSERS.get(raw_version)
+    parser = registry.parsers.get(raw_version)
     if parser is None or raw_version > CURRENT_SCHEMA_VERSION:
         raise ValueError(f"unsupported schema_version: {raw_version!r}")
     payload = parser(value)
-    registry = MIGRATIONS if migrations is None else migrations
     version = raw_version
     while version < CURRENT_SCHEMA_VERSION:
-        migration = registry.get(version)
+        migration = registry.migrations.get(version)
         if migration is None:
             raise ValueError(f"missing migration from schema_version {version}")
         payload = migration(dict(payload))
         expected = version + 1
         if payload.get("schema_version") != expected:
             raise ValueError(f"migration from schema_version {version} must produce {expected}")
+        target_parser = registry.parsers.get(expected)
+        if target_parser is None:
+            raise ValueError(f"missing parser for schema_version {expected}")
+        payload = target_parser(payload)
         version = expected
     return SiteConfig(**payload)
 

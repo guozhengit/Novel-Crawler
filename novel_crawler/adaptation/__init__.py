@@ -1,6 +1,7 @@
 """Candidate extraction primitives for scored site adaptation."""
 
 from .config_manager import ConfigManager, ConfigResolution, ResolutionKind
+from .config_schema import DEFAULT_SCHEMA_REGISTRY, SchemaVersionRegistry, SiteConfig, parse_config
 from .decision import AdaptationDecision, DecisionConfig, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
 from .diagnostics import Diagnostic, DiagnosticCode
 from .extractor import CandidateExtractor, ExtractionRule, ExtractorConfig
@@ -33,6 +34,7 @@ __all__ = [
     "AdaptationDecision",
     "ConfigManager",
     "ConfigResolution",
+    "DEFAULT_SCHEMA_REGISTRY",
     "Candidate",
     "DecisionKind",
     "DecisionConfig",
@@ -71,5 +73,8 @@ __all__ = [
     "RevalidationResult",
     "RevalidationStatus",
     "ResolutionKind",
+    "SchemaVersionRegistry",
+    "SiteConfig",
     "ValidationResult",
+    "parse_config",
 ]

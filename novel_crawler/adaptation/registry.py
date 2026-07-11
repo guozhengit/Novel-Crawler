@@ -233,7 +233,7 @@ class ConfigRegistry:
     def register(self, config: SiteConfig) -> RegistryEntry:
         if not isinstance(config, SiteConfig):
             raise TypeError("config must be a SiteConfig")
-        config_payload = config.to_dict(include_sensitive=True)
+        config_payload = config.to_sensitive_dict()
         config_bytes = _canonical_json(config_payload)
         if len(config_bytes) > self._max_config_bytes:
             raise RegistryLimitError("config exceeds maximum bytes")
@@ -496,13 +496,14 @@ class ConfigRegistry:
                     parsed = SiteConfig.from_dict(config)
                     if parsed.config_id != current.entry.config_id or parsed.domain != current.entry.domain:
                         raise RegistryError("validated revision changed config identity")
+                    config = parsed.to_sensitive_dict()
                     digest = hashlib.sha256(_canonical_json(config)).hexdigest()
                     identity_digest = _config_identity_digest(config)
                 entry = replace(
                     current.entry,
                     status=status,
                     version=current.entry.version + 1,
-                    validated=validated or current.entry.validated,
+                    validated=parsed.last_validated if validated is not None else current.entry.validated,
                     invalid_reason_ids=invalid_reason_ids,
                 )
                 record = self._write_revision(entry, config, digest)

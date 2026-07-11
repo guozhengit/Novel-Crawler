@@ -134,6 +134,13 @@ class _AnalyzedPage:
     decision: AdaptationDecision
 
 
+@dataclass
+class _RevalidationRunContext:
+    origin: tuple[str, str, int]
+    page_count: int = 0
+    byte_count: int = 0
+
+
 class _AuthRequired(RuntimeError):
     pass
 
@@ -177,13 +184,9 @@ class ConfigRevalidator:
         self.max_revalidation_bytes = min(20 * 1024, max_revalidation_bytes)
         self.minimum_score = float(minimum_score)
         self.minor_drift_tolerance = float(minor_drift_tolerance)
-        self._fetches = 0
-        self._bytes = 0
-        self._origin: tuple[str, str, int] | None = None
 
     def revalidate(self, entry: RegistryEntry, input_url: str) -> RevalidationResult:
         checked_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-        self._fetches = self._bytes = 0
         if entry.status is ConfigStatus.REVOKED:
             return RevalidationResult(RevalidationStatus.INVALID, ("config_revoked",), {}, {}, checked_at)
         try:
@@ -195,14 +198,14 @@ class ConfigRevalidator:
         if self._fingerprint_baselines(config) is None:
             return self._stale(entry, ("fingerprint_baseline_missing",), {}, {}, checked_at)
         try:
-            self._origin = self._origin_key(input_url)
+            context = _RevalidationRunContext(self._origin_key(input_url))
         except ValueError:
             return self._invalid(entry, ("input_url_invalid",), checked_at)
-        if self._origin[1] != config.domain:
+        if context.origin[1] != config.domain:
             return self._invalid(entry, ("domain_mismatch",), checked_at)
         try:
-            start = self._fetch(input_url)
-            index, first, second = self._collect_pages(start, config)
+            start = self._fetch(input_url, context)
+            index, first, second = self._collect_pages(start, config, context)
             scores: dict[str, float] = {}
             self._replay(config, "book", index, scores)
             self._replay(config, "chapter", first, scores)
@@ -241,10 +244,10 @@ class ConfigRevalidator:
             return self._invalid(entry, ("selector_match_invalid",), checked_at)
 
     def _collect_pages(
-        self, start: _AnalyzedPage, config: SiteConfig
+        self, start: _AnalyzedPage, config: SiteConfig, context: _RevalidationRunContext
     ) -> tuple[_AnalyzedPage, _AnalyzedPage, _AnalyzedPage]:
         book = self._selector_group(config, "book")
-        links = self._catalog_links(start.acquired, book.get("chapter_list", "")) if start.classification.kind is PageKind.BOOK_INDEX else []
+        links = self._catalog_links(start.acquired, book.get("chapter_list", ""), context) if start.classification.kind is PageKind.BOOK_INDEX else []
         prefetched: _AnalyzedPage | None = None
         if start.classification.kind is PageKind.BOOK_INDEX and links:
             index = start
@@ -253,25 +256,25 @@ class ConfigRevalidator:
             index_selector = chapter.get("index_link")
             if not index_selector:
                 raise ValueError("chapter config requires index_link")
-            index_url = self._single_anchor(start.acquired, index_selector, required=True)
+            index_url = self._single_anchor(start.acquired, index_selector, context, required=True)
             assert index_url is not None
             prefetched = start
-            index = self._fetch(index_url)
+            index = self._fetch(index_url, context)
             if index.classification.kind is not PageKind.BOOK_INDEX:
                 raise ValueError("index page kind is invalid")
-            links = self._catalog_links(index.acquired, book.get("chapter_list", ""))
+            links = self._catalog_links(index.acquired, book.get("chapter_list", ""), context)
         else:
             raise ValueError("start page kind is unsupported")
         if len(links) < 2:
             raise ValueError("catalog requires adjacent chapters")
         if prefetched is None:
-            return index, self._fetch(links[0]), self._fetch(links[1])
+            return index, self._fetch(links[0], context), self._fetch(links[1], context)
         current = self._canonical(prefetched.acquired.navigation_url)
         position = next((number for number, link in enumerate(links) if self._canonical(link) == current), -1)
         if position < 0:
             raise ValueError("chapter missing from catalog")
         neighbor = position + 1 if position + 1 < len(links) else position - 1
-        other = self._fetch(links[neighbor])
+        other = self._fetch(links[neighbor], context)
         return (index, prefetched, other) if neighbor > position else (index, other, prefetched)
 
     def _replay(self, config: SiteConfig, kind: str, page: _AnalyzedPage, scores: dict[str, float]) -> None:
@@ -350,22 +353,22 @@ class ConfigRevalidator:
                 expected[label] = StructureFingerprint.from_dict(raw)
         return expected if set(expected) == set(_FINGERPRINT_KINDS) else None
 
-    def _fetch(self, url: str) -> _AnalyzedPage:
-        if self._fetches >= self.max_pages:
+    def _fetch(self, url: str, context: _RevalidationRunContext) -> _AnalyzedPage:
+        if context.page_count >= self.max_pages:
             raise ValueError("revalidation page budget exceeded")
-        if self._origin_key(url) != self._origin:
+        if self._origin_key(url) != context.origin:
             raise AcquisitionError("cross_origin", self._origin_display(url), False)
-        remaining = self.max_revalidation_bytes - self._bytes
+        remaining = self.max_revalidation_bytes - context.byte_count
         if remaining <= 0:
             raise AcquisitionError("response_too_large", self._origin_display(url), False)
         page = self.acquirer.fetch_page(url, max_body_bytes=remaining, locked_origin=self._origin_display(url))
-        if self._origin_key(page.navigation_url) != self._origin:
+        if self._origin_key(page.navigation_url) != context.origin:
             raise AcquisitionError("cross_origin", self._origin_display(page.navigation_url), False)
         size = len(page.snapshot.body)
         if size > remaining:
             raise AcquisitionError("response_too_large", self._origin_display(url), False)
-        self._fetches += 1
-        self._bytes += size
+        context.page_count += 1
+        context.byte_count += size
         return self._analyze(page)
 
     def _analyze(self, page: AcquiredPage) -> _AnalyzedPage:
@@ -384,7 +387,9 @@ class ConfigRevalidator:
         )
         return _AnalyzedPage(page, classification, extraction, scored, decision)
 
-    def _catalog_links(self, page: AcquiredPage, selector: str) -> list[str]:
+    def _catalog_links(
+        self, page: AcquiredPage, selector: str, context: _RevalidationRunContext
+    ) -> list[str]:
         if not selector:
             raise ValueError("chapter_list selector is required")
         soup = BeautifulSoup(page.snapshot.html, "lxml")
@@ -396,7 +401,7 @@ class ConfigRevalidator:
             if not isinstance(node, Tag) or node.name != "a" or not node.get("href"):
                 raise ValueError("chapter list must contain anchors")
             link = urljoin(page.navigation_url, str(node.get("href")))
-            if self._origin_key(link) != self._origin:
+            if self._origin_key(link) != context.origin:
                 raise AcquisitionError("cross_origin", self._origin_display(link), False)
             links.append(link)
         canonical = [self._canonical(link) for link in links]
@@ -404,14 +409,16 @@ class ConfigRevalidator:
             raise ValueError("chapter links must be unique")
         return links
 
-    def _single_anchor(self, page: AcquiredPage, selector: str, *, required: bool) -> str | None:
+    def _single_anchor(
+        self, page: AcquiredPage, selector: str, context: _RevalidationRunContext, *, required: bool
+    ) -> str | None:
         nodes = BeautifulSoup(page.snapshot.html, "lxml").select(selector)
         if not nodes and not required:
             return None
         if len(nodes) != 1 or not isinstance(nodes[0], Tag) or nodes[0].name != "a" or not nodes[0].get("href"):
             raise ValueError("navigation selector must match one anchor")
         link = urljoin(page.navigation_url, str(nodes[0].get("href")))
-        if self._origin_key(link) != self._origin:
+        if self._origin_key(link) != context.origin:
             raise AcquisitionError("cross_origin", self._origin_display(link), False)
         return link
 

@@ -97,6 +97,7 @@ class _Registry(Protocol):
     def lookup(self, url: str) -> RegistryEntry | None: ...
     def load(self, entry_or_id: RegistryEntry | str, *, version: int | None = None) -> SiteConfig: ...
     def register(self, config: SiteConfig) -> RegistryEntry: ...
+    def load_exact(self, config_id: str, version: int, allowed_status: ConfigStatus) -> SiteConfig: ...
 
 
 class _Revalidator(Protocol):
@@ -207,7 +208,8 @@ class ConfigManager:
             if needs_probe:
                 validated = dict(selector_overrides or {})
                 validate_candidate_selectors(validated)
-                result = self.probe.probe(pending_url, overrides=validated)
+                with self._collaborator_lock(self.probe):
+                    result = self.probe.probe(pending_url, overrides=validated)
                 if result.outcome is DecisionKind.REJECT or result.config_draft is None:
                     raise ValueError("selector overrides failed three-page validation")
                 draft = result.config_draft
@@ -377,10 +379,16 @@ class ConfigManager:
         if existing is not None and existing.config_id != config.config_id:
             raise ConfigConflictError("matching config requires exact revalidation")
         entry = self.registry.register(config)
-        status = getattr(entry, "status", ConfigStatus.ACTIVE)
-        if status is not ConfigStatus.ACTIVE:
-            raise ConfigConflictError("registered config is not active")
-        return ConfigResolution(ResolutionKind.REGISTERED, config=config)
+        if (
+            entry.config_id != config.config_id
+            or entry.domain != config.domain
+            or entry.status is not ConfigStatus.ACTIVE
+        ):
+            raise ConfigConflictError("registered config identity or status changed")
+        loaded = self.registry.load_exact(entry.config_id, entry.version, ConfigStatus.ACTIVE)
+        if loaded.config_id != entry.config_id or loaded.domain != entry.domain:
+            raise ConfigConflictError("loaded registered config identity changed")
+        return ConfigResolution(ResolutionKind.REGISTERED, config=loaded)
 
     def _now(self) -> datetime:
         value = self._clock()

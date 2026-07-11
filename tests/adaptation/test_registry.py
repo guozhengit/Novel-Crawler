@@ -187,6 +187,31 @@ def test_transition_state_machine_makes_revoked_terminal_except_admin_unrevoke(t
     assert restored.status is ConfigStatus.STALE and restored.version == revoked.version + 1
 
 
+@pytest.mark.parametrize(
+    ("supplied", "canonical"),
+    [
+        ("2026-07-11T09:00:00+00:00", "2026-07-11T09:00:00Z"),
+        ("2026-07-11T09:00:00.987654Z", "2026-07-11T09:00:00Z"),
+    ],
+)
+def test_mark_validated_persists_one_canonical_config_and_reopens_cleanly(
+    tmp_path: Path, supplied: str, canonical: str
+) -> None:
+    registry = ConfigRegistry(tmp_path)
+    active = registry.register(config())
+
+    validated = registry.mark_validated(active.config_id, supplied)
+
+    assert validated.validated == canonical
+    assert registry.load(validated).last_validated == canonical
+    revision = json.loads(next((tmp_path / "configs").rglob("rev-000002.json")).read_text(encoding="utf-8"))
+    assert revision["config"] == registry.load(validated).to_dict(include_sensitive=True)
+    reopened = ConfigRegistry(tmp_path)
+    assert reopened.list()[0] == validated
+    assert reopened.load(validated).to_dict(include_sensitive=True) == revision["config"]
+    assert not list((tmp_path / "quarantine").iterdir())
+
+
 def test_transition_checks_expected_version_and_status_atomically(tmp_path: Path) -> None:
     registry = ConfigRegistry(tmp_path)
     active = registry.register(config())

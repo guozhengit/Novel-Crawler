@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import FrozenInstanceError, is_dataclass
 
 import pytest
@@ -177,18 +178,38 @@ def test_version_pipeline_applies_injected_migration_to_runtime_target(monkeypat
     import novel_crawler.adaptation.config_schema as schema
 
     called = []
+    parsed_versions = []
 
     def v1_to_v2(payload: dict[str, object]) -> dict[str, object]:
         called.append(payload["schema_version"])
         return {**payload, "schema_version": 2}
 
+    def parse_v2(payload: Mapping[str, object]) -> dict[str, object]:
+        parsed_versions.append(payload.get("schema_version"))
+        if payload.get("schema_version") != 2:
+            raise ValueError("v2 parser requires schema_version 2")
+        return dict(payload)
+
+    version_registry = schema.DEFAULT_SCHEMA_REGISTRY.register_parser(2, parse_v2).register_migration(1, v1_to_v2)
     monkeypatch.setattr(schema, "CURRENT_SCHEMA_VERSION", 2)
-    config = schema.parse_config(valid_payload(), migrations={1: v1_to_v2})
+    config = schema.parse_config(valid_payload(), version_registry=version_registry)
     assert called == [1]
     assert config.schema_version == 2
+    serialized = config.to_sensitive_dict()
+    assert schema.parse_config(serialized, version_registry=version_registry).to_sensitive_dict() == serialized
+    assert parsed_versions == [2, 2]
 
+    without_migration = schema.DEFAULT_SCHEMA_REGISTRY.register_parser(2, parse_v2)
     with pytest.raises(ValueError, match="missing migration from schema_version 1"):
-        schema.parse_config(valid_payload(), migrations={})
+        schema.parse_config(valid_payload(), version_registry=without_migration)
+
+
+def test_version_pipeline_requires_a_parser_for_current_runtime_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    import novel_crawler.adaptation.config_schema as schema
+
+    monkeypatch.setattr(schema, "CURRENT_SCHEMA_VERSION", 2)
+    with pytest.raises(ValueError, match="missing parser for current schema_version 2"):
+        schema.parse_config(valid_payload())
 
 
 def test_v1_runtime_target_still_parses_without_migration() -> None:
