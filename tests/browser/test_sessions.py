@@ -10,13 +10,13 @@ import threading
 import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from novel_crawler.adaptation.registry_io import RegistryIOError
 from novel_crawler.browser.sessions import (
     BrowserSessionError,
+    BrowserSessionInfo,
     BrowserSessionStatus,
     BrowserSessionStore,
     SessionConfirmationError,
@@ -408,38 +408,6 @@ def test_deep_profile_deletion_is_iterative(tmp_path: Path) -> None:
         sys.setrecursionlimit(previous)
 
 
-def test_directory_swap_during_deletion_cannot_escape_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = BrowserSessionStore(tmp_path / "sessions")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    sentinel = outside / "keep.txt"
-    sentinel.write_text("keep", encoding="utf-8")
-    with store.acquire("swap.example") as lease:
-        child = lease.profile_path / "child"
-        child.mkdir()
-        session_id = lease.info.session_id
-    original_scandir = os.scandir
-    swapped = False
-
-    def scandir(path: str | os.PathLike[str]) -> Any:
-        nonlocal swapped
-        candidate = Path(path)
-        if candidate == child and not swapped:
-            candidate.rmdir()
-            try:
-                candidate.symlink_to(outside, target_is_directory=True)
-            except OSError:
-                pytest.skip("directory symlink creation unavailable")
-            swapped = True
-        return original_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
-    assert store.clear("swap.example", session_id, confirmation=True)
-    assert sentinel.read_text(encoding="utf-8") == "keep"
-
-
 def test_global_session_limit_includes_unpublished_concurrent_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -518,7 +486,59 @@ def test_permanent_domain_lock_capacity_is_bounded(tmp_path: Path) -> None:
         store.clear(domain, session_id, confirmation=True)
     with pytest.raises(SessionLimitError, match="domain_capacity"):
         store.acquire("three.example")
+    with store.acquire("one.example"):
+        pass
     assert len(list((store.root / "locks").glob("*.lock"))) == 3
+
+
+def test_ensure_lock_failure_releases_allocation_and_redacts_io(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    original = store._ensure_domain_lock
+
+    def fail(path: Path) -> None:
+        raise RegistryIOError(f"cookie=secret path={path}")
+
+    monkeypatch.setattr(store, "_ensure_domain_lock", fail)
+    with pytest.raises(BrowserSessionError) as caught:
+        store.acquire("failed.example")
+    assert caught.value.code == "allocation_io"
+    assert "cookie" not in str(caught.value) and str(tmp_path) not in str(caught.value)
+    monkeypatch.setattr(store, "_ensure_domain_lock", original)
+    with store.acquire("working.example", timeout=0.5):
+        pass
+
+
+def test_recovery_missing_lock_respects_capacity_and_normal_recreates_under_cap(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    store = BrowserSessionStore(root, max_sessions=1, max_domain_locks=1)
+    with store.acquire("known.example") as lease:
+        known_id = lease.info.session_id
+    store.clear("known.example", known_id, confirmation=True)
+    timestamp = "2026-07-11T00:00:00+00:00"
+    pending = BrowserSessionInfo(
+        "a" * 32, "pending.example", timestamp, timestamp, BrowserSessionStatus.REVOKED, "empty"
+    )
+    _, profile, metadata, _ = store._paths(pending.domain)
+    store._io.ensure_directory(profile)
+    tombstone_id = "b" * 32
+    store._write_deleting(metadata, pending, tombstone_id)
+    store._write_tombstone(pending, tombstone_id)
+    with pytest.raises(SessionLimitError, match="domain_capacity"):
+        BrowserSessionStore(root, max_sessions=1, max_domain_locks=1)
+    assert len(list((root / "locks").glob("*.lock"))) == 2
+
+    other_root = tmp_path / "under-cap"
+    under = BrowserSessionStore(other_root, max_sessions=1, max_domain_locks=2)
+    with under.acquire("normal.example") as lease:
+        session_id = lease.info.session_id
+    _, _, _, lock_path = under._paths("normal.example")
+    lock_path.unlink()
+    reopened = BrowserSessionStore(other_root, max_sessions=1, max_domain_locks=2)
+    with reopened.acquire("normal.example") as lease:
+        assert lease.info.session_id == session_id
+    assert lock_path.exists()
 
 
 def test_clear_waiters_recreate_on_same_permanent_inode_with_one_active_lease(

@@ -332,29 +332,43 @@ class BrowserSessionStore:
         _, _, metadata_path, _ = self._paths(canonical)
         preallocation = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
         allocation: _DomainLock | None = preallocation
+        allocation_owned = False
         try:
             preallocation.acquire()
+            allocation_owned = True
         except (RegistryIOError, OSError):
             raise BrowserSessionError("allocation_io", canonical) from None
         try:
-            preview = self._read_info(metadata_path, quarantine=False)
-        except BrowserSessionError as exc:
-            if exc.code not in {"metadata_corrupt", "metadata_io"}:
+            try:
+                preview = self._read_info(metadata_path, quarantine=False)
+            except BrowserSessionError as exc:
+                if exc.code not in {"metadata_corrupt", "metadata_io"}:  # pragma: no cover - defensive code gate
+                    raise  # pragma: no cover
+                preview = None
+            if preview is None or preview.status is BrowserSessionStatus.STALE:
+                self._enforce_session_limit(excluding=metadata_path)
+            _, _, _, lock_path = self._paths(canonical)
+            self._ensure_domain_lock(lock_path)
+            if preview is not None and preview.status is not BrowserSessionStatus.STALE:
                 preallocation.release()
-                raise
-            preview = None
-        if preview is None or preview.status is BrowserSessionStatus.STALE:
-            self._enforce_session_limit(excluding=metadata_path)
-        _, _, _, lock_path = self._paths(canonical)
-        self._ensure_domain_lock(lock_path)
-        if preview is not None and preview.status is not BrowserSessionStatus.STALE:
-            preallocation.release()
-            allocation = None
-        try:
+                allocation_owned = False
+                allocation = None
             lock = self._lock(canonical, timeout)
-        except Exception:  # pragma: no cover - injected lock-open failure
-            if allocation is not None:
-                allocation.release()
+        except SessionLimitError:
+            if allocation_owned:
+                preallocation.release()
+            raise
+        except BrowserSessionError:
+            if allocation_owned:
+                preallocation.release()
+            raise
+        except (RegistryIOError, OSError):
+            if allocation_owned:
+                preallocation.release()
+            raise BrowserSessionError("allocation_io", canonical) from None
+        except Exception:  # pragma: no cover - unexpected preparation failure
+            if allocation_owned:
+                preallocation.release()
             raise
         try:
             _, profile, metadata, _ = self._paths(canonical)
@@ -407,17 +421,20 @@ class BrowserSessionStore:
                     raise _RetryAcquire
                 return BrowserSessionLease(self, in_use, profile, lock)
             finally:
-                if allocation is not None:
+                if allocation is not None and allocation_owned:
                     allocation.release()
+                    allocation_owned = False
         except (RegistryIOError, OSError):  # pragma: no cover - injected cleanup failure
             lock.release()
-            if allocation is not None:
+            if allocation is not None and allocation_owned:
                 allocation.release()
+                allocation_owned = False
             raise BrowserSessionError("storage_io", canonical) from None  # pragma: no cover
         except Exception:
             lock.release()
-            if allocation is not None:
+            if allocation is not None and allocation_owned:
                 allocation.release()
+                allocation_owned = False
             raise
 
     def _release(self, leased: BrowserSessionInfo) -> None:
@@ -657,6 +674,8 @@ class BrowserSessionStore:
                 value = json.loads(self._io.read_bounded(path, 4096))
                 if isinstance(value, dict) and value.get("status") == "deleting":
                     info, tombstone_id = self._validate_deleting(path, value)
+                    _, _, _, lock_path = self._paths(info.domain)
+                    self._ensure_domain_lock(lock_path)
                     domain_lock = self._lock(info.domain)
                     try:
                         self._complete_deletion(path, info, tombstone_id)
@@ -677,6 +696,8 @@ class BrowserSessionStore:
                 info, tombstone_id = self._validate_deleting(metadata, value)
                 if tombstone.stem != tombstone_id:
                     raise ValueError
+                _, _, _, lock_path = self._paths(info.domain)
+                self._ensure_domain_lock(lock_path)
                 domain_lock = self._lock(info.domain)
                 try:
                     self._complete_deletion(metadata, info, tombstone_id)
@@ -692,7 +713,9 @@ class BrowserSessionStore:
             if profile.name not in metadata_keys:
                 tombstone_id = uuid.uuid4().hex
                 trash = self._trash / tombstone_id
-                domain_lock = _DomainLock(self._locks / f"{profile.name}.lock", self._lock_timeout, self._io)
+                lock_path = self._locks / f"{profile.name}.lock"
+                self._ensure_domain_lock(lock_path)
+                domain_lock = _DomainLock(lock_path, self._lock_timeout, self._io)
                 domain_lock.acquire()
                 try:
                     self._io.durable_move(profile, trash)
