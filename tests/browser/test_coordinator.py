@@ -27,9 +27,11 @@ class FakeHttp:
     def __init__(self, html: str) -> None:
         self.page = AcquiredPage(snapshot(html), "https://example.test/private?q=secret")
         self.calls: list[str] = []
+        self.options: list[dict[str, Any]] = []
 
     def fetch_page(self, url: str, **kwargs: Any) -> AcquiredPage:
         self.calls.append(url)
+        self.options.append(kwargs)
         return self.page
 
 
@@ -115,7 +117,7 @@ def test_continue_waits_then_fails_after_two_attempts_and_releases_lease(tmp_pat
     driver = FakeDriver([context])
     sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
     coordinator = VerificationCoordinator(sessions, driver=driver, max_attempts=2, safety_policy=PUBLIC_POLICY)
-    ticket = coordinator.begin("https://example.test/private?q=secret")
+    ticket = coordinator.begin("https://example.test/private?q=secret", task_key="download")
     assert coordinator.continue_verification(ticket.token).status is VerificationStatus.WAITING
     assert coordinator.continue_verification(ticket.token).status is VerificationStatus.FAILED
     with sessions.acquire("example.test", timeout=0.1):
@@ -128,7 +130,7 @@ def test_verified_continue_reloads_original_in_same_context_and_returns_page(tmp
     chapter = browser_snapshot("<title>第1章</title><article id='content'>正文</article>")
     context = FakeContext([auth, chapter, chapter], [])
     coordinator = VerificationCoordinator(BrowserSessionStore(tmp_path), driver=FakeDriver([context]), safety_policy=PUBLIC_POLICY)
-    ticket = coordinator.begin("https://example.test/private?q=secret")
+    ticket = coordinator.begin("https://example.test/private?q=secret", task_key="download")
     outcome = coordinator.continue_verification(ticket.token)
     assert outcome.status is VerificationStatus.COMPLETED
     assert outcome.page is not None and outcome.page.navigation_url.endswith("?q=secret")
@@ -142,11 +144,11 @@ def test_cancel_timeout_capacity_and_safe_unknown_tokens(tmp_path: Path) -> None
         BrowserSessionStore(tmp_path), driver=FakeDriver(contexts), max_active=1, ttl=timedelta(minutes=10), clock=lambda: now,
         safety_policy=PUBLIC_POLICY,
     )
-    first = coordinator.begin("https://one.example/a")
+    first = coordinator.begin("https://one.example/a", task_key="one")
     with pytest.raises(VerificationRequired, match="verification_capacity"):
-        coordinator.begin("https://two.example/a")
+        coordinator.begin("https://two.example/a", task_key="two")
     assert coordinator.cancel(first.token).status is VerificationStatus.CANCELLED
-    second = coordinator.begin("https://two.example/a")
+    second = coordinator.begin("https://two.example/a", task_key="two")
     now += timedelta(minutes=11)
     assert coordinator.continue_verification(second.token).status is VerificationStatus.TIMED_OUT
     with pytest.raises(VerificationRequired, match="verification_token_invalid") as caught:
@@ -160,7 +162,7 @@ def test_same_token_has_one_winner_and_same_domain_conflicts(tmp_path: Path) -> 
     context = FakeContext([auth, chapter, chapter], [])
     sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
     coordinator = VerificationCoordinator(sessions, driver=FakeDriver([context]), safety_policy=PUBLIC_POLICY)
-    ticket = coordinator.begin("https://example.test/a")
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
     with pytest.raises(SessionLockTimeout):
         sessions.acquire("example.test", timeout=0.01)
     results: list[object] = []
@@ -191,7 +193,7 @@ def test_browser_crash_fails_safely_releases_lease_and_redacts_exception(tmp_pat
     context = Crashed([browser_snapshot("<p>x</p>")], [])
     sessions = BrowserSessionStore(tmp_path)
     coordinator = VerificationCoordinator(sessions, driver=FakeDriver([context]), safety_policy=PUBLIC_POLICY)
-    ticket = coordinator.begin("https://example.test/private?q=secret")
+    ticket = coordinator.begin("https://example.test/private?q=secret", task_key="download")
     result = coordinator.continue_verification(ticket.token)
     assert result.status is VerificationStatus.FAILED
     assert "secret" not in repr(result)
@@ -208,7 +210,7 @@ def test_public_models_reject_invalid_limits_urls_and_error_codes(tmp_path: Path
         VerificationRequired("cookie=secret")
     coordinator = VerificationCoordinator(sessions, driver=FakeDriver([]), safety_policy=PUBLIC_POLICY)
     with pytest.raises(VerificationRequired, match="verification_url_invalid"):
-        coordinator.begin("https:///missing-host")
+        coordinator.begin("https:///missing-host", task_key="download")
     with pytest.raises(VerificationRequired, match="verification_token_invalid"):
         coordinator.continue_verification("x" * 129)
 
@@ -222,7 +224,7 @@ def test_begin_navigation_crash_closes_partial_context_and_releases_lease(tmp_pa
     sessions = BrowserSessionStore(tmp_path)
     coordinator = VerificationCoordinator(sessions, driver=FakeDriver([context]), safety_policy=PUBLIC_POLICY)
     with pytest.raises(VerificationRequired, match="verification_start_failed") as caught:
-        coordinator.begin("https://example.test/private?q=secret")
+        coordinator.begin("https://example.test/private?q=secret", task_key="download")
     assert "secret" not in str(caught.value)
     assert context.calls[-1] == "close"
     with sessions.acquire("example.test", timeout=0.1):
@@ -236,7 +238,7 @@ def test_reload_that_returns_auth_waits_then_fails_on_second_attempt(tmp_path: P
     coordinator = VerificationCoordinator(
         BrowserSessionStore(tmp_path), driver=FakeDriver([context]), safety_policy=PUBLIC_POLICY
     )
-    ticket = coordinator.begin("https://example.test/a")
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
     assert coordinator.continue_verification(ticket.token).status is VerificationStatus.WAITING
     assert coordinator.continue_verification(ticket.token).status is VerificationStatus.FAILED
 
@@ -250,7 +252,7 @@ def test_expire_sweep_closes_expired_entries(tmp_path: Path) -> None:
         clock=lambda: now,
         safety_policy=PUBLIC_POLICY,
     )
-    ticket = coordinator.begin("https://example.test/a")
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
     now += timedelta(minutes=11)
     assert coordinator.expire_sweep() == 1
     assert context.calls[-1] == "close"
@@ -290,3 +292,185 @@ def test_headless_browser_failure_is_safe_and_releases_profile(tmp_path: Path) -
     assert "secret" not in str(caught.value)
     with sessions.acquire("example.test", timeout=0.1):
         pass
+
+
+def test_begin_requires_safe_task_key_and_persistent_attempts_cannot_reset(tmp_path: Path) -> None:
+    contexts = [FakeContext([browser_snapshot("<p>x</p>")], []) for _ in range(2)]
+    sessions = BrowserSessionStore(tmp_path)
+    coordinator = VerificationCoordinator(sessions, driver=FakeDriver(contexts), safety_policy=PUBLIC_POLICY)
+    with pytest.raises(TypeError):
+        coordinator.begin("https://example.test/a")  # type: ignore[call-arg]
+    with pytest.raises(VerificationRequired, match="verification_task_invalid"):
+        coordinator.begin("https://example.test/a", task_key="cookie=secret")
+    first = coordinator.begin("https://example.test/a", task_key="download")
+    coordinator.cancel(first.token)
+    second = coordinator.begin("https://example.test/a", task_key="download")
+    coordinator.cancel(second.token)
+    restarted = VerificationCoordinator(sessions, driver=FakeDriver([]), safety_policy=PUBLIC_POLICY)
+    with pytest.raises(VerificationRequired, match="verification_attempts_exhausted"):
+        restarted.begin("https://example.test/a", task_key="download")
+
+
+def test_launch_failure_rolls_back_capacity_and_attempt_reservation(tmp_path: Path) -> None:
+    class FailOnceDriver(FakeDriver):
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: object) -> FakeContext:
+            if not self.contexts:
+                raise RuntimeError("launch failure")
+            return super().launch(user_data_dir=user_data_dir, headless=headless, policy=policy)
+
+    driver = FailOnceDriver([])
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path), driver=driver, max_active=1, safety_policy=PUBLIC_POLICY
+    )
+    with pytest.raises(VerificationRequired, match="verification_start_failed"):
+        coordinator.begin("https://example.test/a", task_key="download")
+    driver.contexts.append(FakeContext([browser_snapshot("<p>x</p>")], []))
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    coordinator.cancel(ticket.token)
+
+
+def test_failed_close_keeps_stale_lease_and_capacity_until_explicit_retry(tmp_path: Path) -> None:
+    class CloseFailsOnce(FakeContext):
+        def __init__(self) -> None:
+            super().__init__([browser_snapshot("<p>x</p>")], [])
+            self.failures = 1
+
+        def close(self) -> None:
+            self.calls.append("close")
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("cookie=secret path=C:/private")
+
+    context = CloseFailsOnce()
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    coordinator = VerificationCoordinator(
+        sessions, driver=FakeDriver([context]), max_active=1, safety_policy=PUBLIC_POLICY
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    outcome = coordinator.cancel(ticket.token)
+    assert outcome.status is VerificationStatus.FAILED
+    with pytest.raises(VerificationRequired, match="verification_capacity"):
+        coordinator.begin("https://other.test/a", task_key="other")
+    with pytest.raises(SessionLockTimeout):
+        sessions.acquire("example.test", timeout=0.01)
+    assert coordinator.retry_cleanup(ticket.token)
+    with sessions.acquire("example.test", timeout=0.1):
+        pass
+
+
+def test_browser_acquirer_passes_limits_and_classifiable_statuses_to_http(tmp_path: Path) -> None:
+    http = FakeHttp("<title>Login</title><form><input type='password'></form>")
+    acquirer = BrowserAcquirer(
+        http=http,
+        driver=FakeDriver([]),
+        sessions=BrowserSessionStore(tmp_path),
+        safety_policy=PUBLIC_POLICY,
+        max_body_bytes=123,
+    )
+    with pytest.raises(VerificationRequired):
+        acquirer.fetch_page("https://example.test/a")
+    assert http.calls == ["https://example.test/a"]
+    assert http.options == [{"max_body_bytes": 123, "classifiable_statuses": frozenset({403, 429})}]
+
+
+def test_success_clears_attempt_ledger_for_future_runs(tmp_path: Path) -> None:
+    chapter = browser_snapshot("<title>Chapter 1</title><article id='content'>body</article>")
+    contexts = [
+        FakeContext([chapter, chapter, chapter], []),
+        FakeContext([chapter], []),
+        FakeContext([chapter], []),
+    ]
+    sessions = BrowserSessionStore(tmp_path)
+    coordinator = VerificationCoordinator(sessions, driver=FakeDriver(contexts), safety_policy=PUBLIC_POLICY)
+    first = coordinator.begin("https://example.test/a", task_key="download")
+    assert coordinator.continue_verification(first.token).status is VerificationStatus.COMPLETED
+    second = coordinator.begin("https://example.test/a", task_key="download")
+    coordinator.cancel(second.token)
+    third = coordinator.begin("https://example.test/a", task_key="download")
+    coordinator.cancel(third.token)
+
+
+def test_confirmed_browser_crash_marks_stale_and_releases_lease(tmp_path: Path) -> None:
+    class DeadContext(FakeContext):
+        def capture(self) -> BrowserPageSnapshot:
+            raise RuntimeError("browser crashed cookie=secret")
+
+        def is_alive(self) -> bool:
+            return False
+
+    sessions = BrowserSessionStore(tmp_path)
+    coordinator = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([DeadContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    assert coordinator.continue_verification(ticket.token).status is VerificationStatus.FAILED
+    with sessions.acquire("example.test", timeout=0.1):
+        pass
+
+
+def test_retry_cleanup_can_report_repeated_close_failure(tmp_path: Path) -> None:
+    class NeverCloses(FakeContext):
+        def close(self) -> None:
+            raise RuntimeError("close failed")
+
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([NeverCloses([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    assert coordinator.cancel(ticket.token).status is VerificationStatus.FAILED
+    assert coordinator.retry_cleanup(ticket.token) is False
+
+
+def test_begin_failure_with_failed_close_is_quarantined_before_lease_release(tmp_path: Path) -> None:
+    class NavigateAndCloseFail(FakeContext):
+        def __init__(self) -> None:
+            super().__init__([], [])
+            self.close_failures = 1
+
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            raise RuntimeError("navigation failed")
+
+        def close(self) -> None:
+            if self.close_failures:
+                self.close_failures -= 1
+                raise RuntimeError("close failed")
+
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    coordinator = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([NavigateAndCloseFail()]),
+        max_active=1,
+        safety_policy=PUBLIC_POLICY,
+    )
+    with pytest.raises(VerificationRequired, match="verification_start_failed") as caught:
+        coordinator.begin("https://example.test/a", task_key="download")
+    cleanup_token = caught.value.ticket.token if caught.value.ticket is not None else ""
+    assert cleanup_token
+    with pytest.raises(SessionLockTimeout):
+        sessions.acquire("example.test", timeout=0.01)
+    assert coordinator.retry_cleanup(cleanup_token)
+
+
+def test_attempt_ledger_is_atomic_across_coordinator_instances(tmp_path: Path) -> None:
+    sessions = BrowserSessionStore(tmp_path)
+    first = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    second = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    one = first.begin("https://example.test/a", task_key="download")
+    first.cancel(one.token)
+    two = second.begin("https://example.test/a", task_key="download")
+    second.cancel(two.token)
+    third = VerificationCoordinator(sessions, driver=FakeDriver([]), safety_policy=PUBLIC_POLICY)
+    with pytest.raises(VerificationRequired, match="verification_attempts_exhausted"):
+        third.begin("https://example.test/a", task_key="download")

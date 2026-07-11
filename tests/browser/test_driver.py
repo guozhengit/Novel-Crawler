@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 
 from novel_crawler.acquisition.security import UrlSafetyPolicy
 from novel_crawler.browser.driver import (
+    BrowserContextWorker,
     BrowserPageSnapshot,
     BrowserRequestPolicy,
     DefaultPlaywrightDriver,
@@ -77,12 +79,12 @@ def test_request_policy_blocks_private_cross_origin_documents_and_allows_same_or
     assert private.decide("https://example.test/a.js", resource_type="script", is_navigation=False) is RequestDecision.BLOCK
 
 
-def test_request_policy_can_allow_validated_public_cdn_assets_but_never_documents() -> None:
-    guard = BrowserRequestPolicy(public_policy(), allow_public_cdn_subresources=True)
+def test_request_policy_blocks_public_cdn_assets_and_non_http_documents() -> None:
+    guard = BrowserRequestPolicy(public_policy())
     guard.lock("https://example.test/start")
-    assert guard.decide("https://cdn.test/app.js", resource_type="script", is_navigation=False) is RequestDecision.ALLOW
+    assert guard.decide("https://cdn.test/app.js", resource_type="script", is_navigation=False) is RequestDecision.BLOCK
     assert guard.decide("https://cdn.test/page", resource_type="document", is_navigation=True) is RequestDecision.BLOCK
-    assert guard.decide("data:image/png;base64,AA==", resource_type="image", is_navigation=False) is RequestDecision.ALLOW
+    assert guard.decide("data:image/png;base64,AA==", resource_type="image", is_navigation=False) is RequestDecision.BLOCK
     assert guard.decide("data:text/html,private", resource_type="document", is_navigation=True) is RequestDecision.BLOCK
     assert guard.decide("file:///etc/passwd", resource_type="other", is_navigation=False) is RequestDecision.BLOCK
 
@@ -107,6 +109,10 @@ class FakePage:
     def content(self) -> str:
         return self.content_value
 
+    def evaluate(self, expression: str) -> int:
+        assert "outerHTML.length" in expression
+        return len(self.content_value)
+
 
 class FakeRawContext:
     def __init__(self, *, fail_route: bool = False) -> None:
@@ -114,6 +120,8 @@ class FakeRawContext:
         self.route_callback: object | None = None
         self.closed = False
         self.fail_route = fail_route
+        self.web_socket_callback: object | None = None
+        self.init_scripts: list[str] = []
 
     def route(self, pattern: str, callback: object) -> None:
         assert pattern == "**/*"
@@ -123,6 +131,13 @@ class FakeRawContext:
 
     def close(self) -> None:
         self.closed = True
+
+    def route_web_socket(self, pattern: str, callback: object) -> None:
+        assert pattern == "**/*"
+        self.web_socket_callback = callback
+
+    def add_init_script(self, script: str) -> None:
+        self.init_scripts.append(script)
 
 
 def test_playwright_context_routes_every_request_and_captures_navigation() -> None:
@@ -158,6 +173,10 @@ def test_playwright_context_routes_every_request_and_captures_navigation() -> No
     assert raw.pages[0].goto_calls == [("https://example.test/start", "domcontentloaded")]
     context.close()
     assert raw.closed and runtime.stopped
+    assert callable(raw.web_socket_callback)
+    web_socket = SimpleNamespace(closed=False, close=lambda **kwargs: setattr(web_socket, "closed", kwargs))
+    raw.web_socket_callback(web_socket)  # type: ignore[operator]
+    assert web_socket.closed
 
 
 def test_playwright_capture_rejects_unexpected_cross_origin_final_page() -> None:
@@ -191,3 +210,204 @@ def test_default_driver_closes_partial_context_when_route_setup_crashes(monkeypa
         DefaultPlaywrightDriver().launch(user_data_dir=tmp_path, headless=True, policy=guard)
     assert raw.closed
     assert runtime.stopped
+
+
+def test_default_driver_uses_pinned_proxy_and_locked_down_chromium_options(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    raw = FakeRawContext()
+    launch_options: dict[str, object] = {}
+
+    def launch(**kwargs: object) -> FakeRawContext:
+        launch_options.update(kwargs)
+        return raw
+
+    runtime = SimpleNamespace(
+        chromium=SimpleNamespace(launch_persistent_context=launch),
+        stop=lambda: None,
+    )
+    manager = SimpleNamespace(start=lambda: runtime)
+    package = ModuleType("playwright")
+    sync_api = ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = lambda: manager  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    class FakeProxy:
+        proxy_url = "socks5://127.0.0.1:4321"
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("novel_crawler.browser.driver.PinnedSocksProxy", lambda *args, **kwargs: FakeProxy())
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/start")
+    context = DefaultPlaywrightDriver().launch(user_data_dir=tmp_path, headless=True, policy=guard)
+    assert launch_options["proxy"] == {"server": "socks5://127.0.0.1:4321", "bypass": ""}
+    assert launch_options["service_workers"] == "block"
+    assert launch_options["accept_downloads"] is False
+    args = launch_options["args"]
+    assert "--renderer-process-limit=4" in args
+    assert any("max-old-space-size" in value for value in args)
+    assert raw.init_scripts and "unregister" in raw.init_scripts[0]
+    context.close()
+
+
+def test_browser_worker_owns_every_context_call_on_one_dedicated_thread(tmp_path: Path) -> None:
+    thread_ids: list[int] = []
+
+    class OwnedContext:
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            thread_ids.append(threading.get_ident())
+            return BrowserPageSnapshot(url, url, 200, {}, b"<p>ok</p>")
+
+        def capture(self) -> BrowserPageSnapshot:
+            thread_ids.append(threading.get_ident())
+            return BrowserPageSnapshot("https://example.test/", "https://example.test/", 200, {}, b"<p>ok</p>")
+
+        def close(self) -> None:
+            thread_ids.append(threading.get_ident())
+
+    class OwnedDriver:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> OwnedContext:
+            thread_ids.append(threading.get_ident())
+            return OwnedContext()
+
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    worker = BrowserContextWorker(OwnedDriver(), user_data_dir=tmp_path, headless=True, policy=guard, ttl=1)
+    worker.start()
+    worker.navigate("https://example.test/")
+    worker.capture()
+    worker.close()
+    assert len(set(thread_ids)) == 1
+    assert thread_ids[0] != threading.get_ident()
+
+
+def test_browser_worker_monotonic_deadline_closes_without_coordinator_calls(tmp_path: Path) -> None:
+    closed = threading.Event()
+
+    class Context:
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def capture(self) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def close(self) -> None:
+            closed.set()
+
+    class DeadlineDriver:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> Context:
+            return Context()
+
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    worker = BrowserContextWorker(DeadlineDriver(), user_data_dir=tmp_path, headless=False, policy=guard, ttl=0.1)
+    worker.start()
+    assert closed.wait(1)
+    with pytest.raises(RuntimeError, match="browser_worker_expired"):
+        worker.capture()
+
+
+def test_capture_rejects_dom_before_materializing_content() -> None:
+    raw = FakeRawContext()
+    raw.pages[0].content_value = "x" * 20
+    content_calls = 0
+
+    def content() -> str:
+        nonlocal content_calls
+        content_calls += 1
+        return raw.pages[0].content_value
+
+    raw.pages[0].content = content  # type: ignore[method-assign]
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    context = _PlaywrightContext(SimpleNamespace(stop=lambda: None), raw, guard, max_body_bytes=10)
+    raw.pages[0].url = "https://example.test/"
+    with pytest.raises(ValueError, match="browser_body_too_large"):
+        context.capture()
+    assert content_calls == 0
+
+
+def test_context_requires_websocket_routing_and_worker_close_can_retry(tmp_path: Path) -> None:
+    raw = FakeRawContext()
+    raw.route_web_socket = None  # type: ignore[method-assign]
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    with pytest.raises(RuntimeError, match="websocket_routing_required"):
+        _PlaywrightContext(SimpleNamespace(stop=lambda: None), raw, guard)
+
+    class CloseRetry:
+        failures = 1
+
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def capture(self) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def close(self) -> None:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("close failed")
+
+    context = CloseRetry()
+
+    class Driver:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> CloseRetry:
+            return context
+
+    worker = BrowserContextWorker(Driver(), user_data_dir=tmp_path, headless=True, policy=guard, ttl=1)
+    worker.start()
+    with pytest.raises(RuntimeError, match="close failed"):
+        worker.close()
+    worker.close()
+
+
+def test_worker_and_driver_limit_validation_and_launch_failure(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="browser limits"):
+        DefaultPlaywrightDriver(max_network_bytes=0)
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    with pytest.raises(ValueError, match="worker ttl"):
+        BrowserContextWorker(SimpleNamespace(), user_data_dir=tmp_path, headless=True, policy=guard, ttl=0)  # type: ignore[arg-type]
+
+    class Broken:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> object:
+            raise RuntimeError("launch failed")
+
+    worker = BrowserContextWorker(Broken(), user_data_dir=tmp_path, headless=True, policy=guard, ttl=1)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="launch failed"):
+        worker.start()
+    with pytest.raises(RuntimeError, match="browser_worker_closed"):
+        worker.capture()
+
+
+def test_policy_requires_lock_and_validation_for_private_properties() -> None:
+    guard = BrowserRequestPolicy(public_policy())
+    with pytest.raises(RuntimeError, match="origin_not_locked"):
+        _ = guard.locked_url
+    with pytest.raises(RuntimeError, match="origin_not_validated"):
+        _ = guard.resolved_target
+
+
+def test_policy_fails_closed_for_malformed_request_url() -> None:
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    assert guard.decide("https://[malformed", resource_type="script", is_navigation=False) is RequestDecision.BLOCK
+
+
+def test_browser_snapshot_falls_back_when_declared_charset_is_invalid() -> None:
+    raw = BrowserPageSnapshot(
+        "https://example.test/",
+        "https://example.test/",
+        200,
+        {"content-type": "text/html; charset=does-not-exist"},
+        b"plain ascii",
+    )
+    snapshot = raw.to_page_snapshot()
+    assert snapshot.html == "plain ascii"

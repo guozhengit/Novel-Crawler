@@ -102,6 +102,16 @@ def test_stale_and_revoked_sessions_are_not_reused(tmp_path: Path) -> None:
         store.acquire("one.example")
 
 
+def test_active_lease_can_be_marked_stale_before_failed_browser_cleanup(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    lease = store.acquire("example.test")
+    stale = lease.mark_stale()
+    assert stale.status is BrowserSessionStatus.STALE
+    lease.close()
+    with store.acquire("example.test") as replacement:
+        assert replacement.info.session_id != stale.session_id
+
+
 @pytest.mark.parametrize("domain", ["", ".", "a/b.example", "user@example.com", "example.com:443"])
 def test_invalid_domains_are_rejected(tmp_path: Path, domain: str) -> None:
     store = BrowserSessionStore(tmp_path / "sessions")

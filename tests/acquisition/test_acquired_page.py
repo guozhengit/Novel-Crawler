@@ -17,3 +17,20 @@ def test_acquired_page_keeps_navigation_url_private_and_immutable() -> None:
         asdict(page)  # type: ignore[arg-type]
     with pytest.raises(AttributeError):
         page.navigation_url = "x"  # type: ignore[misc]
+
+
+def test_snapshot_and_acquired_page_repr_hide_dom_body_and_headers() -> None:
+    snapshot = PageSnapshot(
+        "https://example.test/private",
+        "https://example.test/private",
+        200,
+        {"set-cookie": "dom-secret"},
+        "utf-8",
+        "<html>dom-secret</html>",
+        b"dom-secret",
+        "GET",
+        (),
+        datetime.now(UTC),
+    )
+    assert "dom-secret" not in repr(snapshot)
+    assert "dom-secret" not in repr(AcquiredPage(snapshot, "https://example.test/private"))

@@ -1,8 +1,16 @@
 """Persistent, domain-isolated browser sessions."""
 
 from .coordinator import BrowserAcquirer, VerificationCoordinator, VerificationRequired
-from .driver import BrowserPageSnapshot, BrowserRequestPolicy, DefaultPlaywrightDriver, Driver, RequestDecision
+from .driver import (
+    BrowserContextWorker,
+    BrowserPageSnapshot,
+    BrowserRequestPolicy,
+    DefaultPlaywrightDriver,
+    Driver,
+    RequestDecision,
+)
 from .models import VerificationOutcome, VerificationStatus, VerificationTicket
+from .proxy import PinnedSocksProxy, ProxyError
 from .sessions import (
     BrowserSessionError,
     BrowserSessionInfo,
@@ -17,6 +25,7 @@ from .sessions import (
 
 __all__ = [
     "BrowserAcquirer",
+    "BrowserContextWorker",
     "BrowserPageSnapshot",
     "BrowserRequestPolicy",
     "BrowserSessionError",
@@ -26,6 +35,8 @@ __all__ = [
     "BrowserSessionStore",
     "DefaultPlaywrightDriver",
     "Driver",
+    "PinnedSocksProxy",
+    "ProxyError",
     "RequestDecision",
     "SessionConfirmationError",
     "SessionConflictError",

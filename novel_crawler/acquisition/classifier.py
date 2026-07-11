@@ -48,9 +48,6 @@ class PageClassifier:
     def classify(self, snapshot: PageSnapshot) -> Classification:
         def result(kind: PageKind, confidence: float, evidence: tuple[str, ...]) -> Classification:
             return Classification(kind, confidence, evidence, snapshot.sample_id, snapshot.final_url.removesuffix("/"))
-        if snapshot.status_code >= 400:
-            return result(PageKind.ERROR, 1.0, ("error.http_status",))
-
         soup = BeautifulSoup(snapshot.html, "lxml")
         title = soup.title.get_text(" ", strip=True) if soup.title else ""
 
@@ -71,10 +68,13 @@ class PageClassifier:
         }
         book_index = len(chapter_links) >= 3
 
-        if self._challenge_score(soup, title) >= 2:
+        classifiable_error = snapshot.status_code in {403, 429}
+        if (snapshot.status_code < 400 or classifiable_error) and self._challenge_score(soup, title) >= 2:
             return result(PageKind.AUTH_OR_CHALLENGE, 0.96, ("auth.challenge_signals",))
-        if self._login_form(soup, title, primary_heading):
+        if (snapshot.status_code < 400 or classifiable_error) and self._login_form(soup, title, primary_heading):
             return result(PageKind.AUTH_OR_CHALLENGE, 0.98, ("auth.password_input",))
+        if snapshot.status_code >= 400:
+            return result(PageKind.ERROR, 1.0, ("error.http_status",))
         if _ERROR_TITLE.search(title):
             return result(PageKind.ERROR, 0.9, ("error.title_marker",))
         if chapter_by_title:

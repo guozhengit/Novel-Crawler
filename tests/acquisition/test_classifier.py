@@ -131,6 +131,12 @@ def test_actual_http_error_precedes_auth_but_soft_error_title_does_not() -> None
     assert result.evidence == ("auth.password_input",)
 
 
+def test_challenge_body_on_classifiable_http_status_is_auth() -> None:
+    html = "<title>Verify human</title><form action='/captcha'><input name='captcha'></form>Verify human"
+    result = PageClassifier().classify(snapshot(403, html))
+    assert result.kind is PageKind.AUTH_OR_CHALLENGE
+
+
 def test_primary_login_page_wins_over_article_and_recommended_chapters() -> None:
     html = """<title>用户登录</title><h1>登录</h1>
     <form><input type='password'></form><article>欢迎回来，请登录后继续阅读。</article>

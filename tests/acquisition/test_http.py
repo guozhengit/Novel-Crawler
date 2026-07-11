@@ -324,6 +324,22 @@ def test_http_status_error_semantics(status: int, recoverable: bool) -> None:
     assert caught.value.safe_url == "https://example.test/"
 
 
+def test_opt_in_classifiable_status_returns_bounded_snapshot_without_changing_default() -> None:
+    policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
+    challenge = b"<title>Just a moment</title><form action='/captcha'><input name='captcha'></form>Verify human"
+    acquirer = HttpPageAcquirer(FakeTransport([response(403, body=challenge)]), policy)
+    page = acquirer.fetch_page("https://example.test/private", classifiable_statuses=frozenset({403, 429}))
+    assert page.snapshot.status_code == 403
+    assert page.snapshot.body == challenge
+
+
+def test_classifiable_status_still_obeys_body_limit() -> None:
+    policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
+    acquirer = HttpPageAcquirer(FakeTransport([response(403, body=b"1234")]), policy, max_body_bytes=3)
+    with pytest.raises(AcquisitionError, match="response_too_large"):
+        acquirer.fetch_page("https://example.test/", classifiable_statuses=frozenset({403}))
+
+
 def test_timeout_is_recoverable_and_redacted() -> None:
     policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
     with pytest.raises(AcquisitionError) as caught:

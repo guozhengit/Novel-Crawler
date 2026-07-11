@@ -51,10 +51,10 @@ class PageSnapshot:
     requested_url: str
     final_url: str
     status_code: int
-    headers: Mapping[str, str]
+    headers: Mapping[str, str] = field(repr=False)
     encoding: str
-    html: str
-    body: bytes
+    html: str = field(repr=False)
+    body: bytes = field(repr=False)
     method: str
     redirects: tuple[RedirectHop, ...]
     retrieved_at: datetime

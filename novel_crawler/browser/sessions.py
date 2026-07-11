@@ -224,6 +224,12 @@ class BrowserSessionLease:
         if failed:
             raise BrowserSessionError("release_failed", self.info.domain) from None
 
+    def mark_stale(self) -> BrowserSessionInfo:
+        """Mark this still-exclusive lease stale without reacquiring its domain lock."""
+        if self._closed:
+            raise BrowserSessionError("lease_closed", self.info.domain)
+        return self._store._mark_leased_stale(self._info)
+
     def __repr__(self) -> str:
         return f"BrowserSessionLease(info={self.info!r}, closed={self._closed!r})"
 
@@ -445,6 +451,20 @@ class BrowserSessionStore:
         if current.status is BrowserSessionStatus.IN_USE:
             size = self._profile_size(profile)
             self._write_info(metadata, replace(current, status=BrowserSessionStatus.AVAILABLE, size_bucket=self._size_bucket(size)))
+
+    def _mark_leased_stale(self, leased: BrowserSessionInfo) -> BrowserSessionInfo:
+        _, _, metadata, _ = self._paths(leased.domain)
+        try:
+            current = self._read_info(metadata, quarantine=False)
+            if current is None or current.session_id != leased.session_id or current.status is not BrowserSessionStatus.IN_USE:
+                raise SessionConflictError("lease_mismatch", leased.domain)
+            updated = replace(current, status=BrowserSessionStatus.STALE)
+            self._write_info(metadata, updated)
+            return updated
+        except BrowserSessionError:
+            raise
+        except (RegistryIOError, OSError):
+            raise BrowserSessionError("storage_io", leased.domain) from None
 
     def get(self, domain: str) -> BrowserSessionInfo | None:
         canonical = canonical_domain(domain)

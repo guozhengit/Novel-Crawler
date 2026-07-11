@@ -132,10 +132,29 @@ class HttpPageAcquirer:
         self.user_agent = user_agent
         self.max_body_bytes = max_body_bytes
 
-    def fetch(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> PageSnapshot:
-        return self.fetch_page(url, max_body_bytes=max_body_bytes, locked_origin=locked_origin).snapshot
+    def fetch(
+        self,
+        url: str,
+        *,
+        max_body_bytes: int | None = None,
+        locked_origin: str | None = None,
+        classifiable_statuses: frozenset[int] = frozenset(),
+    ) -> PageSnapshot:
+        return self.fetch_page(
+            url,
+            max_body_bytes=max_body_bytes,
+            locked_origin=locked_origin,
+            classifiable_statuses=classifiable_statuses,
+        ).snapshot
 
-    def fetch_page(self, url: str, *, max_body_bytes: int | None = None, locked_origin: str | None = None) -> AcquiredPage:
+    def fetch_page(
+        self,
+        url: str,
+        *,
+        max_body_bytes: int | None = None,
+        locked_origin: str | None = None,
+        classifiable_statuses: frozenset[int] = frozenset(),
+    ) -> AcquiredPage:
         effective_max = self.max_body_bytes if max_body_bytes is None else min(self.max_body_bytes, max_body_bytes)
         if effective_max <= 0:
             raise ValueError("max_body_bytes must be positive")
@@ -220,7 +239,7 @@ class HttpPageAcquirer:
                 target = next_target
                 continue
 
-            if response.status_code >= 400:
+            if response.status_code >= 400 and response.status_code not in classifiable_statuses:
                 recoverable = response.status_code in {408, 429} or response.status_code >= 500
                 raise AcquisitionError(f"http_{response.status_code}", redact_url(current_url), recoverable)
 
