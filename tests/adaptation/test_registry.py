@@ -20,6 +20,7 @@ from novel_crawler.adaptation.registry import (
     RegistryLimitError,
     RegistryLockTimeout,
 )
+from novel_crawler.adaptation.registry_io import RegistryIOError
 
 
 def config(
@@ -50,6 +51,50 @@ def config(
 def _process_register(root: str, queue: multiprocessing.Queue[tuple[str, int]]) -> None:
     entry = ConfigRegistry(root).register(config())
     queue.put((entry.config_id, entry.version))
+
+
+def _process_hold_lock(root: str, entered: multiprocessing.synchronize.Event) -> None:
+    registry = ConfigRegistry(root)
+    with registry._global_lock():
+        entered.set()
+        threading.Event().wait(30)
+
+
+def _process_crash_after_revision(root: str) -> None:
+    registry = ConfigRegistry(root)
+    original = registry._io.atomic_write
+
+    def crash(path: Path, payload: bytes) -> None:
+        original(path, payload)
+        if path.name.startswith("rev-"):
+            os._exit(77)
+
+    registry._io.atomic_write = crash  # type: ignore[method-assign]
+    registry.register(config())
+
+
+def _process_crash_before_revision_replace(root: str) -> None:
+    registry = ConfigRegistry(root)
+    if os.name == "nt":
+        api = registry._io._api  # type: ignore[attr-defined]
+        original = api.move_write_through
+
+        def crash(source: Path, destination: Path) -> None:
+            if destination.name.startswith("rev-"):
+                os._exit(78)
+            original(source, destination)
+
+        api.move_write_through = crash
+    else:
+        original_replace = os.replace
+
+        def crash_replace(source: object, destination: object, **kwargs: object) -> None:
+            if str(destination).startswith("rev-"):
+                os._exit(78)
+            original_replace(source, destination, **kwargs)  # type: ignore[arg-type]
+
+        os.replace = crash_replace  # type: ignore[assignment]
+    registry.register(config())
 
 
 def test_register_returns_immutable_safe_entry_and_load_is_explicit(tmp_path: Path) -> None:
@@ -145,7 +190,7 @@ def test_concurrent_threads_register_one_revision(tmp_path: Path) -> None:
 
 def test_recovery_ignores_temp_rebuilds_manifest_and_isolates_corruption(tmp_path: Path) -> None:
     registry = ConfigRegistry(tmp_path)
-    good = registry.register(config())
+    registry.register(config())
     (tmp_path / "manifest.json").write_text("{broken", encoding="utf-8")
     (tmp_path / "configs" / "interrupted.tmp").write_text("raw secret should be ignored", encoding="utf-8")
     revision = next((tmp_path / "configs").rglob("*.json"))
@@ -154,8 +199,8 @@ def test_recovery_ignores_temp_rebuilds_manifest_and_isolates_corruption(tmp_pat
 
     recovered = ConfigRegistry(tmp_path)
 
-    assert recovered.list() == (good,)
-    assert recovered.lookup("https://example.com/book/1") == good
+    assert recovered.list() == ()
+    assert recovered.lookup("https://example.com/book/1") is None
     assert list((tmp_path / "quarantine").glob("*.reason.json"))
     assert "raw secret" not in (tmp_path / "manifest.json").read_text(encoding="utf-8")
 
@@ -165,6 +210,11 @@ def test_recovery_rejects_symlink_and_enforces_size_and_count_limits(tmp_path: P
     registry.register(config())
     revision = next((tmp_path / "configs").rglob("*.json"))
 
+    with pytest.raises(RegistryLimitError, match="files"):
+        ConfigRegistry(tmp_path, max_files=0)
+    with pytest.raises(RegistryLimitError, match="bytes"):
+        ConfigRegistry(tmp_path, max_config_bytes=8)
+
     if hasattr(os, "symlink"):
         link = revision.with_name("rev-000002.json")
         try:
@@ -173,12 +223,7 @@ def test_recovery_rejects_symlink_and_enforces_size_and_count_limits(tmp_path: P
             pass
         else:
             recovered = ConfigRegistry(tmp_path)
-            assert recovered.list()[0].version == 1
-
-    with pytest.raises(RegistryLimitError, match="files"):
-        ConfigRegistry(tmp_path, max_files=0)
-    with pytest.raises(RegistryLimitError, match="bytes"):
-        ConfigRegistry(tmp_path, max_config_bytes=8)
+            assert recovered.list() == ()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
@@ -516,3 +561,161 @@ def test_windows_junction_ancestor_is_rejected(tmp_path: Path) -> None:
         pytest.skip("junction creation is unavailable")
     with pytest.raises(Exception, match="symlink|reparse"):
         ConfigRegistry(junction / "nested")
+
+
+def test_revision_is_durable_before_manifest_and_manifest_crash_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ConfigRegistry(tmp_path)
+    original = registry._io.atomic_write
+    writes: list[str] = []
+    manifest_writes = 0
+
+    def fail_manifest(path: Path, payload: bytes) -> None:
+        nonlocal manifest_writes
+        writes.append(path.name)
+        if path.name == "manifest.json":
+            manifest_writes += 1
+            if manifest_writes == 2:
+                raise RegistryIOError("injected manifest crash")
+        original(path, payload)
+
+    monkeypatch.setattr(registry._io, "atomic_write", fail_manifest)
+    with pytest.raises(RegistryIOError, match="injected"):
+        registry.register(config())
+
+    assert writes[-2].startswith("rev-") and writes[-1] == "manifest.json"
+    assert len(list((tmp_path / "configs").rglob("rev-*.json"))) == 1
+    recovered = ConfigRegistry(tmp_path)
+    assert recovered.load(recovered.list()[0]) == config()
+
+
+def test_quarantine_events_are_append_only_and_never_name_blocked(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    registry.register(config())
+    revision = next((tmp_path / "configs").rglob("rev-*.json"))
+    corrupt = b"{same-corrupt-content"
+    registry._io.atomic_write(revision, corrupt)
+    ConfigRegistry(tmp_path)
+    first_events = set((tmp_path / "quarantine").glob("*.reason.json"))
+    assert len(first_events) == 1
+
+    registry._io.atomic_write(revision, corrupt)
+    ConfigRegistry(tmp_path)
+    all_events = set((tmp_path / "quarantine").glob("*.reason.json"))
+    assert len(all_events) == 2
+    assert first_events < all_events
+    assert len(list((tmp_path / "quarantine").glob("*.bad"))) == 2
+
+
+def test_quarantine_move_failure_is_fail_closed_after_event_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = ConfigRegistry(tmp_path)
+    registry.register(config())
+    revision = next((tmp_path / "configs").rglob("rev-*.json"))
+    registry._io.atomic_write(revision, b"{corrupt")
+
+    def fail_move(source: Path, destination: Path) -> None:
+        raise RegistryIOError("injected quarantine durability failure")
+
+    monkeypatch.setattr(registry._io, "durable_move", fail_move)
+    with pytest.raises(RegistryIOError, match="quarantine durability"):
+        registry.list()
+    assert revision.exists()
+    assert len(list((tmp_path / "quarantine").glob("*.reason.json"))) == 1
+
+
+def test_valid_digest_gap_cascades_quarantine_to_all_remaining_history(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    entry = registry.register(config())
+    registry.mark_stale(entry.config_id)
+    registry.mark_revoked(entry.config_id)
+    revisions = sorted((tmp_path / "configs").rglob("rev-*.json"))
+    revisions[1].unlink()
+
+    recovered = ConfigRegistry(tmp_path)
+
+    assert recovered.list(include_history=True) == ()
+    assert not list((tmp_path / "configs").rglob("rev-*.json"))
+    assert len(list((tmp_path / "quarantine").glob("*.bad"))) == 2
+
+
+def test_rehashed_invalid_middle_revision_cascades_to_every_original(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    entry = registry.register(config())
+    registry.mark_stale(entry.config_id)
+    registry.mark_revoked(entry.config_id)
+    middle = sorted((tmp_path / "configs").rglob("rev-*.json"))[1]
+    envelope = json.loads(registry._io.read_bounded(middle, 1_048_576))
+    envelope["entry"]["version"] = 4
+    revision_payload = {"entry": envelope["entry"], "config": envelope["config"]}
+    encoded = json.dumps(revision_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+    envelope["revision_sha256"] = hashlib.sha256(encoded).hexdigest()
+    registry._io.atomic_write(middle, json.dumps(envelope).encode())
+
+    recovered = ConfigRegistry(tmp_path)
+
+    assert recovered.list(include_history=True) == ()
+    assert not list((tmp_path / "configs").rglob("rev-*.json"))
+    assert len(list((tmp_path / "quarantine").glob("*.bad"))) == 3
+
+
+@pytest.mark.parametrize("mode", ["corrupt", "delete"])
+def test_latest_revision_corruption_or_deletion_cannot_roll_status_back(tmp_path: Path, mode: str) -> None:
+    registry = ConfigRegistry(tmp_path)
+    entry = registry.register(config())
+    registry.mark_stale(entry.config_id)
+    registry.mark_revoked(entry.config_id)
+    latest = sorted((tmp_path / "configs").rglob("rev-*.json"))[-1]
+    if mode == "corrupt":
+        registry._io.atomic_write(latest, b"{corrupt-latest")
+    else:
+        latest.unlink()
+
+    recovered = ConfigRegistry(tmp_path)
+
+    assert recovered.list(include_history=True) == ()
+    assert not list((tmp_path / "configs").rglob("rev-*.json"))
+
+
+def test_unexplained_deletion_of_all_history_fails_closed(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    registry.register(config())
+    for revision in (tmp_path / "configs").rglob("rev-*.json"):
+        revision.unlink()
+    with pytest.raises(Exception, match="missing config history"):
+        ConfigRegistry(tmp_path)
+
+
+def test_cross_process_lock_is_released_after_holder_crash(tmp_path: Path) -> None:
+    ConfigRegistry(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    process = context.Process(target=_process_hold_lock, args=(str(tmp_path), entered))
+    process.start()
+    assert entered.wait(timeout=5)
+    process.terminate()
+    process.join(timeout=5)
+    assert process.exitcode is not None
+    assert ConfigRegistry(tmp_path, lock_timeout=1).list() == ()
+
+
+def test_abrupt_crash_after_revision_before_manifest_recovers_complete_config(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_process_crash_after_revision, args=(str(tmp_path),))
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 77
+    recovered = ConfigRegistry(tmp_path)
+    assert recovered.load(recovered.list()[0]) == config()
+
+
+def test_abrupt_crash_before_revision_replace_leaves_only_ignored_temp(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_process_crash_before_revision_replace, args=(str(tmp_path),))
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 78
+    recovered = ConfigRegistry(tmp_path)
+    assert recovered.list() == ()

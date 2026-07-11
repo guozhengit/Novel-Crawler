@@ -7,19 +7,20 @@ import importlib
 import json
 import os
 import re
-import stat
 import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from .config_schema import SiteConfig
+from .registry_io import RegistryIO, RegistryIOError, RegistryIOSizeError, default_registry_io
 
 _REGISTRY_SCHEMA_VERSION = 1
 _REVISION_NAME = re.compile(r"rev-([0-9]{6})\.json")
@@ -80,74 +81,6 @@ def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _reject_symlink_components(path: Path) -> None:
-    current = path.absolute()
-    for component in (current, *current.parents):
-        if _is_link_or_reparse_point(component):
-            raise RegistryError("registry path components must not be symlinks or reparse points")
-
-
-def _is_link_or_reparse_point(path: Path) -> bool:
-    if path.is_symlink():
-        return True
-    try:
-        attributes = getattr(os.lstat(path), "st_file_attributes", 0)
-    except OSError:
-        return False
-    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-
-
-def _private_directory(path: Path) -> None:
-    _reject_symlink_components(path)
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _reject_symlink_components(path)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
-
-
-def _private_file(path: Path) -> None:
-    _reject_symlink_components(path)
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
-
-
-def _fsync_directory(path: Path) -> None:
-    if os.name == "nt":
-        return
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _atomic_write(path: Path, payload: bytes) -> None:
-    _private_directory(path.parent)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        _private_file(temporary)
-        os.replace(temporary, path)
-        _private_file(path)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
 def _thread_lock(name: str) -> threading.RLock:
     with _PROCESS_LOCKS_GUARD:
         return _PROCESS_LOCKS.setdefault(name, threading.RLock())
@@ -164,16 +97,14 @@ def _bounded_thread_lock(lock: threading.RLock, timeout: float) -> Iterator[None
 
 
 class _FileLock:
-    def __init__(self, path: Path, timeout: float) -> None:
+    def __init__(self, path: Path, timeout: float, io: RegistryIO) -> None:
         self._path = path
         self._timeout = timeout
+        self._io = io
         self._stream: Any = None
 
     def __enter__(self) -> _FileLock:
-        _private_directory(self._path.parent)
-        _reject_symlink_components(self._path)
-        self._stream = self._path.open("a+b")
-        _private_file(self._path)
+        self._stream = self._io.open_lock(self._path)
         self._stream.seek(0, os.SEEK_END)
         if self._stream.tell() == 0:
             self._stream.write(b"\0")
@@ -228,12 +159,14 @@ class ConfigRegistry:
         lock_timeout: float = 5.0,
         max_files: int = 10_000,
         max_config_bytes: int = 1_048_576,
+        _io: RegistryIO | None = None,
     ) -> None:
         if lock_timeout <= 0:
             raise ValueError("lock_timeout must be positive")
         if max_files < 0 or max_config_bytes <= 0:
             raise ValueError("registry limits are invalid")
         self.root = Path(root).absolute()
+        self._io = _io or default_registry_io()
         self._lock_timeout = float(lock_timeout)
         self._max_files = max_files
         self._max_config_bytes = max_config_bytes
@@ -243,7 +176,8 @@ class ConfigRegistry:
         self._quarantine = self.root / "quarantine"
         self._manifest = self.root / "manifest.json"
         for directory in (self.root, self._configs, self._locks, self._quarantine):
-            _private_directory(directory)
+            self._io.ensure_directory(directory)
+            self._io.verify_private(directory)
         self._history: dict[str, list[_Record]] = {}
         with self._global_lock():
             self._recover()
@@ -252,7 +186,7 @@ class ConfigRegistry:
     def _global_lock(self) -> Iterator[None]:
         key = str(self.root.resolve(strict=False))
         with _bounded_thread_lock(_thread_lock(key), self._lock_timeout):
-            with _FileLock(self._locks / "registry.lock", self._lock_timeout):
+            with _FileLock(self._locks / "registry.lock", self._lock_timeout, self._io):
                 yield
 
     @contextmanager
@@ -260,7 +194,7 @@ class ConfigRegistry:
         name = _hash(config_id)
         key = f"{self.root.resolve(strict=False)}:{name}"
         with _bounded_thread_lock(_thread_lock(key), self._lock_timeout):
-            with _FileLock(self._locks / f"{name}.lock", self._lock_timeout):
+            with _FileLock(self._locks / f"{name}.lock", self._lock_timeout, self._io):
                 yield
 
     def register(self, config: SiteConfig) -> RegistryEntry:
@@ -424,7 +358,7 @@ class ConfigRegistry:
             raise RegistryLimitError("config revision exceeds maximum bytes")
         if path.exists():
             raise RegistryError("config revision already exists")
-        _atomic_write(path, payload)
+        self._io.atomic_write(path, payload)
         return _Record(entry, path, digest)
 
     @staticmethod
@@ -472,17 +406,15 @@ class ConfigRegistry:
         )
 
     def _read_envelope(self, path: Path) -> dict[str, object]:
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("unsafe revision path")
         resolved = path.resolve(strict=True)
         try:
             resolved.relative_to(self._configs.resolve(strict=True))
         except ValueError as exc:
             raise ValueError("unsafe revision path") from exc
-        size = path.stat().st_size
-        if size > self._max_config_bytes:
-            raise RegistryLimitError("config revision exceeds maximum bytes")
-        raw = path.read_bytes()
+        try:
+            raw = self._io.read_bounded(path, self._max_config_bytes)
+        except RegistryIOSizeError as exc:
+            raise RegistryLimitError("config revision exceeds maximum bytes") from exc
         decoded = json.loads(raw)
         if not isinstance(decoded, dict) or decoded.get("registry_schema_version") != _REGISTRY_SCHEMA_VERSION:
             raise ValueError("unsupported registry schema")
@@ -506,16 +438,23 @@ class ConfigRegistry:
             if hashlib.sha256(canonical).hexdigest() != record.digest:
                 raise ValueError("config digest mismatch")
             return SiteConfig.from_dict(config)
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        except (OSError, RegistryIOError, TypeError, ValueError, json.JSONDecodeError):
             self._quarantine_path(record.path, "invalid_revision")
             return None
 
     def _recover(self) -> None:
-        self._validate_or_quarantine_manifest()
+        manifest_highwater = self._validate_or_quarantine_manifest()
         history: dict[str, list[_Record]] = {}
+        tainted_config_hashes: set[str] = set()
+        handled_invalid_histories: set[str] = set()
         for path in self._scan_revision_files():
+            relative = path.relative_to(self._configs)
+            possible_config_hash = (
+                relative.parts[1]
+                if len(relative.parts) == 3 and _HASH_NAME.fullmatch(relative.parts[1])
+                else None
+            )
             try:
-                relative = path.relative_to(self._configs)
                 if len(relative.parts) != 3:
                     raise ValueError("unexpected revision location")
                 domain_hash, config_hash, filename = relative.parts
@@ -546,20 +485,34 @@ class ConfigRegistry:
                 history.setdefault(entry.config_id, []).append(_Record(entry, path, digest))
             except RegistryLimitError:
                 raise
-            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            except (OSError, RegistryIOError, TypeError, ValueError, json.JSONDecodeError):
+                if possible_config_hash is not None:
+                    tainted_config_hashes.add(possible_config_hash)
                 self._quarantine_path(path, "invalid_revision")
         for config_id, records in list(history.items()):
             records.sort(key=lambda item: item.entry.version)
-            valid: list[_Record] = []
-            for expected, record in enumerate(records, 1):
-                if record.entry.version != expected or (valid and record.digest != valid[0].digest):
+            versions_are_contiguous = [record.entry.version for record in records] == list(range(1, len(records) + 1))
+            content_is_consistent = len({record.digest for record in records}) == 1
+            rolled_back = manifest_highwater.get(config_id, 0) > records[-1].entry.version
+            if (
+                not versions_are_contiguous
+                or not content_is_consistent
+                or _hash(config_id) in tainted_config_hashes
+                or rolled_back
+            ):
+                for record in records:
                     self._quarantine_path(record.path, "invalid_history")
-                else:
-                    valid.append(record)
-            if valid:
-                history[config_id] = valid
-            else:
+                handled_invalid_histories.add(config_id)
                 del history[config_id]
+        unexplained_missing = {
+            config_id
+            for config_id in manifest_highwater
+            if config_id not in history
+            and config_id not in handled_invalid_histories
+            and _hash(config_id) not in tainted_config_hashes
+        }
+        if unexplained_missing:
+            raise RegistryError("manifest references missing config history")
         self._history = history
         self._write_manifest()
 
@@ -575,9 +528,12 @@ class ConfigRegistry:
                 if scan_entries > scan_limit:
                     raise RegistryLimitError("registry exceeds maximum scan entries")
                 candidate = Path(directory) / name
-                if _is_link_or_reparse_point(candidate):
+                try:
+                    self._io.reject_link(candidate)
+                except RegistryIOError as exc:
                     dirnames.remove(name)
                     self._quarantine_path(candidate, "unsafe_directory")
+                    raise RegistryError("registry scan found an unsafe symlink or reparse point") from exc
             for name in filenames:
                 scan_entries += 1
                 if scan_entries > scan_limit:
@@ -593,15 +549,11 @@ class ConfigRegistry:
                     raise RegistryLimitError("registry exceeds maximum files")
                 yield candidate
 
-    def _validate_or_quarantine_manifest(self) -> None:
+    def _validate_or_quarantine_manifest(self) -> dict[str, int]:
         if not self._manifest.exists() and not self._manifest.is_symlink():
-            return
+            return {}
         try:
-            if self._manifest.is_symlink() or not self._manifest.is_file():
-                raise ValueError("unsafe manifest")
-            if self._manifest.stat().st_size > self._max_manifest_bytes:
-                raise ValueError("oversized manifest")
-            decoded = json.loads(self._manifest.read_bytes())
+            decoded = json.loads(self._io.read_bounded(self._manifest, self._max_manifest_bytes))
             if (
                 not isinstance(decoded, dict)
                 or set(decoded) != {"registry_schema_version", "entries"}
@@ -609,28 +561,41 @@ class ConfigRegistry:
                 or not isinstance(decoded.get("entries"), list)
             ):
                 raise ValueError("invalid manifest")
+            highwater: dict[str, int] = {}
             for item in decoded["entries"]:
-                self._parse_entry(item)
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                entry = self._parse_entry(item)
+                highwater[entry.config_id] = max(highwater.get(entry.config_id, 0), entry.version)
+            return highwater
+        except (OSError, RegistryIOError, TypeError, ValueError, json.JSONDecodeError):
             self._quarantine_path(self._manifest, "invalid_manifest")
+            return {}
 
     def _quarantine_path(self, path: Path, reason: str) -> None:
-        token = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
-        reason_path = self._quarantine / f"{token}.reason.json"
-        _atomic_write(
-            reason_path,
-            _canonical_json({"registry_schema_version": _REGISTRY_SCHEMA_VERSION, "reason_id": reason, "source_hash": token}),
-        )
-        if path.is_symlink():
-            return
+        source_hash = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
         try:
-            if path.exists() and path.is_file():
-                destination = self._quarantine / f"{token}.bad"
-                if not destination.exists():
-                    os.replace(path, destination)
-                    _private_file(destination)
-        except OSError:
-            pass
+            content_hash = hashlib.sha256(self._io.read_bounded(path, self._max_config_bytes)).hexdigest()
+        except (OSError, RegistryIOError):
+            content_hash = "unavailable"
+        timestamp = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        nonce = uuid.uuid4().hex
+        token = hashlib.sha256(f"{source_hash}:{content_hash}:{timestamp}:{nonce}".encode()).hexdigest()
+        reason_path = self._quarantine / f"{token}.reason.json"
+        self._io.atomic_write(
+            reason_path,
+            _canonical_json(
+                {
+                    "registry_schema_version": _REGISTRY_SCHEMA_VERSION,
+                    "reason_id": reason,
+                    "source_hash": source_hash,
+                    "content_hash": content_hash,
+                    "revision": path.name if _REVISION_NAME.fullmatch(path.name) else None,
+                    "quarantined_at": timestamp,
+                    "event_nonce": nonce,
+                }
+            ),
+        )
+        if path.exists() or path.is_symlink():
+            self._io.durable_move(path, self._quarantine / f"{token}.bad")
 
     def _write_manifest(self) -> None:
         entries = [record.entry for records in self._history.values() for record in records]
@@ -641,7 +606,7 @@ class ConfigRegistry:
         encoded = _canonical_json(payload)
         if len(encoded) > self._max_manifest_bytes:
             raise RegistryLimitError("manifest exceeds maximum bytes")
-        _atomic_write(self._manifest, encoded)
+        self._io.atomic_write(self._manifest, encoded)
 
 
 __all__ = [
