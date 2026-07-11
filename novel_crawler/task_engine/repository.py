@@ -572,6 +572,7 @@ class TaskRepository:
             TaskStatus.VALIDATING,
             TaskStatus.READY,
             TaskStatus.CRAWLING,
+            TaskStatus.PAUSED,
         }
         with self._lock, self._transaction():
             row = self._connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -586,8 +587,8 @@ class TaskRepository:
                 raise InvalidTaskTransition(f"cleanup_gate_not_allowed:{current.status.value}")
             next_version = current.version + 1
             resume_status = (
-                TaskStatus.PROBING
-                if current.status is TaskStatus.WAITING_FOR_USER
+                current.resume_status or TaskStatus.PROBING
+                if current.status in {TaskStatus.WAITING_FOR_USER, TaskStatus.PAUSED}
                 else current.status
             )
             updated = self._connection.execute(

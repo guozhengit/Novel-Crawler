@@ -61,8 +61,13 @@ def build_application(
         crawler = CrawlerService(ctx)
 
         def adopt_late_interaction(task, url, signal):
-            outcome = adaptive.capture_acquisition_signal(url, task.task_id, signal)
-            return controller.adopt_acquisition_result(task.task_id, outcome)
+            return controller.capture_acquisition_result(
+                task.task_id,
+                task.version,
+                lambda: adaptive.capture_acquisition_signal(
+                    url, task.task_id, signal
+                ),
+            )
 
         pipeline = CrawlTaskPipeline(
             repository,
@@ -89,10 +94,16 @@ def build_application(
             repository, executor, controller=controller, crawler=cast(Any, crawler)
         )
         if recover_on_start:
-            try:
-                executor.recover_and_schedule()
-            except Exception:
-                pass
+            last_error: Exception | None = None
+            for _attempt in range(3):
+                try:
+                    executor.recover_and_schedule()
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise RuntimeError("startup_recovery_failed") from None
         return service
     except BaseException:
         executor_stopped = executor is None

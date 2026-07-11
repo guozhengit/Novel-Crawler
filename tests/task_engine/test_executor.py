@@ -769,3 +769,24 @@ def test_startup_reconciler_eventually_schedules_all_deferred_tasks(
             time.sleep(0.02)
         assert all(repository.get_task(task_id).status is TaskStatus.TERMINAL_FAILED for task_id in task_ids)
         assert executor.shutdown(timeout=5)
+
+
+def test_shutdown_waits_for_reconciler_before_reporting_safe_to_close(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingRepository(TaskRepository):
+        def list_tasks(self, **kwargs):
+            if threading.current_thread().name == "novel-task-reconciler":
+                entered.set()
+                assert release.wait(5)
+            return super().list_tasks(**kwargs)
+
+    repository = BlockingRepository(tmp_path / "blocked-reconciler.db")
+    executor = BackgroundTaskExecutor(repository, {}, max_workers=1)
+    executor.recover_and_schedule()
+    assert entered.wait(2)
+    assert executor.shutdown(timeout=0.2) is False
+    release.set()
+    assert executor.shutdown(timeout=2) is True
+    repository.close()

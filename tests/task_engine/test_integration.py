@@ -184,6 +184,101 @@ def test_late_cleanup_handle_sets_gate_and_is_retryable(tmp_path: Path) -> None:
         assert secret.encode() not in (tmp_path / "late-cleanup.db").read_bytes()
 
 
+def test_late_cleanup_race_with_pause_is_compensated_without_orphan(tmp_path: Path) -> None:
+    secret = "raced-private-cleanup"
+    adaptive = FakeAdaptive(result(ResolutionKind.REUSED))
+    with TaskRepository(tmp_path / "late-race.db") as repo:
+        active = crawling(repo)
+        paused = repo.transition(
+            active.task_id,
+            TaskStatus.PAUSED,
+            expected_version=active.version,
+            reason="concurrent_pause",
+        )
+        controller = AdaptiveTaskController(repo, adaptive)
+        cleanup = result(ResolutionKind.CLEANUP_REQUIRED, token=secret, source="headless")
+        adopted = controller.adopt_acquisition_result(paused.task_id, cleanup)
+        assert adopted.status is TaskStatus.PAUSED
+        assert controller.interaction(paused.task_id) is None
+        assert adaptive.cleaned == [secret]
+        assert secret.encode() not in (tmp_path / "late-race.db").read_bytes()
+
+
+def test_failed_late_cleanup_compensation_gates_paused_task(tmp_path: Path) -> None:
+    secret = "raced-private-cleanup"
+    adaptive = FakeAdaptive(result(ResolutionKind.CLEANUP_REQUIRED, token=secret, source="headless"))
+    with TaskRepository(tmp_path / "late-race-gated.db") as repo:
+        active = crawling(repo)
+        paused = repo.transition(active.task_id, TaskStatus.PAUSED, expected_version=active.version)
+        controller = AdaptiveTaskController(repo, adaptive)
+        cleanup = result(ResolutionKind.CLEANUP_REQUIRED, token=secret, source="headless")
+        adopted = controller.adopt_acquisition_result(paused.task_id, cleanup)
+        assert adopted.status is TaskStatus.RECOVERABLE_FAILED
+        assert adopted.cleanup_required is True
+        assert adopted.resume_status is TaskStatus.CRAWLING
+        assert controller.interaction(paused.task_id).kind is InteractionKind.CLEANUP  # type: ignore[union-attr]
+        assert secret.encode() not in (tmp_path / "late-race-gated.db").read_bytes()
+
+
+def test_capture_race_with_pause_aborts_new_cleanup_handle(tmp_path: Path) -> None:
+    secret = "capture-race-cleanup"
+    adaptive = FakeAdaptive(result(ResolutionKind.REUSED))
+    with TaskRepository(tmp_path / "capture-pause.db") as repo:
+        task = crawling(repo)
+        controller = AdaptiveTaskController(repo, adaptive)
+
+        def capture():
+            repo.transition(task.task_id, TaskStatus.PAUSED, expected_version=task.version)
+            return result(ResolutionKind.CLEANUP_REQUIRED, token=secret, source="headless")
+
+        current = controller.capture_acquisition_result(task.task_id, task.version, capture)
+        assert current.status is TaskStatus.PAUSED
+        assert adaptive.cleaned == [secret]
+        assert controller.interaction(task.task_id) is None
+        assert secret.encode() not in (tmp_path / "capture-pause.db").read_bytes()
+
+
+def test_capture_capacity_one_aborts_second_concurrent_handle(tmp_path: Path) -> None:
+    first_secret = "first-capacity-ticket"
+    second_secret = "second-capacity-cleanup"
+    entered = threading.Event()
+    release = threading.Event()
+    adaptive = FakeAdaptive(result(ResolutionKind.REUSED))
+    with TaskRepository(tmp_path / "capture-capacity.db") as repo:
+        first = crawling(repo)
+        second = crawling(repo)
+        controller = AdaptiveTaskController(repo, adaptive, max_interactions=1)
+
+        def first_capture():
+            entered.set()
+            assert release.wait(5)
+            return result(ResolutionKind.WAITING_FOR_USER, token=first_secret)
+
+        thread = threading.Thread(
+            target=lambda: controller.capture_acquisition_result(
+                first.task_id, first.version, first_capture
+            )
+        )
+        thread.start()
+        assert entered.wait(2)
+        current = controller.capture_acquisition_result(
+            second.task_id,
+            second.version,
+            lambda: result(
+                ResolutionKind.CLEANUP_REQUIRED,
+                token=second_secret,
+                source="headless",
+            ),
+        )
+        assert current.status is TaskStatus.CRAWLING
+        assert adaptive.cleaned == [second_secret]
+        release.set()
+        thread.join(5)
+        assert repo.get_task(first.task_id).status is TaskStatus.WAITING_FOR_USER
+        raw = (tmp_path / "capture-capacity.db").read_bytes()
+        assert first_secret.encode() not in raw and second_secret.encode() not in raw
+
+
 def test_continue_verification_is_concurrently_idempotent(tmp_path: Path) -> None:
     secret = "verification-secret"
     adaptive = FakeAdaptive(result(ResolutionKind.WAITING_FOR_USER, token=secret), result(ResolutionKind.REUSED))

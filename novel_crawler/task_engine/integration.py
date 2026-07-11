@@ -154,10 +154,67 @@ class AdaptiveTaskController:
             raise ValueError("late acquisition result is invalid")
         current = self._repository.get_task(task_id)
         if current.status not in {TaskStatus.VALIDATING, TaskStatus.CRAWLING}:
-            return current
+            return self._compensate_unadopted(current, outcome)
         with self._lock:
             self._late_resume_status[task_id] = current.status
         return self._apply_result(current, outcome)
+
+    def capture_acquisition_result(
+        self,
+        task_id: str,
+        expected_version: int,
+        capture: Callable[[], AdaptiveResult],
+    ) -> TaskRecord:
+        """Reserve capacity, capture a private handle, then CAS-adopt or abort it."""
+        reserved = self._reserve_capacity(task_id)
+        try:
+            before = self._repository.get_task(task_id)
+            eligible = (
+                before.version == expected_version
+                and before.status in {TaskStatus.VALIDATING, TaskStatus.CRAWLING}
+            )
+            outcome = capture()
+            after = self._repository.get_task(task_id)
+            if (
+                not reserved
+                or not eligible
+                or after.version != expected_version
+                or after.status is not before.status
+            ):
+                return self._compensate_unadopted(after, outcome)
+            with self._lock:
+                self._late_resume_status[task_id] = after.status
+            return self._apply_result(after, outcome)
+        finally:
+            self._release_reservation(task_id)
+
+    def _compensate_unadopted(
+        self, current: TaskRecord, outcome: AdaptiveResult
+    ) -> TaskRecord:
+        try:
+            if outcome.kind is ResolutionKind.WAITING_FOR_USER:
+                assert outcome.ticket is not None
+                compensated = self._adaptive.cancel(outcome.ticket)
+            elif outcome.kind is ResolutionKind.CLEANUP_REQUIRED:
+                assert outcome.cleanup_ticket is not None
+                compensated = self._adaptive.retry_cleanup(outcome.cleanup_ticket)
+            else:
+                return current
+        except Exception:
+            compensated = outcome
+        if compensated.kind is not ResolutionKind.CLEANUP_REQUIRED:
+            return current
+        self._store_result_handle(current.task_id, compensated)
+        if current.status in TERMINAL_STATUSES:
+            return current
+        try:
+            return self._repository.require_cleanup(
+                current.task_id,
+                expected_version=current.version,
+                error_code="interaction_cleanup_required",
+            )
+        except (TaskVersionConflict, InvalidTaskTransition):
+            return self._repository.get_task(current.task_id)
 
     def __repr__(self) -> str:
         with self._lock:

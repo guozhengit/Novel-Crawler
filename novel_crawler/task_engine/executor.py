@@ -264,32 +264,39 @@ class BackgroundTaskExecutor:
             self._startup_recovered = True
         try:
             self.recover_startup()
+            safe_tasks = self._repository.list_tasks(
+                statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000
+            )
+            scheduled = 0
+            for index, task in enumerate(safe_tasks):
+                try:
+                    if self.submit(task.task_id):
+                        scheduled += 1
+                except ExecutorQueueFull:
+                    self._startup_deferred_count = len(safe_tasks) - index
+                    break
+            reconciler = threading.Thread(
+                target=self._reconcile_deferred,
+                name="novel-task-reconciler",
+                daemon=True,
+            )
+            reconciler.start()
+            self._reconciler = reconciler
+            return scheduled
         except Exception:
             with self._lock:
                 self._startup_recovered = False
             raise
-        safe_tasks = self._repository.list_tasks(statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000)
-        scheduled = 0
-        for index, task in enumerate(safe_tasks):
-            try:
-                if self.submit(task.task_id):
-                    scheduled += 1
-            except ExecutorQueueFull:
-                self._startup_deferred_count = len(safe_tasks) - index
-                break
-        self._reconciler = threading.Thread(
-            target=self._reconcile_deferred,
-            name="novel-task-reconciler",
-            daemon=True,
-        )
-        self._reconciler.start()
-        return scheduled
 
     def _reconcile_deferred(self) -> None:
         while not self._closing.is_set():
-            safe_tasks = self._repository.list_tasks(
-                statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000
-            )
+            try:
+                safe_tasks = self._repository.list_tasks(
+                    statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000
+                )
+            except Exception:
+                self._closing.wait(0.1)
+                continue
             deferred = 0
             for index, task in enumerate(safe_tasks):
                 if self._closing.is_set():
@@ -310,7 +317,7 @@ class BackgroundTaskExecutor:
         with self._lock:
             self._closing.set()
         if not wait:
-            return not any(thread.is_alive() for thread in self._threads)
+            return not self._has_live_thread()
         deadline = None if timeout is None else time.monotonic() + timeout
         if self._reconciler is not None:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -318,7 +325,12 @@ class BackgroundTaskExecutor:
         for thread in self._threads:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(remaining)
-        return not any(thread.is_alive() for thread in self._threads)
+        return not self._has_live_thread()
+
+    def _has_live_thread(self) -> bool:
+        return any(thread.is_alive() for thread in self._threads) or (
+            self._reconciler is not None and self._reconciler.is_alive()
+        )
 
     def _schedule_resumed(
         self,
