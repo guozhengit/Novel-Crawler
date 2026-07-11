@@ -6,7 +6,7 @@ import json
 import math
 import re
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import FrozenInstanceError, dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -16,7 +16,6 @@ from bs4 import BeautifulSoup
 from soupsieve.util import SelectorSyntaxError
 
 CURRENT_SCHEMA_VERSION = 1
-SCHEMA_VERSION = 1
 _V1_FIELDS = frozenset({"schema_version", "config_id", "site", "domain", "url_patterns", "selectors", "request_policy", "generated_at", "last_validated", "field_scores", "validation_samples", "fingerprint_salt"})
 _FIELDS = _V1_FIELDS
 _CONFIG_ID = re.compile(r"cfg_[A-Za-z0-9_-]{16,80}")
@@ -26,7 +25,7 @@ _SAMPLE_FIELDS = frozenset({"page_kind", "matched_fields", "node_count_bucket", 
 _LDH_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _PATH_LITERAL = re.compile(r"[A-Za-z0-9._~%-]*")
 _PERCENT = re.compile(r"%(?:[0-9A-Fa-f]{2})")
-_UNSAFE_SELECTOR = re.compile(r"(?::has\s*\(|:contains\s*\(|https?://|@|[?&]|token|secret|password|session)", re.I)
+_UNSAFE_SELECTOR = re.compile(r"(?::has\s*\(|:contains\s*\(|:-soup-contains(?:-own)?\s*\(|https?://|@|[?&]|token|secret|password|session)", re.I)
 
 
 def _utc(value: object, field: str) -> str:
@@ -116,14 +115,20 @@ def _selector(value: object) -> str:
     return value
 
 
+def validate_selector_collection(value: Sequence[object]) -> tuple[str, ...]:
+    if len(value) > 20:
+        raise ValueError("at most 20 selectors are allowed")
+    if sum(len(selector) for selector in value if isinstance(selector, str)) > 4096:
+        raise ValueError("selectors exceed total length limit of 4096")
+    return tuple(_selector(selector) for selector in value)
+
+
 def validate_candidate_selectors(value: Mapping[str, str]) -> tuple[str, ...]:
-    if not isinstance(value, Mapping) or len(value) > 20:
-        raise ValueError("at most 20 candidate selectors are allowed")
+    if not isinstance(value, Mapping):
+        raise TypeError("candidate selectors must be a mapping")
     if not all(isinstance(key, str) and _SCORE_KEY.fullmatch(key) and isinstance(selector, str) for key, selector in value.items()):
         raise TypeError("candidate selectors must map safe names to selectors")
-    if sum(len(selector) for selector in value.values()) > 4096:
-        raise ValueError("candidate selectors exceed total length limit")
-    return tuple(_selector(selector) for selector in value.values())
+    return validate_selector_collection(tuple(value.values()))
 
 
 def _selectors(value: object) -> Mapping[str, object]:
@@ -132,13 +137,18 @@ def _selectors(value: object) -> Mapping[str, object]:
     clean_raw = value["clean"]
     if not isinstance(clean_raw, Sequence) or isinstance(clean_raw, str):
         raise TypeError("clean selectors must be a sequence")
-    clean = tuple(_selector(item) for item in clean_raw)
-    result: dict[str, object] = {"clean": clean}
+    raw_groups: dict[str, Mapping[str, object]] = {}
     for kind in ("book", "chapter"):
         raw = value[kind]
         if not isinstance(raw, Mapping) or not all(isinstance(key, str) and _SCORE_KEY.fullmatch(key) for key in raw):
             raise TypeError(f"{kind} selectors must be a field mapping")
-        result[kind] = MappingProxyType({key: _selector(item) for key, item in raw.items()})
+        raw_groups[kind] = raw
+    all_values = tuple(clean_raw) + tuple(raw_groups["book"].values()) + tuple(raw_groups["chapter"].values())
+    validated = iter(validate_selector_collection(all_values))
+    clean = tuple(next(validated) for _ in clean_raw)
+    result: dict[str, object] = {"clean": clean}
+    for kind in ("book", "chapter"):
+        result[kind] = MappingProxyType({key: next(validated) for key in raw_groups[kind]})
     return MappingProxyType(result)
 
 
@@ -208,7 +218,7 @@ class SiteConfig:
         if set(values) != _FIELDS:
             missing, unknown = _FIELDS - set(values), set(values) - _FIELDS
             raise ValueError(f"invalid config fields; missing={sorted(missing)!r}, unknown={sorted(unknown)!r}")
-        if values["schema_version"] != SCHEMA_VERSION or isinstance(values["schema_version"], bool):
+        if values["schema_version"] != CURRENT_SCHEMA_VERSION or isinstance(values["schema_version"], bool):
             raise ValueError(f"unsupported schema_version: {values['schema_version']!r}")
         config_id = values["config_id"]
         site = values["site"]
@@ -221,7 +231,7 @@ class SiteConfig:
         if not isinstance(patterns_raw, Sequence) or isinstance(patterns_raw, str) or not patterns_raw:
             raise TypeError("url_patterns must be a non-empty sequence")
         normalized = {
-            "schema_version": SCHEMA_VERSION, "config_id": config_id, "site": site.strip(), "domain": domain,
+            "schema_version": CURRENT_SCHEMA_VERSION, "config_id": config_id, "site": site.strip(), "domain": domain,
             "url_patterns": tuple(_pattern(item, domain) for item in patterns_raw), "selectors": _selectors(values["selectors"]),
             "request_policy": _request_policy(values["request_policy"]), "generated_at": _utc(values["generated_at"], "generated_at"),
             "last_validated": _utc(values["last_validated"], "last_validated"), "field_scores": _scores(values["field_scores"]),
@@ -276,11 +286,7 @@ class SiteConfig:
     def from_dict(cls, value: Mapping[str, object]) -> SiteConfig:
         if not isinstance(value, Mapping):
             raise TypeError("config must be a mapping")
-        version = value.get("schema_version")
-        parser = _VERSION_PARSERS.get(version) if isinstance(version, int) and not isinstance(version, bool) else None
-        if parser is None:
-            raise ValueError(f"unsupported schema_version: {version!r}")
-        return parser(value)
+        return parse_config(value)
 
     @classmethod
     def from_json(cls, value: str) -> SiteConfig:
@@ -293,7 +299,7 @@ class SiteConfig:
     @classmethod
     def new(cls, *, site: str, domain: str, url_patterns: Sequence[str], selectors: Mapping[str, object], request_policy: Mapping[str, object] | None = None, generated_at: str | None = None) -> SiteConfig:
         now = generated_at or datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-        return cls(schema_version=SCHEMA_VERSION, config_id=f"cfg_{secrets.token_urlsafe(18)}", site=site, domain=domain, url_patterns=url_patterns, selectors=selectors, request_policy=request_policy or {"timeout_seconds": 15.0, "max_retries": 2, "rate_limit_seconds": 0.5}, generated_at=now, last_validated=now, field_scores={}, validation_samples=[], fingerprint_salt=secrets.token_bytes(32))
+        return cls(schema_version=CURRENT_SCHEMA_VERSION, config_id=f"cfg_{secrets.token_urlsafe(18)}", site=site, domain=domain, url_patterns=url_patterns, selectors=selectors, request_policy=request_policy or {"timeout_seconds": 15.0, "max_retries": 2, "rate_limit_seconds": 0.5}, generated_at=now, last_validated=now, field_scores={}, validation_samples=[], fingerprint_salt=secrets.token_bytes(32))
 
 
 def _salt(value: object) -> bytes:
@@ -304,16 +310,44 @@ def _salt(value: object) -> bytes:
     raise ValueError("fingerprint_salt must encode exactly 32 bytes")
 
 
-def _parse_v1(value: Mapping[str, object]) -> SiteConfig:
+def _parse_v1(value: Mapping[str, object]) -> dict[str, object]:
     if set(value) != _V1_FIELDS:
         missing, unknown = _V1_FIELDS - set(value), set(value) - _V1_FIELDS
         raise ValueError(f"invalid v1 config fields; missing={sorted(missing)!r}, unknown={sorted(unknown)!r}")
-    return SiteConfig(**dict(value))
+    return dict(value)
 
 
 _VERSION_PARSERS = {1: _parse_v1}
+Migration = Callable[[dict[str, object]], dict[str, object]]
+MIGRATIONS: dict[int, Migration] = {}
 
 
-def migrate_v1_to_current(value: Mapping[str, object]) -> SiteConfig:
+def parse_config(value: Mapping[str, object], *, migrations: Mapping[int, Migration] | None = None) -> SiteConfig:
+    if not isinstance(value, Mapping):
+        raise TypeError("config must be a mapping")
+    raw_version = value.get("schema_version")
+    if not isinstance(raw_version, int) or isinstance(raw_version, bool):
+        raise ValueError(f"unsupported schema_version: {raw_version!r}")
+    parser = _VERSION_PARSERS.get(raw_version)
+    if parser is None or raw_version > CURRENT_SCHEMA_VERSION:
+        raise ValueError(f"unsupported schema_version: {raw_version!r}")
+    payload = parser(value)
+    registry = MIGRATIONS if migrations is None else migrations
+    version = raw_version
+    while version < CURRENT_SCHEMA_VERSION:
+        migration = registry.get(version)
+        if migration is None:
+            raise ValueError(f"missing migration from schema_version {version}")
+        payload = migration(dict(payload))
+        expected = version + 1
+        if payload.get("schema_version") != expected:
+            raise ValueError(f"migration from schema_version {version} must produce {expected}")
+        version = expected
+    return SiteConfig(**payload)
+
+
+def migrate_v1_to_current(value: Mapping[str, object], *, migrations: Mapping[int, Migration] | None = None) -> SiteConfig:
     """Parse v1 independently; future migrations can chain from this boundary."""
-    return _parse_v1(value)
+    if value.get("schema_version") != 1:
+        raise ValueError("migrate_v1_to_current requires schema_version 1")
+    return parse_config(value, migrations=migrations)

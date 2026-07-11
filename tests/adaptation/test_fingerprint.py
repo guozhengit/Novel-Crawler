@@ -57,15 +57,16 @@ def test_fingerprint_rejects_invalid_inputs() -> None:
 def test_salt_makes_identical_layouts_unlinkable() -> None:
     html = "<main><article><p>private</p></article></main>"
     assert fingerprint_html(html, "chapter", {}, SALT).digest != fingerprint_html(html, "chapter", {}, b"x" * 32).digest
+    assert fingerprint_html(html, "chapter", {}, SALT).digest != fingerprint_html(html, "book", {}, SALT).digest
 
 
 def test_rejects_unsafe_or_excessive_candidate_selectors() -> None:
     import pytest
 
-    for selector in ("a:has(span)", "div:contains(secret)", "[data-user='alice@example.com']", "body div p a span"):
+    for selector in ("a:has(span)", "div:contains(private-text)", "p:-soup-contains(private-text)", "p:-SOUP-CONTAINS-OWN(private-text)", "[data-user='alice@example.com']", "body div p a span"):
         with pytest.raises(ValueError):
             fingerprint_html("<p>x</p>", "chapter", {"private": selector}, SALT)
     with pytest.raises(ValueError):
-        fingerprint_html("<p>x</p>", "chapter", {str(i): "p" for i in range(21)}, SALT)
+        fingerprint_html("<p>x</p>", "chapter", {f"s{i}": "p" for i in range(21)}, SALT)
     with pytest.raises(ValueError):
         fingerprint_html("<p>x</p>", "chapter", {}, b"short")

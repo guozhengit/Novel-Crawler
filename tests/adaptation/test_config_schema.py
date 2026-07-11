@@ -141,13 +141,47 @@ def test_json_validation_and_public_json_redaction() -> None:
         SiteConfig.from_dict([])  # type: ignore[arg-type]
 
 
-def test_version_dispatch_is_independent_of_current(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_version_pipeline_applies_injected_migration_to_runtime_target(monkeypatch: pytest.MonkeyPatch) -> None:
     import novel_crawler.adaptation.config_schema as schema
 
-    monkeypatch.setattr(schema, "CURRENT_SCHEMA_VERSION", 99)
+    called = []
+
+    def v1_to_v2(payload: dict[str, object]) -> dict[str, object]:
+        called.append(payload["schema_version"])
+        return {**payload, "schema_version": 2}
+
+    monkeypatch.setattr(schema, "CURRENT_SCHEMA_VERSION", 2)
+    config = schema.parse_config(valid_payload(), migrations={1: v1_to_v2})
+    assert called == [1]
+    assert config.schema_version == 2
+
+    with pytest.raises(ValueError, match="missing migration from schema_version 1"):
+        schema.parse_config(valid_payload(), migrations={})
+
+
+def test_v1_runtime_target_still_parses_without_migration() -> None:
     assert SiteConfig.from_dict(valid_payload()).schema_version == 1
-    assert schema.migrate_v1_to_current(valid_payload()).schema_version == 1
-    future = valid_payload()
-    future["schema_version"] = 99
-    with pytest.raises(ValueError, match="unsupported"):
-        SiteConfig.from_dict(future)
+
+
+def test_selector_limits_apply_across_all_config_groups() -> None:
+    payload = valid_payload()
+    payload["selectors"] = {
+        "clean": [f".ad{i}" for i in range(10)],
+        "book": {f"b{i}": "h1" for i in range(6)},
+        "chapter": {f"c{i}": "p" for i in range(5)},
+    }
+    with pytest.raises(ValueError, match="20"):
+        SiteConfig.from_dict(payload)
+
+    long_selector = "." + "a" * 500
+    payload["selectors"] = {"clean": [long_selector] * 9, "book": {}, "chapter": {}}
+    with pytest.raises(ValueError, match="4096"):
+        SiteConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize("selector", ["p:-soup-contains(private-text)", "p:-SOUP-CONTAINS-OWN(private-text)"])
+def test_rejects_soupsieve_text_contains_selectors(selector: str) -> None:
+    payload = valid_payload()
+    payload["selectors"] = {"clean": [], "book": {"title": selector}, "chapter": {}}
+    with pytest.raises(ValueError):
+        SiteConfig.from_dict(payload)

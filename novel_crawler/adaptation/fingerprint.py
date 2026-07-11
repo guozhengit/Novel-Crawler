@@ -81,5 +81,5 @@ def fingerprint_html(html: str | bytes, page_kind: str, candidate_selectors: Map
         except SelectorSyntaxError as exc:
             raise ValueError("candidate selector syntax is invalid") from exc
     roots = [node for child in soup.children if isinstance(child, Tag) and (node := _node(child)) is not None]
-    canonical = json.dumps({"structure": roots, "selector_match_counts": counts}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    canonical = json.dumps({"fingerprint_version": 1, "page_kind": page_kind, "structure": roots, "selector_match_counts": counts}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return StructureFingerprint(1, page_kind, hmac.new(fingerprint_salt, canonical.encode("ascii"), hashlib.sha256).hexdigest())
