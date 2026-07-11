@@ -110,6 +110,7 @@ class BackgroundTaskExecutor:
         self._control_poll_interval = control_poll_interval
         self._lock = threading.Lock()
         self._scheduled: set[str] = set()
+        self._scheduled_versions: dict[str, int] = {}
         self._pending_resumes: dict[str, tuple[bool, TaskStatus]] = {}
         self._startup_deferred_count = 0
         self._closing = threading.Event()
@@ -158,10 +159,36 @@ class BackgroundTaskExecutor:
             if task_id in self._scheduled:
                 return False
             self._scheduled.add(task_id)
+            self._scheduled_versions[task_id] = task.version
             try:
                 self._queue.put_nowait((task_id, False))
             except queue.Full as exc:
                 self._scheduled.discard(task_id)
+                self._scheduled_versions.pop(task_id, None)
+                raise ExecutorQueueFull("executor_queue_full") from exc
+        return True
+
+    def schedule_active(self, task_id: str) -> bool:
+        """Schedule an already-claimed active generation without widening status scope."""
+        with self._lock:
+            if self._closing.is_set():
+                raise ExecutorClosed("executor_closed")
+            task = self._repository.get_task(task_id)
+            if task.status not in _INTERRUPTED:
+                return False
+            if task_id in self._scheduled:
+                if self._scheduled_versions.get(task_id, -1) >= task.version:
+                    return False
+                self._scheduled_versions[task_id] = task.version
+                self._pending_resumes[task_id] = (True, TaskStatus.RECOVERABLE_FAILED)
+                return True
+            self._scheduled.add(task_id)
+            self._scheduled_versions[task_id] = task.version
+            try:
+                self._queue.put_nowait((task_id, True))
+            except queue.Full as exc:
+                self._scheduled.discard(task_id)
+                self._scheduled_versions.pop(task_id, None)
                 raise ExecutorQueueFull("executor_queue_full") from exc
         return True
 
@@ -177,6 +204,8 @@ class BackgroundTaskExecutor:
             if task.is_terminal:
                 return task
             if task.status not in {TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED}:
+                return task
+            if task.cleanup_required:
                 return task
             if task.resume_status is None:
                 return task
@@ -252,13 +281,16 @@ class BackgroundTaskExecutor:
             if self._closing.is_set():
                 raise ExecutorClosed("executor_closed")
             if task_id in self._scheduled:
+                self._scheduled_versions[task_id] = self._repository.get_task(task_id).version
                 self._pending_resumes[task_id] = (preclaimed, rollback_status)
                 return
             self._scheduled.add(task_id)
+            self._scheduled_versions[task_id] = self._repository.get_task(task_id).version
             try:
                 self._queue.put_nowait((task_id, preclaimed))
             except queue.Full as exc:
                 self._scheduled.discard(task_id)
+                self._scheduled_versions.pop(task_id, None)
                 raise ExecutorQueueFull("executor_queue_full") from exc
 
     def _request_status(self, task_id: str, status: TaskStatus) -> TaskRecord:
@@ -305,9 +337,13 @@ class BackgroundTaskExecutor:
                             self._queue.put_nowait((task_id, pending[0]))
                         except queue.Full:
                             self._scheduled.discard(task_id)
+                            self._scheduled_versions.pop(task_id, None)
                             rollback = True
                     elif pending is not None:
+                        self._scheduled_versions.pop(task_id, None)
                         rollback = True
+                    else:
+                        self._scheduled_versions.pop(task_id, None)
                 self._queue.task_done()
                 if rollback and pending is not None:
                     latest = self._repository.get_task(task_id)
@@ -353,7 +389,7 @@ class BackgroundTaskExecutor:
             except TerminalTaskError as exc:
                 self._record_failure(current.task_id, terminal=True, error_code=exc.error_code)
                 return
-            except BaseException:
+            except Exception:
                 self._record_failure(current.task_id, terminal=False, error_code="task_handler_failed")
                 return
 

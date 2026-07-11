@@ -15,12 +15,13 @@ from urllib.parse import urlsplit
 from novel_crawler.task_engine.models import (
     ALLOWED_TRANSITIONS,
     CheckpointRecord,
+    ResumeGate,
     TaskEvent,
     TaskRecord,
     TaskStatus,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SENSITIVE_KEYS = (
     "api_key",
@@ -60,6 +61,16 @@ _RESUMABLE_STATUSES = frozenset({TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILE
 _DISPLAY_TEXT_KEYS = frozenset({"book_name", "book_title", "name", "title"})
 _MAX_MIGRATION_EVENTS = 100_000
 _CHECKPOINT_KEY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_INTERACTION_RECOVERY_ERRORS = frozenset(
+    {
+        "interaction_session_lost",
+        "interaction_expired",
+        "interaction_cleanup_required",
+        "verification_timed_out",
+        "verification_failed",
+        "adaptive_service_failed",
+    }
+)
 
 
 V1_ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = MappingProxyType(
@@ -236,6 +247,7 @@ class TaskRepository:
                     CHECK(length(CAST(metadata_json AS BLOB)) <= 1000000),
                 error_code TEXT,
                 error_message TEXT CHECK(error_message IS NULL OR length(error_message) <= 10000),
+                resume_gate TEXT NOT NULL DEFAULT 'none' CHECK(resume_gate IN ('none', 'cleanup')),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -269,6 +281,15 @@ class TaskRepository:
                 FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS task_interaction_leases (
+                task_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL CHECK(length(owner_id) BETWEEN 16 AND 128),
+                owner_epoch INTEGER NOT NULL CHECK(owner_epoch >= 0),
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+            )
+            """,
             "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status, updated_at)",
             "CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, event_id)",
         )
@@ -290,6 +311,24 @@ class TaskRepository:
                 self._backfill_resume_statuses()
                 self._connection.execute(
                     "INSERT INTO task_schema_migrations(version, applied_at) VALUES(2, ?)", (_now(),)
+                )
+        if self.schema_version < 3:
+            with self._transaction():
+                self._connection.execute(
+                    "INSERT INTO task_schema_migrations(version, applied_at) VALUES(3, ?)", (_now(),)
+                )
+        if self.schema_version < 4:
+            with self._transaction():
+                columns = {
+                    str(row[1]) for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()
+                }
+                if "resume_gate" not in columns:
+                    self._connection.execute(
+                        "ALTER TABLE tasks ADD COLUMN resume_gate TEXT NOT NULL DEFAULT 'none' "
+                        "CHECK(resume_gate IN ('none', 'cleanup'))"
+                    )
+                self._connection.execute(
+                    "INSERT INTO task_schema_migrations(version, applied_at) VALUES(4, ?)", (_now(),)
                 )
         columns = {str(row[1]) for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()}
         if "resume_status" not in columns:
@@ -441,6 +480,11 @@ class TaskRepository:
                 raise TaskVersionConflict("task_version_conflict")
             if to_status not in ALLOWED_TRANSITIONS[current.status]:
                 raise InvalidTaskTransition(f"transition_not_allowed:{current.status.value}:{to_status.value}")
+            if current.resume_gate is ResumeGate.CLEANUP and to_status not in {
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                raise InvalidTaskTransition("cleanup_gate_requires_completion")
             if current.status in _RESUMABLE_STATUSES and to_status not in {
                 TaskStatus.TERMINAL_FAILED,
                 TaskStatus.CANCELLED,
@@ -451,17 +495,23 @@ class TaskRepository:
                 resume_status = current.status
             else:
                 resume_status = None
+            resume_gate = (
+                ResumeGate.NONE
+                if to_status in {TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED}
+                else current.resume_gate
+            )
             next_version = current.version + 1
             cursor = self._connection.execute(
                 """
                 UPDATE tasks
-                SET status=?, version=?, resume_status=?, error_code=?, error_message=?, updated_at=?
+                SET status=?, version=?, resume_status=?, resume_gate=?, error_code=?, error_message=?, updated_at=?
                 WHERE task_id=? AND version=?
                 """,
                 (
                     to_status.value,
                     next_version,
                     resume_status.value if resume_status is not None else None,
+                    resume_gate.value,
                     error_code,
                     error_message,
                     timestamp,
@@ -499,9 +549,370 @@ class TaskRepository:
             error_code=error_code,
             error_message=error_message,
             resume_status=resume_status,
+            resume_gate=resume_gate,
             created_at=current.created_at,
             updated_at=timestamp,
         )
+
+    def require_cleanup(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        error_code: str,
+    ) -> TaskRecord:
+        validated_error = _validate_error_code(error_code)
+        if validated_error is None:
+            raise TaskInputError("cleanup_error_code_required")
+        error_code = validated_error
+        timestamp = _now()
+        allowed_sources = {
+            TaskStatus.PROBING,
+            TaskStatus.WAITING_FOR_USER,
+            TaskStatus.VALIDATING,
+            TaskStatus.READY,
+            TaskStatus.CRAWLING,
+        }
+        with self._lock, self._transaction():
+            row = self._connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise TaskNotFound("task_not_found")
+            current = _task_from_row(row)
+            if current.version != expected_version:
+                raise TaskVersionConflict("task_version_conflict")
+            if current.resume_gate is ResumeGate.CLEANUP:
+                return current
+            if current.status not in allowed_sources:
+                raise InvalidTaskTransition(f"cleanup_gate_not_allowed:{current.status.value}")
+            next_version = current.version + 1
+            updated = self._connection.execute(
+                """
+                UPDATE tasks SET status=?, version=?, resume_status=?, resume_gate=?,
+                    error_code=?, error_message=NULL, updated_at=?
+                WHERE task_id=? AND version=?
+                """,
+                (
+                    TaskStatus.RECOVERABLE_FAILED.value,
+                    next_version,
+                    TaskStatus.PROBING.value,
+                    ResumeGate.CLEANUP.value,
+                    error_code,
+                    timestamp,
+                    task_id,
+                    expected_version,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise TaskVersionConflict("task_version_conflict")
+            self._connection.execute("DELETE FROM task_interaction_leases WHERE task_id=?", (task_id,))
+            updated = self._connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_id, from_status, to_status, task_version, reason, metadata_json,
+                    error_code, error_message, created_at
+                ) VALUES(?, ?, ?, ?, 'cleanup_required', '{}', ?, NULL, ?)
+                """,
+                (
+                    task_id,
+                    current.status.value,
+                    TaskStatus.RECOVERABLE_FAILED.value,
+                    next_version,
+                    error_code,
+                    timestamp,
+                ),
+            )
+        return TaskRecord(
+            task_id=task_id,
+            source_url=current.source_url,
+            status=TaskStatus.RECOVERABLE_FAILED,
+            version=next_version,
+            metadata=current.metadata,
+            error_code=error_code,
+            resume_status=TaskStatus.PROBING,
+            resume_gate=ResumeGate.CLEANUP,
+            created_at=current.created_at,
+            updated_at=timestamp,
+        )
+
+    def complete_cleanup_gate(self, task_id: str, *, expected_version: int) -> TaskRecord:
+        timestamp = _now()
+        with self._lock, self._transaction():
+            row = self._connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise TaskNotFound("task_not_found")
+            current = _task_from_row(row)
+            if current.version != expected_version:
+                raise TaskVersionConflict("task_version_conflict")
+            if (
+                current.status is not TaskStatus.RECOVERABLE_FAILED
+                or current.resume_gate is not ResumeGate.CLEANUP
+            ):
+                raise InvalidTaskTransition("cleanup_gate_not_active")
+            next_version = current.version + 1
+            updated = self._connection.execute(
+                """
+                UPDATE tasks SET status=?, version=?, resume_status=NULL, resume_gate=?,
+                    error_code=NULL, error_message=NULL, updated_at=?
+                WHERE task_id=? AND version=?
+                """,
+                (
+                    TaskStatus.PROBING.value,
+                    next_version,
+                    ResumeGate.NONE.value,
+                    timestamp,
+                    task_id,
+                    expected_version,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise TaskVersionConflict("task_version_conflict")
+            self._connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_id, from_status, to_status, task_version, reason, metadata_json, created_at
+                ) VALUES(?, ?, ?, ?, 'cleanup_completed', '{}', ?)
+                """,
+                (
+                    task_id,
+                    TaskStatus.RECOVERABLE_FAILED.value,
+                    TaskStatus.PROBING.value,
+                    next_version,
+                    timestamp,
+                ),
+            )
+        return TaskRecord(
+            task_id=task_id,
+            source_url=current.source_url,
+            status=TaskStatus.PROBING,
+            version=next_version,
+            metadata=current.metadata,
+            resume_gate=ResumeGate.NONE,
+            created_at=current.created_at,
+            updated_at=timestamp,
+        )
+
+    def recover_lost_interaction(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        error_code: str = "interaction_session_lost",
+        now: str | None = None,
+    ) -> TaskRecord:
+        """Fail a WAITING task closed with the only safe restart target, PROBING."""
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
+            raise TaskInputError("expected_version_invalid")
+        if error_code not in _INTERACTION_RECOVERY_ERRORS:
+            raise ValueError("interaction_recovery_error_invalid")
+        timestamp = _now()
+        lease_now = now or timestamp
+        with self._lock, self._transaction():
+            row = self._connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise TaskNotFound("task_not_found")
+            current = _task_from_row(row)
+            if current.version != expected_version:
+                raise TaskVersionConflict("task_version_conflict")
+            if current.status is not TaskStatus.WAITING_FOR_USER:
+                raise InvalidTaskTransition(
+                    f"interaction_recovery_not_allowed:{current.status.value}"
+                )
+            lease = self._connection.execute(
+                "SELECT expires_at FROM task_interaction_leases WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if lease is not None and str(lease["expires_at"]) > lease_now:
+                raise InvalidTaskTransition("interaction_lease_active")
+            self._connection.execute("DELETE FROM task_interaction_leases WHERE task_id=?", (task_id,))
+            next_version = current.version + 1
+            updated = self._connection.execute(
+                """
+                UPDATE tasks
+                SET status=?, version=?, resume_status=?, error_code=?, error_message=NULL, updated_at=?
+                WHERE task_id=? AND version=? AND status=?
+                """,
+                (
+                    TaskStatus.RECOVERABLE_FAILED.value,
+                    next_version,
+                    TaskStatus.PROBING.value,
+                    error_code,
+                    timestamp,
+                    task_id,
+                    expected_version,
+                    TaskStatus.WAITING_FOR_USER.value,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise TaskVersionConflict("task_version_conflict")
+            self._connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_id, from_status, to_status, task_version, reason, metadata_json,
+                    error_code, error_message, created_at
+                ) VALUES(?, ?, ?, ?, ?, '{}', ?, NULL, ?)
+                """,
+                (
+                    task_id,
+                    TaskStatus.WAITING_FOR_USER.value,
+                    TaskStatus.RECOVERABLE_FAILED.value,
+                    next_version,
+                    "interaction_recovery",
+                    error_code,
+                    timestamp,
+                ),
+            )
+        return TaskRecord(
+            task_id=task_id,
+            source_url=current.source_url,
+            status=TaskStatus.RECOVERABLE_FAILED,
+            version=next_version,
+            metadata=current.metadata,
+            error_code=error_code,
+            resume_status=TaskStatus.PROBING,
+            created_at=current.created_at,
+            updated_at=timestamp,
+        )
+
+    def transition_to_waiting_with_lease(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        owner_id: str,
+        owner_epoch: int,
+        expires_at: str,
+    ) -> TaskRecord:
+        owner_id, owner_epoch, expires_at = _validate_interaction_lease(
+            owner_id, owner_epoch, expires_at
+        )
+        timestamp = _now()
+        with self._lock, self._transaction():
+            row = self._connection.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise TaskNotFound("task_not_found")
+            current = _task_from_row(row)
+            if current.version != expected_version:
+                raise TaskVersionConflict("task_version_conflict")
+            if TaskStatus.WAITING_FOR_USER not in ALLOWED_TRANSITIONS[current.status]:
+                raise InvalidTaskTransition(
+                    f"transition_not_allowed:{current.status.value}:waiting_for_user"
+                )
+            next_version = current.version + 1
+            updated = self._connection.execute(
+                """
+                UPDATE tasks SET status=?, version=?, resume_status=NULL, error_code=NULL,
+                    error_message=NULL, updated_at=?
+                WHERE task_id=? AND version=?
+                """,
+                (TaskStatus.WAITING_FOR_USER.value, next_version, timestamp, task_id, expected_version),
+            )
+            if updated.rowcount != 1:
+                raise TaskVersionConflict("task_version_conflict")
+            self._connection.execute(
+                """
+                INSERT INTO task_interaction_leases(task_id, owner_id, owner_epoch, expires_at)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET owner_id=excluded.owner_id,
+                    owner_epoch=excluded.owner_epoch, expires_at=excluded.expires_at
+                """,
+                (task_id, owner_id, owner_epoch, expires_at),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO task_events(
+                    task_id, from_status, to_status, task_version, reason, metadata_json, created_at
+                ) VALUES(?, ?, ?, ?, 'adaptive_interaction_waiting', '{}', ?)
+                """,
+                (
+                    task_id,
+                    current.status.value,
+                    TaskStatus.WAITING_FOR_USER.value,
+                    next_version,
+                    timestamp,
+                ),
+            )
+        return TaskRecord(
+            task_id=task_id,
+            source_url=current.source_url,
+            status=TaskStatus.WAITING_FOR_USER,
+            version=next_version,
+            metadata=current.metadata,
+            resume_status=None,
+            created_at=current.created_at,
+            updated_at=timestamp,
+        )
+
+    def renew_interaction_lease(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        owner_id: str,
+        owner_epoch: int,
+        expires_at: str,
+    ) -> bool:
+        owner_id, owner_epoch, expires_at = _validate_interaction_lease(
+            owner_id, owner_epoch, expires_at
+        )
+        with self._lock, self._transaction():
+            row = self._connection.execute(
+                "SELECT status, version FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise TaskNotFound("task_not_found")
+            if int(row["version"]) != expected_version:
+                raise TaskVersionConflict("task_version_conflict")
+            if TaskStatus(row["status"]) is not TaskStatus.WAITING_FOR_USER:
+                return False
+            updated = self._connection.execute(
+                """
+                UPDATE task_interaction_leases SET expires_at=?
+                WHERE task_id=? AND owner_id=? AND owner_epoch=?
+                """,
+                (expires_at, task_id, owner_id, owner_epoch),
+            )
+            return updated.rowcount == 1
+
+    def owns_interaction_lease(
+        self, task_id: str, *, owner_id: str, owner_epoch: int, now: str
+    ) -> bool:
+        owner_id, owner_epoch, now = _validate_interaction_lease(owner_id, owner_epoch, now)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM task_interaction_leases
+                WHERE task_id=? AND owner_id=? AND owner_epoch=? AND expires_at>?
+                """,
+                (task_id, owner_id, owner_epoch, now),
+            ).fetchone()
+        return row is not None
+
+    def release_interaction_lease(
+        self, task_id: str, *, owner_id: str, owner_epoch: int
+    ) -> bool:
+        owner_id, owner_epoch, _ = _validate_interaction_lease(
+            owner_id, owner_epoch, "2000-01-01T00:00:00+00:00"
+        )
+        with self._lock, self._transaction():
+            deleted = self._connection.execute(
+                "DELETE FROM task_interaction_leases WHERE task_id=? AND owner_id=? AND owner_epoch=?",
+                (task_id, owner_id, owner_epoch),
+            )
+        return deleted.rowcount == 1
+
+    def list_orphaned_waiting(self, *, now: str, limit: int = 1000) -> list[TaskRecord]:
+        if not isinstance(now, str) or not now:
+            raise TaskInputError("interaction_lease_time_invalid")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT tasks.* FROM tasks
+                LEFT JOIN task_interaction_leases lease ON lease.task_id=tasks.task_id
+                WHERE tasks.status=? AND (lease.task_id IS NULL OR lease.expires_at<=?)
+                ORDER BY tasks.rowid LIMIT ?
+                """,
+                (TaskStatus.WAITING_FOR_USER.value, now, limit),
+            ).fetchall()
+        return [_task_from_row(row) for row in rows]
 
     def save_checkpoint(
         self,
@@ -720,6 +1131,28 @@ def _looks_like_display_credential(label: str, value: str) -> bool:
     return len(candidate) >= 16 and not candidate.istitle()
 
 
+def _validate_interaction_lease(
+    owner_id: str, owner_epoch: int, timestamp: str
+) -> tuple[str, int, str]:
+    if (
+        not isinstance(owner_id, str)
+        or not 16 <= len(owner_id) <= 128
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", owner_id)
+    ):
+        raise TaskInputError("interaction_lease_owner_invalid")
+    if isinstance(owner_epoch, bool) or not isinstance(owner_epoch, int) or owner_epoch < 0:
+        raise TaskInputError("interaction_lease_epoch_invalid")
+    if not isinstance(timestamp, str) or len(timestamp) < 20 or len(timestamp) > 64:
+        raise TaskInputError("interaction_lease_time_invalid")
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise TaskInputError("interaction_lease_time_invalid") from exc
+    if parsed.tzinfo is None:
+        raise TaskInputError("interaction_lease_time_invalid")
+    return owner_id, owner_epoch, timestamp
+
+
 def _validated_resume_origin(events: list[sqlite3.Row], task_status: TaskStatus, task_version: int) -> TaskStatus:
     if len(events) != task_version + 1:
         raise ValueError
@@ -755,6 +1188,7 @@ def _task_from_row(row: sqlite3.Row) -> TaskRecord:
         metadata=json.loads(row["metadata_json"]),
         error_code=row["error_code"],
         resume_status=TaskStatus(row["resume_status"]) if row["resume_status"] is not None else None,
+        resume_gate=ResumeGate(row["resume_gate"]),
         error_message=row["error_message"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),

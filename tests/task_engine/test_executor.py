@@ -632,3 +632,72 @@ def test_executor_processes_more_than_one_hundred_tasks(tmp_path: Path) -> None:
                 executor.submit(task.task_id)
             for task in tasks:
                 _wait_for_status(repository, task.task_id, TaskStatus.VALIDATING, timeout=8)
+
+
+def test_schedule_active_runs_preclaimed_status_and_deduplicates(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def validate(_context, task):  # type: ignore[no-untyped-def]
+        calls.append(task.task_id)
+        return TaskStatus.READY
+
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        validating = repository.transition(
+            task.task_id, TaskStatus.VALIDATING, expected_version=probing.version
+        )
+        with BackgroundTaskExecutor(
+            repository, {TaskStatus.VALIDATING: validate}, max_workers=1
+        ) as executor:
+            assert executor.schedule_active(task.task_id) is True
+            assert executor.schedule_active(task.task_id) is False
+            _wait_for_status(repository, task.task_id, TaskStatus.READY)
+        assert calls == [task.task_id]
+        assert validating.status is TaskStatus.VALIDATING
+
+
+def test_schedule_active_rejects_nonactive_and_closed_executor(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test")
+        executor = BackgroundTaskExecutor(repository, {}, max_workers=1)
+        assert executor.schedule_active(task.task_id) is False
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        assert executor.shutdown(timeout=2)
+        with pytest.raises(ExecutorClosed):
+            executor.schedule_active(probing.task_id)
+
+
+def test_handler_control_flow_base_exceptions_propagate_without_fake_failure(tmp_path: Path) -> None:
+    def stop(_context, _task):  # type: ignore[no-untyped-def]
+        raise SystemExit("stop")
+
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test")
+        active = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        executor = BackgroundTaskExecutor(repository, {TaskStatus.PROBING: stop}, max_workers=1)
+        try:
+            with pytest.raises(SystemExit, match="stop"):
+                executor._run_claimed(active)
+            current = repository.get_task(task.task_id)
+            assert current.status is TaskStatus.PROBING
+            assert current.error_code is None
+        finally:
+            executor.shutdown(timeout=2)
+
+
+def test_generic_resume_cannot_bypass_cleanup_gate(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        gated = repository.require_cleanup(
+            task.task_id,
+            expected_version=probing.version,
+            error_code="interaction_cleanup_required",
+        )
+        with BackgroundTaskExecutor(repository, {}, max_workers=1) as executor:
+            for _ in range(3):
+                resumed = executor.resume(task.task_id)
+                assert resumed.version == gated.version
+                assert resumed.cleanup_required is True
+                assert resumed.status is TaskStatus.RECOVERABLE_FAILED

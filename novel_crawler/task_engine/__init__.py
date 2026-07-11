@@ -8,10 +8,16 @@ from novel_crawler.task_engine.executor import (
     TaskExecutorError,
     TerminalTaskError,
 )
+from novel_crawler.task_engine.integration import (
+    AdaptiveTaskController,
+    InteractionKind,
+    InteractionSummary,
+)
 from novel_crawler.task_engine.models import (
     ALLOWED_TRANSITIONS,
     TERMINAL_STATUSES,
     CheckpointRecord,
+    ResumeGate,
     TaskEvent,
     TaskRecord,
     TaskStatus,
@@ -28,14 +34,18 @@ from novel_crawler.task_engine.repository import (
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
+    "AdaptiveTaskController",
     "BackgroundTaskExecutor",
     "CheckpointNotFound",
     "ChapterBatchRunner",
     "CheckpointRecord",
+    "ResumeGate",
     "ExecutorClosed",
     "ExecutorQueueFull",
     "TERMINAL_STATUSES",
     "InvalidTaskTransition",
+    "InteractionKind",
+    "InteractionSummary",
     "TaskEvent",
     "TaskControlRequested",
     "TaskExecutionContext",

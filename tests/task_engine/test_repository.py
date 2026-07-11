@@ -44,13 +44,13 @@ def test_migration_is_idempotent_and_non_destructive_for_old_storage(tmp_path: P
         storage.conn.commit()
 
     with TaskRepository(path) as first:
-        assert first.schema_version == 2
+        assert first.schema_version == 4
     with TaskRepository(path) as second:
-        assert second.schema_version == 2
+        assert second.schema_version == 4
         tables = {row[0] for row in second.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"books", "chapters", "tasks", "task_events", "checkpoints", "task_schema_migrations"} <= tables
         assert second.connection.execute("SELECT title FROM books").fetchone()[0] == "kept"
-        assert second.connection.execute("SELECT COUNT(*) FROM task_schema_migrations").fetchone()[0] == 2
+        assert second.connection.execute("SELECT COUNT(*) FROM task_schema_migrations").fetchone()[0] == 4
 
 
 def test_database_enables_wal_foreign_keys_and_busy_timeout(tmp_path: Path) -> None:
@@ -394,7 +394,7 @@ def test_upgrades_existing_v1_task_rows_with_empty_resume_origin(tmp_path: Path)
     connection.close()
 
     with TaskRepository(path) as repository:
-        assert repository.schema_version == 2
+        assert repository.schema_version == 4
         task = repository.get_task("a" * 32)
         assert task.status is TaskStatus.CREATED
         assert task.resume_status is None
@@ -530,7 +530,7 @@ def test_v1_migration_atomically_backfills_resume_origin_from_event_chain(
     _create_v1_resume_database(path, status=status.value)
     with TaskRepository(path) as repository:
         task = repository.get_task("b" * 32)
-        assert repository.schema_version == 2
+        assert repository.schema_version == 4
         assert task.resume_status is expected_origin
 
     with TaskRepository(path) as repository:
@@ -773,3 +773,62 @@ def test_schema_has_absolute_text_size_limits_even_for_direct_sql(tmp_path: Path
             repository.connection.execute(
                 "UPDATE tasks SET error_message=? WHERE task_id=?", ("x" * 10_001, task.task_id)
             )
+
+
+def test_cleanup_gate_is_persistent_fail_closed_and_safe(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.db"
+    with TaskRepository(path) as repository:
+        task = repository.create_task("https://example.test")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        gated = repository.require_cleanup(
+            task.task_id,
+            expected_version=probing.version,
+            error_code="interaction_cleanup_required",
+        )
+        assert gated.status is TaskStatus.RECOVERABLE_FAILED
+        assert gated.resume_status is TaskStatus.PROBING
+        assert gated.cleanup_required is True
+        assert gated.to_safe_dict()["cleanup_required"] is True
+        assert "cleanup" in repr(gated)
+        with pytest.raises(sqlite3.IntegrityError):
+            repository.connection.execute(
+                "UPDATE tasks SET resume_gate='bypass' WHERE task_id=?", (task.task_id,)
+            )
+        with pytest.raises(InvalidTaskTransition, match="cleanup_gate"):
+            repository.transition(
+                task.task_id, TaskStatus.PROBING, expected_version=gated.version
+            )
+    with TaskRepository(path) as restarted:
+        gated = restarted.get_task(task.task_id)
+        assert restarted.schema_version == 4
+        assert gated.cleanup_required is True
+        with pytest.raises(InvalidTaskTransition, match="cleanup_gate"):
+            restarted.transition(
+                task.task_id, TaskStatus.PROBING, expected_version=gated.version
+            )
+
+
+def test_only_cleanup_completion_or_terminal_cancel_clears_gate(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+        gated = repository.require_cleanup(
+            task.task_id,
+            expected_version=probing.version,
+            error_code="interaction_cleanup_required",
+        )
+        completed = repository.complete_cleanup_gate(
+            task.task_id, expected_version=gated.version
+        )
+        assert completed.status is TaskStatus.PROBING
+        assert completed.cleanup_required is False
+
+        again = repository.require_cleanup(
+            task.task_id,
+            expected_version=completed.version,
+            error_code="interaction_cleanup_required",
+        )
+        cancelled = repository.transition(
+            task.task_id, TaskStatus.CANCELLED, expected_version=again.version
+        )
+        assert cancelled.cleanup_required is False

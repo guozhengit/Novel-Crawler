@@ -20,6 +20,11 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ResumeGate(StrEnum):
+    NONE = "none"
+    CLEANUP = "cleanup"
+
+
 TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED})
 
 
@@ -114,6 +119,7 @@ class TaskRecord:
     updated_at: str
     error_code: str | None = None
     resume_status: TaskStatus | None = None
+    resume_gate: ResumeGate = ResumeGate.NONE
     source_url: str = field(default="", repr=False)
     metadata: dict[str, Any] = field(default_factory=dict, repr=False)
     error_message: str | None = field(default=None, repr=False)
@@ -121,6 +127,10 @@ class TaskRecord:
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
+
+    @property
+    def cleanup_required(self) -> bool:
+        return self.resume_gate is ResumeGate.CLEANUP
 
     def to_safe_dict(self) -> dict[str, str | int | bool | None]:
         return {
@@ -132,6 +142,7 @@ class TaskRecord:
             "error_code": self.error_code,
             "resume_status": self.resume_status.value if self.resume_status is not None else None,
             "is_terminal": self.is_terminal,
+            "cleanup_required": self.cleanup_required,
         }
 
 
