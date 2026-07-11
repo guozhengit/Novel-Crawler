@@ -287,6 +287,8 @@ def test_batch_facade_reads_bounded_url_file_and_returns_only_safe_task_views(ap
         service.create_crawl_tasks_from_file(source, concurrency=2)
     with pytest.raises(ApplicationError, match="concurrency_unsupported"):
         service.create_crawl_tasks_from_file(source, concurrency=True)
+    with pytest.raises(ApplicationError, match="max_chapters_invalid"):
+        service.create_crawl_tasks_from_file(source, max_chapters=0)
     assert len(executor.submitted) == 2
 
 

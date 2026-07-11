@@ -517,7 +517,9 @@ class ApplicationService:
     ) -> dict[str, object]:
         if isinstance(concurrency, bool) or concurrency != 1:
             raise ApplicationError("concurrency_unsupported")
-        options = CrawlOptions(max_chapters=max_chapters, concurrency=concurrency, export=False)
+        options = CrawlOptions.parse(
+            CrawlOptions(max_chapters=max_chapters, concurrency=concurrency, export=False)
+        )
         if not isinstance(file_path, Path):
             raise ApplicationError("batch_file_invalid")
         try:
