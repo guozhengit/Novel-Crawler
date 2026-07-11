@@ -140,9 +140,13 @@ class HttpPageAcquirer:
 
         while True:
             try:
-                target = self.policy.validate(current_url) if target is None else target
+                if target is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AcquisitionError("timeout", redact_url(current_url), True)
+                    target = self.policy.validate(current_url, timeout=remaining)
             except UrlSafetyError as exc:
-                raise AcquisitionError(exc.code, exc.safe_url, False) from None
+                raise AcquisitionError(exc.code, exc.safe_url, exc.recoverable) from None
             parts = urlsplit(current_url)
             scheme = parts.scheme.lower()
             headers = {
@@ -191,9 +195,12 @@ class HttpPageAcquirer:
                 if next_url in seen:
                     raise AcquisitionError("redirect_loop", redact_url(next_url), False)
                 try:
-                    next_target = self.policy.validate_redirect(current_url, location)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AcquisitionError("timeout", redact_url(current_url), True)
+                    next_target = self.policy.validate_redirect(current_url, location, timeout=remaining)
                 except UrlSafetyError as exc:
-                    raise AcquisitionError(exc.code, exc.safe_url, False) from None
+                    raise AcquisitionError(exc.code, exc.safe_url, exc.recoverable) from None
                 redirects.append(RedirectHop(redact_url(current_url), response.status_code))
                 seen.add(next_url)
                 current_url = next_url

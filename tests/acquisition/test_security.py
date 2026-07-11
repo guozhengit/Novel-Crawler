@@ -47,7 +47,7 @@ def test_validate_rejects_unsafe_literal_addresses(url: str, address: str) -> No
         UrlSafetyPolicy(resolver=resolver).validate(url)
 
     assert caught.value.code == "unsafe_address"
-    assert caught.value.safe_url == url
+    assert caught.value.safe_url == redact_url(url)
     assert resolver.calls == []
 
 
@@ -133,15 +133,21 @@ def test_validate_rejects_invalid_urls_without_resolving(url: str, code: str) ->
 
 
 def test_error_url_and_string_redact_query_fragment_and_credentials() -> None:
-    url = "https://alice:super-secret@example.com/book?token=top-secret#private"
+    url = "https://alice:super-secret@example.com/path-secret/book?token=top-secret#private"
 
     with pytest.raises(UrlSafetyError) as caught:
         UrlSafetyPolicy(resolver=StubResolver({})).validate(url)
 
-    assert caught.value.safe_url == "https://example.com/book"
+    assert caught.value.safe_url == "https://example.com/"
+    assert "path-secret" not in str(caught.value)
     assert "super-secret" not in str(caught.value)
     assert "top-secret" not in str(caught.value)
-    assert redact_url(url) == "https://example.com/book"
+    assert redact_url(url) == "https://example.com/"
+
+
+def test_redact_url_normalizes_scheme_host_and_default_port_to_origin() -> None:
+    assert redact_url("HTTPS://B\u00fcCHER.Example.:443/path-secret") == "https://xn--bcher-kva.example/"
+    assert redact_url("http://Example.COM:8080/path-secret") == "http://example.com:8080/"
 
 
 def test_validate_redirect_validates_target_and_allows_public_cross_domain() -> None:
@@ -160,7 +166,7 @@ def test_validate_redirect_rejects_unsafe_target_and_redacts_it() -> None:
     with pytest.raises(UrlSafetyError) as caught:
         policy.validate_redirect("https://source.example/", "http://127.0.0.1/admin?token=secret")
 
-    assert caught.value.safe_url == "http://127.0.0.1/admin"
+    assert caught.value.safe_url == "http://127.0.0.1/"
     assert "secret" not in str(caught.value)
 
 
@@ -205,3 +211,27 @@ def test_default_and_explicit_ports_are_passed_to_resolver(url: str, expected_po
 
     assert UrlSafetyPolicy(resolver=resolver).validate(url).port == expected_port
     assert resolver.calls == [("example.com", expected_port)]
+
+
+def test_timeout_aware_resolver_receives_budget_and_timeout_is_recoverable() -> None:
+    class TimeoutResolver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int, float | None]] = []
+
+        def __call__(self, host: str, port: int, timeout: float | None = None) -> Iterable[str]:
+            self.calls.append((host, port, timeout))
+            raise TimeoutError("resolver budget exhausted")
+
+    resolver = TimeoutResolver()
+    with pytest.raises(UrlSafetyError) as caught:
+        UrlSafetyPolicy(resolver=resolver).validate("https://example.com/path-secret", timeout=3.5)
+    assert (caught.value.code, caught.value.recoverable) == ("dns_timeout", True)
+    assert caught.value.safe_url == "https://example.com/"
+    assert resolver.calls == [("example.com", 443, 3.5)]
+
+
+def test_literal_ip_does_not_invoke_timeout_aware_resolver() -> None:
+    resolver = StubResolver({})
+    target = UrlSafetyPolicy(resolver=resolver).validate("https://8.8.8.8/path-secret", timeout=0.01)
+    assert target.addresses == ("8.8.8.8",)
+    assert resolver.calls == []

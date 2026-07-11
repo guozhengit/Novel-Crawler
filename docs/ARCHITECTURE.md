@@ -434,9 +434,9 @@ CrawlerService._chase_chapters()
 
 所有生产 transport **MUST** 使用 `UrlSafetyPolicy` 已批准的 IP 建立连接，同时保留原始主机名用于 HTTP `Host` 和 HTTPS SNI/证书主机名校验。禁止在校验后按主机名重新解析或让底层客户端自动跟随重定向；每个重定向目标都必须重新验证并重新 pinning。测试中的本地 fixture transport 仅用于确定性集成测试，不代表伪造的真实 TLS E2E 保证。
 
-一次 `fetch` 的默认总 deadline 为 25 秒，由所有重定向 hop 和同一目标的 IP fallback 共同消耗，任何 hop 都不会重置预算。默认最多跟随 10 次重定向。响应体默认最多为 10 MiB（`max_body_bytes`）：先用有效的 `Content-Length` 拒绝明显超限响应，再以 `preload_content=False` 流式读取，并按 `decode_content=True` 解压后的累计字节执行严格上限。重定向响应只读取状态和 headers，不读取 body；超限统一抛出不可恢复的 `AcquisitionError(code="response_too_large")`。
+一次 `fetch` 的默认总 deadline 为 25 秒，由初始 DNS、每个重定向目标的 DNS、所有重定向 hop 和同一目标的 IP fallback 共同消耗，任何阶段都不会重置预算。默认解析器直接使用 dnspython，在 A 与 AAAA 查询间共享剩余 lifetime；注入式 resolver 可接收第三个 `timeout` 参数，旧的双参数 resolver 仅为兼容测试与既有集成。DNS 超时稳定映射为可恢复的 `dns_timeout`，其他解析失败映射为 `dns_resolution_failed`。字面 IP 不执行 DNS。默认最多跟随 10 次重定向。响应体默认最多为 10 MiB（`max_body_bytes`）：先用有效的 `Content-Length` 拒绝明显超限响应，再以 `preload_content=False` 流式读取，并按 `decode_content=True` 解压后的累计字节执行严格上限。重定向响应只读取状态和 headers，不读取 body；超限统一抛出不可恢复的 `AcquisitionError(code="response_too_large")`。
 
-snapshot 是隐私边界而非请求重放记录。`PageSnapshot.requested_url`、`PageSnapshot.final_url` 和每个 `RedirectHop.url` 只保存 `redact_url()` 的结果，因此不包含 userinfo、query 或 fragment。完整 URL 只在 `fetch` 局部变量中短暂存在，用于请求 target 和 `Location` 的 `urljoin`；日志、异常、`repr`、`dataclasses.asdict` 及下游持久化都不得依赖或恢复这些敏感部分。
+snapshot 是隐私边界而非请求重放记录。`PageSnapshot.requested_url`、`PageSnapshot.final_url`、每个 `RedirectHop.url` 以及错误 provenance 只保存 `redact_url()` 的规范化 origin（`scheme://host[:非默认端口]/`），因此不包含 userinfo、path、query 或 fragment。完整导航 URL 只在 `fetch` 局部变量中短暂存在，用于请求 target 和 `Location` 的 `urljoin`；日志、异常、`repr`、`dataclasses.asdict` 及下游持久化都不得依赖或恢复这些敏感部分。
 
 ### SiteAdapter 抽象接口
 

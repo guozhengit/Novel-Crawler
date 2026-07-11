@@ -29,3 +29,17 @@ New regression tests were run red before implementation for URL privacy, content
 ## Minor / test-boundary note
 
 No claim of real-network TLS E2E coverage is made. HTTPS host pinning, SNI, hostname configuration, streaming, and cleanup are deterministic unit tests around urllib3 pool construction and response behavior; the integration fixture remains plain HTTP and injected only in tests.
+
+## Conditional gap closure
+
+- URL provenance was tightened from path-preserving redaction to normalized origin-only storage: `scheme://host[:nondefault-port]/`. Model fields, snapshot `repr`/`asdict`, and acquisition/safety errors cannot retain userinfo, path, query, or fragment.
+- DNS is now inside the single acquisition deadline. The direct `dnspython>=2.6,<3` resolver shares the passed lifetime across A and AAAA, redirect resolutions receive the remaining budget, timeout-aware injected resolvers receive the same contract, and legacy two-argument injections remain compatible.
+- DNS timeout has stable `dns_timeout` / recoverable semantics; literal public IPs bypass DNS.
+
+Conditional-gap verification:
+
+- Focused security + HTTP tests: `77 passed`.
+- Acquisition suite: `88 passed`, branch coverage `88.14%` (required `>=85%`).
+- Full suite: `182 passed`.
+- Ruff and mypy: clean.
+- Standard isolated build still stops at the known Windows Store Python temporary-venv defect before backend execution; `python -m build --no-isolation` succeeds with the declared dnspython dependency and produces sdist + wheel.

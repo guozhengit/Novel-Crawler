@@ -70,10 +70,11 @@ def test_models_enforce_redacted_url_storage() -> None:
         redirects=(hop,), retrieved_at=datetime.now().astimezone(),
     )
     rendered = repr(snapshot) + repr(asdict(snapshot))
-    assert hop.url == "https://example.test/old"
-    assert snapshot.requested_url == "https://example.test/old"
-    assert snapshot.final_url == "https://example.test/new"
-    assert "token" not in rendered
+    assert hop.url == "https://example.test/"
+    assert snapshot.requested_url == "https://example.test/"
+    assert snapshot.final_url == "https://example.test/"
+    for secret in ("user", "password", "old", "new", "token", "fragment"):
+        assert secret not in rendered
 
 
 def test_fetch_pins_transport_to_policy_ip_and_preserves_original_authority() -> None:
@@ -82,7 +83,7 @@ def test_fetch_pins_transport_to_policy_ip_and_preserves_original_authority() ->
 
     snapshot = HttpPageAcquirer(transport, policy).fetch("https://example.test:8443/a?q=1")
 
-    assert snapshot.final_url == "https://example.test:8443/a"
+    assert snapshot.final_url == "https://example.test:8443/"
     assert resolver_calls == [("example.test", 8443)]
     call = transport.calls[0]
     assert {key: value for key, value in call.items() if key not in {"timeout", "max_body_bytes"}} == {
@@ -129,8 +130,8 @@ def test_redirect_is_relative_revalidated_and_has_no_second_dns_lookup() -> None
     assert resolver_calls == [("first.test", 443), ("next.test", 443)]
     assert [call["approved_ip"] for call in transport.calls] == ["93.184.216.34", "142.250.72.14"]
     assert [call["original_host"] for call in transport.calls] == ["first.test", "next.test"]
-    assert snapshot.redirects == (RedirectHop("https://first.test/start", 302),)
-    assert snapshot.final_url == "https://next.test/final"
+    assert snapshot.redirects == (RedirectHop("https://first.test/", 302),)
+    assert snapshot.final_url == "https://next.test/"
 
 
 def test_relative_redirect_is_joined_before_next_request() -> None:
@@ -138,7 +139,7 @@ def test_relative_redirect_is_joined_before_next_request() -> None:
     transport = FakeTransport([response(303, headers={"Location": "../final?x=1"}), response()])
     snapshot = HttpPageAcquirer(transport, policy).fetch("https://example.test/a/start")
     assert calls == [("example.test", 443), ("example.test", 443)]
-    assert snapshot.final_url == "https://example.test/final"
+    assert snapshot.final_url == "https://example.test/"
     assert transport.calls[1]["path"] == "/final?x=1"
 
 
@@ -148,14 +149,14 @@ def test_snapshot_urls_never_retain_credentials_query_or_fragment() -> None:
         [response(302, headers={"Location": "/final?next-secret=2#hidden"}), response()]
     )
     snapshot = HttpPageAcquirer(transport, policy).fetch(
-        "https://example.test/start?request-secret=1#fragment"
+        "https://example.test/request-path-secret/start?request-secret=1#fragment"
     )
 
     rendered = repr(snapshot) + repr(asdict(snapshot))
-    assert snapshot.requested_url == "https://example.test/start"
-    assert snapshot.final_url == "https://example.test/final"
-    assert snapshot.redirects == (RedirectHop("https://example.test/start", 302),)
-    for secret in ("user", "password", "request-secret", "next-secret", "fragment", "hidden"):
+    assert snapshot.requested_url == "https://example.test/"
+    assert snapshot.final_url == "https://example.test/"
+    assert snapshot.redirects == (RedirectHop("https://example.test/", 302),)
+    for secret in ("user", "password", "path-secret", "request-secret", "next-secret", "fragment", "hidden"):
         assert secret not in rendered
 
 
@@ -174,7 +175,7 @@ def test_content_length_and_actual_body_are_strictly_limited() -> None:
 
 
 def test_redirect_hops_and_ip_fallback_share_one_total_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = iter((0.0, 1.0, 4.0, 10.0))
+    clock = iter((0.0, 1.0, 1.0, 4.0, 4.0, 10.0))
     monkeypatch.setattr("novel_crawler.acquisition.http.time.monotonic", lambda: next(clock))
     policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
     transport = FakeTransport(
@@ -187,7 +188,7 @@ def test_redirect_hops_and_ip_fallback_share_one_total_deadline(monkeypatch: pyt
 
 
 def test_ip_fallback_reports_timeout_when_shared_deadline_expires(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = iter((0.0, 1.0, 6.0))
+    clock = iter((0.0, 1.0, 1.0, 6.0))
     monkeypatch.setattr("novel_crawler.acquisition.http.time.monotonic", lambda: next(clock))
     policy = UrlSafetyPolicy(resolver=lambda host, port: ("93.184.216.34", "142.250.72.14"))
     transport = FakeTransport([OSError("first IP unavailable")])
@@ -195,6 +196,39 @@ def test_ip_fallback_reports_timeout_when_shared_deadline_expires(monkeypatch: p
         HttpPageAcquirer(transport, policy, timeout=5).fetch("https://example.test/")
     assert caught.value.code == "timeout"
     assert len(transport.calls) == 1
+
+
+def test_dns_resolution_and_redirects_share_total_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = iter((0.0, 1.0, 2.0, 4.0, 5.0))
+    monkeypatch.setattr("novel_crawler.acquisition.http.time.monotonic", lambda: next(clock))
+    resolver_calls: list[tuple[str, int, float | None]] = []
+
+    def resolver(host: str, port: int, timeout: float | None = None) -> tuple[str]:
+        resolver_calls.append((host, port, timeout))
+        return ("93.184.216.34",)
+
+    transport = FakeTransport([response(302, headers={"Location": "/final"}), response()])
+    HttpPageAcquirer(transport, UrlSafetyPolicy(resolver=resolver), timeout=9).fetch(
+        "https://example.test/start"
+    )
+    assert resolver_calls == [
+        ("example.test", 443, 8.0),
+        ("example.test", 443, 5.0),
+    ]
+    assert [call["timeout"] for call in transport.calls] == [7.0, 4.0]
+
+
+def test_dns_timeout_maps_to_recoverable_acquisition_error_without_path_leak() -> None:
+    def resolver(host: str, port: int, timeout: float | None = None) -> tuple[str, ...]:
+        raise TimeoutError("blocked until timeout")
+
+    with pytest.raises(AcquisitionError) as caught:
+        HttpPageAcquirer(policy=UrlSafetyPolicy(resolver=resolver)).fetch(
+            "https://example.test/path-secret?query-secret=1"
+        )
+    assert (caught.value.code, caught.value.recoverable) == ("dns_timeout", True)
+    assert caught.value.safe_url == "https://example.test/"
+    assert "secret" not in repr(caught.value)
 
 
 def test_response_headers_are_filtered_case_insensitively_and_frozen() -> None:
@@ -249,7 +283,7 @@ def test_http_status_error_semantics(status: int, recoverable: bool) -> None:
         HttpPageAcquirer(FakeTransport([response(status)]), policy).fetch("https://example.test/x?secret=1")
     assert caught.value.code == f"http_{status}"
     assert caught.value.recoverable is recoverable
-    assert caught.value.safe_url == "https://example.test/x"
+    assert caught.value.safe_url == "https://example.test/"
 
 
 def test_timeout_is_recoverable_and_redacted() -> None:

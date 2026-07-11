@@ -199,7 +199,7 @@ def test_fixture_pages_classify_and_acquisition_handles_redirect_and_gbk() -> No
             assert result.kind is kind, (path, result)
             assert 0 <= result.confidence <= 1
         redirected = acquirer.fetch(f"http://fixture.example:{acquirer.transport.fixture_port}/redirect")  # type: ignore[attr-defined]
-        assert redirected.final_url.endswith("/chapter/1")
+        assert redirected.final_url == f"http://fixture.example:{acquirer.transport.fixture_port}/"  # type: ignore[attr-defined]
         assert classifier.classify(redirected).kind is PageKind.CHAPTER
         gbk = acquirer.fetch(f"http://fixture.example:{acquirer.transport.fixture_port}/gbk")  # type: ignore[attr-defined]
         assert gbk.encoding == "gbk"

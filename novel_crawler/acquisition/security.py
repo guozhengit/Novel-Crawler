@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
+import inspect
 import ipaddress
 import re
-import socket
-from collections.abc import Callable, Iterable
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-Resolver = Callable[[str, int], Iterable[str]]
+import dns.exception
+import dns.resolver
+
+
+class Resolver(Protocol):
+    def __call__(self, host: str, port: int, timeout: float | None = None) -> Iterable[str]: ...
 
 
 class UrlSafetyError(ValueError):
     """A URL was rejected without retaining its sensitive components."""
 
-    def __init__(self, code: str, safe_url: str) -> None:
+    def __init__(self, code: str, safe_url: str, recoverable: bool = False) -> None:
         self.code = code
         self.safe_url = safe_url
+        self.recoverable = recoverable
         super().__init__(f"{code}: {safe_url}")
 
 
@@ -37,25 +45,48 @@ class ResolvedTarget:
 
 
 def redact_url(url: str) -> str:
-    """Remove credentials, query parameters, and fragments from a URL."""
+    """Reduce a URL to its normalized origin, excluding every navigation component."""
     try:
         parts = urlsplit(url)
         host = parts.hostname
         if host is None:
-            return urlunsplit((parts.scheme, "", parts.path, "", ""))
+            return urlunsplit((parts.scheme.lower(), "", "/", "", ""))
+        host = host.lower()
+        if ":" not in host:
+            host = host.encode("idna").decode("ascii").rstrip(".")
         display_host = f"[{host}]" if ":" in host else host
         try:
             port = parts.port
         except ValueError:
             port = None
-        netloc = display_host if port is None else f"{display_host}:{port}"
-        return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+        scheme = parts.scheme.lower()
+        default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+        netloc = display_host if port is None or port == default_port else f"{display_host}:{port}"
+        return urlunsplit((scheme, netloc, "/", "", ""))
     except (TypeError, ValueError):
         return "<invalid-url>"
 
 
-def _system_resolver(host: str, port: int) -> Iterable[str]:
-    return (str(item[4][0]) for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+def _system_resolver(host: str, port: int, timeout: float | None = None) -> Iterable[str]:
+    """Resolve A and AAAA records with one dnspython lifetime budget."""
+    resolver = dns.resolver.Resolver()
+    lifetime = timeout
+    answers: list[str] = []
+    started = time.monotonic()
+    for record_type in ("A", "AAAA"):
+        remaining = None if lifetime is None else lifetime - (time.monotonic() - started)
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("DNS resolution deadline exhausted")
+        try:
+            response = resolver.resolve(host, record_type, lifetime=remaining)
+        except dns.resolver.NoAnswer:
+            continue
+        except dns.exception.Timeout as exc:
+            raise TimeoutError("DNS resolution deadline exhausted") from exc
+        except dns.exception.DNSException:
+            continue
+        answers.extend(str(answer) for answer in response)
+    return answers
 
 
 def _is_unsafe(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -79,7 +110,7 @@ class UrlSafetyPolicy:
         self.allowed_schemes = tuple(scheme.lower() for scheme in allowed_schemes)
         self.resolver = resolver
 
-    def validate(self, url: str) -> ResolvedTarget:
+    def validate(self, url: str, *, timeout: float | None = None) -> ResolvedTarget:
         safe_url = redact_url(url)
         try:
             parts = urlsplit(url)
@@ -116,7 +147,9 @@ class UrlSafetyPolicy:
             return ResolvedTarget(host, port, (literal.compressed,))
 
         try:
-            answers = tuple(dict.fromkeys(self.resolver(host, port)))
+            answers = tuple(dict.fromkeys(self._resolve(host, port, timeout)))
+        except TimeoutError as exc:
+            raise UrlSafetyError("dns_timeout", safe_url, True) from exc
         except (OSError, KeyError, UnicodeError, ValueError) as exc:
             raise UrlSafetyError("dns_resolution_failed", safe_url) from exc
         if not answers:
@@ -131,9 +164,20 @@ class UrlSafetyPolicy:
             normalized.append(address.compressed)
         return ResolvedTarget(host, port, tuple(normalized))
 
-    def validate_redirect(self, source_url: str, target_url: str) -> ResolvedTarget:
+    def validate_redirect(
+        self, source_url: str, target_url: str, *, timeout: float | None = None
+    ) -> ResolvedTarget:
         """Resolve a possibly relative redirect and fully validate its target."""
-        return self.validate(urljoin(source_url, target_url))
+        return self.validate(urljoin(source_url, target_url), timeout=timeout)
+
+    def _resolve(self, host: str, port: int, timeout: float | None) -> Iterable[str]:
+        """Call timeout-aware resolvers while retaining legacy two-argument injection."""
+        try:
+            signature = inspect.signature(self.resolver)
+            signature.bind(host, port, timeout)
+        except (TypeError, ValueError):
+            return self.resolver(host, port)
+        return self.resolver(host, port, timeout)
 
     @staticmethod
     def _normalize_host(host: str, safe_url: str) -> str:
