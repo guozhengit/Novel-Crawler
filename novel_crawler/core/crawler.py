@@ -91,9 +91,12 @@ class CrawlerService:
         except KeyError:
             self.storage.delete_book(book_id)
             return
-        self.storage.delete_book_content(book_id, book.title)
         cache_dir = self.ctx.cache_dir / book.site / safe_filename(book.title)
-        if not self.storage.has_other_book(book_id, book.title, site=book.site):
+        delete_cache = not self.storage.has_other_book(book_id, book.title, site=book.site)
+        if delete_cache:
+            self.storage.validate_tree_under(self.ctx.cache_dir, cache_dir)
+        self.storage.delete_book_content(book_id, book.title)
+        if delete_cache:
             self.storage.remove_tree_under(self.ctx.cache_dir, cache_dir)
         self.storage.delete_book(book_id)
 

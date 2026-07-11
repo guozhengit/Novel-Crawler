@@ -460,19 +460,73 @@ class Storage:
         return self.data_dir / "contents" / str(book_id)
 
     def delete_book_content(self, book_id: int, title: str) -> None:
-        root = self.data_dir / "contents"
         with self._lock:
-            rows = self.conn.execute(
-                "SELECT content_path FROM chapters WHERE book_id=? AND content_path IS NOT NULL", (book_id,)
-            ).fetchall()
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self._delete_book_content_locked(book_id, title)
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
+
+    def _delete_book_content_locked(self, book_id: int, title: str) -> None:
+        root = self.data_dir / "contents"
+        rows = self.conn.execute(
+            "SELECT content_path FROM chapters WHERE book_id=? AND content_path IS NOT NULL", (book_id,)
+        ).fetchall()
+        other_rows = self.conn.execute(
+            "SELECT content_path FROM chapters WHERE book_id!=? AND content_path IS NOT NULL", (book_id,)
+        ).fetchall()
         paths = [self._validate_content_path(root, Path(str(row["content_path"]))) for row in rows]
+        shared_keys = {
+            key
+            for row in other_rows
+            if (key := self._content_path_key(root, Path(str(row["content_path"])))) is not None
+        }
+        tree_candidates = [self.chapter_content_dir(book_id, title)]
+        if not self.has_other_book(book_id, title):
+            tree_candidates.append(root / safe_filename(title))
+        trees: list[Path] = []
+        for tree in tree_candidates:
+            self.validate_tree_under(root, tree)
+            tree_resolved = tree.resolve(strict=False)
+            if not any(self._key_is_under_tree(key, tree_resolved) for key in shared_keys):
+                trees.append(tree)
         for path in paths:
+            if self._content_path_key(root, path) in shared_keys or any(
+                self._path_is_under_tree(path, tree) for tree in trees
+            ):
+                continue
+            path = self._validate_content_path(root, path)
             if path.exists():
                 path.unlink()
             self._prune_empty_parents(path.parent, root)
-        self._prune_empty_parents(self.chapter_content_dir(book_id, title), root)
-        if not self.has_other_book(book_id, title):
-            self._prune_empty_parents(root / safe_filename(title), root)
+        for tree in trees:
+            self.remove_tree_under(root, tree)
+
+    def _content_path_key(self, root: Path, path: Path) -> str | None:
+        candidate = path if path.is_absolute() else self.data_dir / path
+        resolved = candidate.resolve(strict=False)
+        root_resolved = root.resolve(strict=False)
+        if resolved == root_resolved or root_resolved not in resolved.parents:
+            return None
+        return os.path.normcase(str(resolved))
+
+    @staticmethod
+    def _key_is_under_tree(key: str, tree: Path) -> bool:
+        tree_key = os.path.normcase(str(tree))
+        try:
+            return os.path.commonpath((key, tree_key)) == tree_key
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _path_is_under_tree(path: Path, tree: Path) -> bool:
+        try:
+            path.resolve(strict=False).relative_to(tree.resolve(strict=False))
+        except ValueError:
+            return False
+        return True
 
     def _validate_content_path(self, root: Path, path: Path) -> Path:
         candidate = path if path.is_absolute() else self.data_dir / path
@@ -522,23 +576,39 @@ class Storage:
 
     @staticmethod
     def remove_tree_under(root: Path, target: Path) -> None:
-        root_resolved = root.resolve(strict=False)
-        target_parent = target.parent.resolve(strict=False)
-        if target_parent != root_resolved and root_resolved not in target_parent.parents:
-            raise ValueError("delete_path_outside_root")
-        if target.resolve(strict=False) == root_resolved:
-            raise ValueError("delete_path_outside_root")
-        if not target.exists() and not target.is_symlink():
+        Storage.validate_tree_under(root, target)
+        if not target.exists():
             return
-        if Storage._is_reparse_point(target):
-            raise ValueError("delete_path_reparse_point")
         if target.is_dir():
-            for descendant in target.rglob("*"):
-                if Storage._is_reparse_point(descendant):
-                    raise ValueError("delete_path_reparse_point")
             shutil.rmtree(target)
         else:
             target.unlink()
+
+    @staticmethod
+    def validate_tree_under(root: Path, target: Path) -> None:
+        root_absolute = Path(os.path.abspath(root))
+        target_absolute = Path(os.path.abspath(target))
+        try:
+            relative = target_absolute.relative_to(root_absolute)
+        except ValueError:
+            raise ValueError("delete_path_outside_root") from None
+        root_resolved = root.resolve(strict=False)
+        target_resolved = target_absolute.resolve(strict=False)
+        if target_resolved == root_resolved or root_resolved not in target_resolved.parents:
+            raise ValueError("delete_path_outside_root")
+        current = root_absolute
+        if Storage._is_reparse_point(current):
+            raise ValueError("delete_path_reparse_point")
+        for part in relative.parts:
+            current /= part
+            if Storage._is_reparse_point(current):
+                raise ValueError("delete_path_reparse_point")
+        if not target_absolute.exists():
+            return
+        if target_absolute.is_dir():
+            for descendant in target_absolute.rglob("*"):
+                if Storage._is_reparse_point(descendant):
+                    raise ValueError("delete_path_reparse_point")
 
     def progress(self, book_id: int) -> dict[str, int]:
         with self._lock:

@@ -451,6 +451,87 @@ def test_delete_content_symlink_fails_closed(tmp_path: Path) -> None:
     storage.close()
 
 
+def test_delete_preserves_content_path_referenced_by_another_book_until_last_reference(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    first_id = storage.upsert_book(Book(title="old-one", url="https://one.example/book", site="site"))
+    second_id = storage.upsert_book(Book(title="old-two", url="https://two.example/book", site="site"))
+    legacy = data / "contents" / "shared-old"
+    legacy.mkdir(parents=True)
+    shared = legacy / "00001.txt"
+    shared.write_text("shared body", encoding="utf-8")
+    for book_id, url in ((first_id, "https://one.example/1"), (second_id, "https://two.example/1")):
+        storage.conn.execute(
+            "INSERT INTO chapters(book_id,chapter_index,title,url,canonical_url,status,content_path) VALUES(?,1,'x',?,?,'done',?)",
+            (book_id, url, url, str(shared)),
+        )
+    storage.conn.commit()
+    ctx = RuntimeContext("test", "3.12", tmp_path, data, data / "cache", data / "output", data / "crawler.db", [], [], {}, {})
+    service = CrawlerService.__new__(CrawlerService)
+    service.ctx = ctx
+    service.storage = storage
+    try:
+        service.delete_book(first_id)
+        assert shared.read_text(encoding="utf-8") == "shared body"
+        remaining = storage.all_chapters(second_id)[0]
+        assert remaining.content_path == shared and remaining.content_path.exists()
+        service.delete_book(second_id)
+        assert not shared.exists()
+        assert not legacy.exists()
+    finally:
+        storage.close()
+
+
+def test_delete_removes_orphan_files_from_exclusive_and_unshared_legacy_trees(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="legacy", url="https://example.test/book", site="site"))
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    storage.mark_done(book_id, chapter, "body")
+    exclusive = data / "contents" / str(book_id)
+    (exclusive / ".crash.tmp").write_text("partial", encoding="utf-8")
+    nested = exclusive / "nested"
+    nested.mkdir()
+    (nested / "orphan.bin").write_bytes(b"orphan")
+    legacy = data / "contents" / "legacy"
+    legacy.mkdir()
+    (legacy / ".old-crash.tmp").write_text("partial", encoding="utf-8")
+    storage.delete_book_content(book_id, "legacy")
+    assert not exclusive.exists()
+    assert not legacy.exists()
+    storage.close()
+
+
+def test_delete_preflights_orphan_symlink_before_changing_files_or_database(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    content = storage.mark_done(book_id, chapter, "body")
+    private = tmp_path / "private.txt"
+    private.write_text("private", encoding="utf-8")
+    orphan_link = content.parent / "unsafe-link"
+    try:
+        orphan_link.symlink_to(private)
+    except OSError:
+        storage.close()
+        pytest.skip("symlink creation is unavailable")
+    ctx = RuntimeContext("test", "3.12", tmp_path, data, data / "cache", data / "output", data / "crawler.db", [], [], {}, {})
+    service = CrawlerService.__new__(CrawlerService)
+    service.ctx = ctx
+    service.storage = storage
+    try:
+        with pytest.raises(ValueError, match="delete_path_reparse_point"):
+            service.delete_book(book_id)
+        assert content.read_text(encoding="utf-8") == "body"
+        assert private.read_text(encoding="utf-8") == "private"
+        assert storage.get_book(book_id).book_id == book_id
+    finally:
+        storage.close()
+
+
 def test_secure_content_delete_rejects_paths_outside_root(tmp_path: Path) -> None:
     root = tmp_path / "root"
     outside = tmp_path / "outside"
