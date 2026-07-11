@@ -4,7 +4,9 @@ import json
 import multiprocessing
 import os
 import stat
+import sys
 import threading
+import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -310,3 +312,96 @@ def test_profile_and_metadata_scan_limits_are_independent(tmp_path: Path) -> Non
         (metadata_store.root / "metadata" / name).write_text("{}", encoding="ascii")
     with pytest.raises(SessionLimitError, match="metadata scan"):
         metadata_store.acquire("new.example")
+
+
+def test_deep_profile_deletion_is_iterative(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions", max_delete_entries=200)
+    with store.acquire("deep.example") as lease:
+        cursor = lease.profile_path
+        for _ in range(60):
+            cursor = cursor / "d"
+            cursor.mkdir()
+        session_id = lease.info.session_id
+    previous = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(50)
+        assert store.clear("deep.example", session_id)
+    finally:
+        sys.setrecursionlimit(previous)
+
+
+def test_directory_swap_during_deletion_cannot_escape_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    with store.acquire("swap.example") as lease:
+        child = lease.profile_path / "child"
+        child.mkdir()
+        session_id = lease.info.session_id
+    original_scandir = os.scandir
+    swapped = False
+
+    def scandir(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
+        nonlocal swapped
+        candidate = Path(path)
+        if candidate == child and not swapped:
+            candidate.rmdir()
+            try:
+                candidate.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                pytest.skip("directory symlink creation unavailable")
+            swapped = True
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    assert store.clear("swap.example", session_id)
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_global_session_limit_includes_unpublished_concurrent_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    stores = [BrowserSessionStore(root, max_sessions=1) for _ in range(2)]
+    first_writing = threading.Event()
+    allow_first_write = threading.Event()
+    original_write = BrowserSessionStore._write_info
+    calls = 0
+    calls_guard = threading.Lock()
+
+    def delayed_write(self: BrowserSessionStore, path: Path, info: object) -> None:
+        nonlocal calls
+        with calls_guard:
+            calls += 1
+            call = calls
+        if call == 1:
+            first_writing.set()
+            assert allow_first_write.wait(5)
+        original_write(self, path, info)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(BrowserSessionStore, "_write_info", delayed_write)
+    outcomes: list[object] = []
+
+    def create(index: int) -> None:
+        try:
+            with stores[index].acquire(f"{index}.example") as lease:
+                outcomes.append(lease.info.session_id)
+        except Exception as exc:
+            outcomes.append(exc)
+
+    first = threading.Thread(target=create, args=(0,))
+    second = threading.Thread(target=create, args=(1,))
+    first.start()
+    assert first_writing.wait(5)
+    second.start()
+    time.sleep(0.1)
+    allow_first_write.set()
+    first.join(5)
+    second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert sum(isinstance(item, str) for item in outcomes) == 1
+    assert sum(isinstance(item, SessionLimitError) for item in outcomes) == 1

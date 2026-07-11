@@ -259,6 +259,7 @@ class BrowserSessionStore:
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
         lock = self._lock(canonical, timeout)
+        allocation: _DomainLock | None = None
         try:
             _, profile, metadata, _ = self._paths(canonical)
             info = self._read_info(metadata, quarantine=True)
@@ -273,30 +274,38 @@ class BrowserSessionStore:
             if info is None:
                 allocation = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
                 allocation.acquire()
-                try:
-                    self._enforce_session_limit(excluding=metadata)
-                    if profile.exists():
-                        self._safe_delete_profile(profile)
-                    self._io.ensure_directory(profile)
-                    self._io.verify_private(profile)
-                    timestamp = _now()
-                    info = BrowserSessionInfo(
-                        uuid.uuid4().hex,
-                        canonical,
-                        timestamp,
-                        timestamp,
-                        BrowserSessionStatus.AVAILABLE,
-                        "empty",
-                    )
-                finally:
+                self._enforce_session_limit(excluding=metadata)
+                if profile.exists():
+                    self._safe_delete_profile(profile)
+                self._io.ensure_directory(profile)
+                self._io.verify_private(profile)
+                timestamp = _now()
+                info = BrowserSessionInfo(
+                    uuid.uuid4().hex,
+                    canonical,
+                    timestamp,
+                    timestamp,
+                    BrowserSessionStatus.AVAILABLE,
+                    "empty",
+                )
+            try:
+                self._verify_profile(profile)
+                size = self._profile_size(profile)
+                timestamp = _now()
+                in_use = replace(
+                    info,
+                    last_used=timestamp,
+                    status=BrowserSessionStatus.IN_USE,
+                    size_bucket=self._size_bucket(size),
+                )
+                self._write_info(metadata, in_use)
+                return BrowserSessionLease(self, in_use, profile, lock)
+            finally:
+                if allocation is not None:
                     allocation.release()
-            self._verify_profile(profile)
-            size = self._profile_size(profile)
-            timestamp = _now()
-            in_use = replace(info, last_used=timestamp, status=BrowserSessionStatus.IN_USE, size_bucket=self._size_bucket(size))
-            self._write_info(metadata, in_use)
-            return BrowserSessionLease(self, in_use, profile, lock)
         except Exception:
+            if allocation is not None:
+                allocation.release()
             lock.release()
             raise
 
@@ -422,11 +431,16 @@ class BrowserSessionStore:
 
     def _delete_metadata(self, path: Path) -> None:
         self._io.reject_link(path)
+        if not path.exists():
+            return
+        tombstone = self._quarantine / f"{path.stem}.{uuid.uuid4().hex}.deleted"
+        self._io.durable_move(path, tombstone)
         try:
-            path.unlink()
+            self._io.reject_link(tombstone)
+            tombstone.unlink()
         except FileNotFoundError:
             return
-        self._sync_directory(path.parent)
+        self._sync_directory(tombstone.parent)
 
     def _verify_profile(self, profile: Path) -> None:
         self._io.reject_link(profile)
@@ -468,33 +482,38 @@ class BrowserSessionStore:
             return
         self._io.reject_link(profile)
         self._verify_profile(profile)
+        tombstone = self._quarantine / f"profile.{uuid.uuid4().hex}.trash"
+        self._io.durable_move(profile, tombstone)
         count = 0
-
-        def remove(directory: Path) -> None:
-            nonlocal count
+        stack: list[tuple[Path, bool]] = [(tombstone, False)]
+        while stack:
+            directory, visited = stack.pop()
+            self._io.reject_link(directory)
+            if visited:
+                directory.rmdir()
+                continue
+            stack.append((directory, True))
             with os.scandir(directory) as entries:
-                children = []
+                children: list[Path] = []
                 for entry in entries:
                     count += 1
                     if count > self._max_delete_entries:
                         raise SessionLimitError("browser profile deletion limit exceeded")
-                    children.append(entry)
-            for entry in children:
-                metadata = entry.stat(follow_symlinks=False)
+                    child = directory / entry.name
+                    renamed = directory / f".delete.{uuid.uuid4().hex}"
+                    os.replace(child, renamed)
+                    children.append(renamed)
+            for child in children:
+                metadata = child.stat(follow_symlinks=False)
                 if stat.S_ISLNK(metadata.st_mode) or self._is_reparse(metadata):
                     raise BrowserSessionError("browser profile deletion rejected a link or reparse point")
-                child = Path(entry.path)
                 if stat.S_ISDIR(metadata.st_mode):
-                    remove(child)
-                    child.rmdir()
+                    stack.append((child, False))
                 elif stat.S_ISREG(metadata.st_mode):
                     child.unlink()
                 else:
                     raise BrowserSessionError("browser profile deletion rejected an unsafe object")
-
-        remove(profile)
-        profile.rmdir()
-        self._sync_directory(profile.parent)
+        self._sync_directory(tombstone.parent)
 
     @staticmethod
     def _is_reparse(metadata: os.stat_result) -> bool:
