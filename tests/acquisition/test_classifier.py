@@ -131,6 +131,13 @@ def test_actual_http_error_precedes_auth_but_soft_error_title_does_not() -> None
     assert result.evidence == ("auth.password_input",)
 
 
+def test_primary_login_page_wins_over_article_and_recommended_chapters() -> None:
+    html = """<title>用户登录</title><h1>登录</h1>
+    <form><input type='password'></form><article>欢迎回来，请登录后继续阅读。</article>
+    <section class='related'><a href='/1'>第一章</a><a href='/2'>第二章</a><a href='/3'>第三章</a></section>"""
+    assert PageClassifier().classify(snapshot(200, html)).kind is PageKind.AUTH_OR_CHALLENGE
+
+
 def test_login_widget_and_reading_challenge_class_do_not_override_content() -> None:
     chapter = snapshot(
         200,
@@ -156,6 +163,21 @@ def test_chinese_text_and_numeric_or_query_urls_form_book_index_cluster() -> Non
     result = PageClassifier().classify(snapshot(200, html, "https://example.test/book/42"))
     assert result.kind is PageKind.BOOK_INDEX
     assert result.evidence == ("book_index.chapter_link_cluster",)
+
+
+def test_numeric_urls_and_chapter_query_are_never_standalone_content_signals() -> None:
+    classifier = PageClassifier()
+    pagination = "<title>Company</title><nav><a href='/1'>1</a><a href='/2'>2</a><a href='/3'>3</a></nav>"
+    news = "<title>Company announcement</title><article>Quarterly company news and ordinary editorial copy.</article>"
+    query = "<title>Product details</title><article>Ordinary product information with enough descriptive copy.</article>"
+    assert classifier.classify(snapshot(200, pagination)).kind is PageKind.UNKNOWN
+    assert classifier.classify(snapshot(200, news, "https://example.test/2026/07/11")).kind is PageKind.UNKNOWN
+    assert classifier.classify(snapshot(200, query, "https://example.test/view?cid=123")).kind is PageKind.UNKNOWN
+
+
+def test_search_page_with_numeric_pagination_remains_search() -> None:
+    html = "<title>搜索结果</title><nav><a href='/1'>1</a><a href='/2'>2</a><a href='/3'>3</a></nav>"
+    assert PageClassifier().classify(snapshot(200, html)).kind is PageKind.SEARCH_OR_LIST
 
 
 def test_fixture_pages_classify_and_acquisition_handles_redirect_and_gbk() -> None:

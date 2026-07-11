@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from urllib.parse import parse_qs, urlsplit
 
 from bs4 import BeautifulSoup, Comment
 
@@ -33,9 +32,7 @@ class Classification:
 
 
 _CHAPTER_TITLE = re.compile(r"(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷]|chapter\s+\d+)", re.I)
-_CHAPTER_HREF = re.compile(r"/(?:chapter|chapters?|read)(?:/|[-_])", re.I)
-_NUMERIC_CHAPTER_PATH = re.compile(r"/(?:\d+|[^/]*\d+\.html?)$", re.I)
-_AUTH_TITLE = re.compile(r"(?:登录|登陆|sign[ -]?in|log[ -]?in)", re.I)
+_AUTH_TITLE = re.compile(r"(?:登录|登陆|验证|sign[ -]?in|log[ -]?in|verif(?:y|ication))", re.I)
 _CHALLENGE_TEXT = re.compile(r"(?:verify (?:you are )?human|just a moment|captcha|安全验证|人机验证)", re.I)
 _ERROR_TITLE = re.compile(r"(?:404|not found|server error|页面不存在|访问出错)", re.I)
 _SEARCH_TEXT = re.compile(r"(?:搜索结果|search results?|书库|小说列表)", re.I)
@@ -59,30 +56,25 @@ class PageClassifier:
             node.decompose()
 
         content = soup.select_one(_CONTENT_SELECTOR)
-        content_text = content.get_text(" ", strip=True) if content is not None else ""
-        chapter_by_title = content is not None and bool(
-            _CHAPTER_TITLE.search(title) or _CHAPTER_TITLE.search(content_text)
-        )
-        chapter_by_url = content is not None and len(content_text) >= 20 and self._chapter_url(snapshot.final_url)
+        heading = soup.find("h1")
+        primary_heading = heading.get_text(" ", strip=True) if heading is not None else ""
+        chapter_by_title = content is not None and bool(_CHAPTER_TITLE.search(f"{title} {primary_heading}"))
 
         chapter_links = {
             str(link.get("href"))
             for link in soup.find_all("a", href=True)
-            if _CHAPTER_TITLE.search(link.get_text(" ", strip=True)) or self._chapter_url(str(link.get("href")))
+            if _CHAPTER_TITLE.search(link.get_text(" ", strip=True))
         }
         book_index = len(chapter_links) >= 3
-        substantial_content = chapter_by_title or chapter_by_url or book_index
 
         if self._challenge_score(soup, title) >= 2:
             return Classification(PageKind.AUTH_OR_CHALLENGE, 0.96, ("auth.challenge_signals",))
-        if not substantial_content and self._login_form(soup, title):
+        if self._login_form(soup, title, primary_heading):
             return Classification(PageKind.AUTH_OR_CHALLENGE, 0.98, ("auth.password_input",))
         if _ERROR_TITLE.search(title):
             return Classification(PageKind.ERROR, 0.9, ("error.title_marker",))
         if chapter_by_title:
             return Classification(PageKind.CHAPTER, 0.95, ("chapter.title_and_content",))
-        if chapter_by_url:
-            return Classification(PageKind.CHAPTER, 0.85, ("chapter.url_and_content",))
         if book_index:
             return Classification(PageKind.BOOK_INDEX, 0.93, ("book_index.chapter_link_cluster",))
 
@@ -91,26 +83,14 @@ class PageClassifier:
         return Classification(PageKind.UNKNOWN, 0.0, ())
 
     @staticmethod
-    def _chapter_url(url: str) -> bool:
-        parts = urlsplit(url)
-        query = parse_qs(parts.query)
-        return bool(
-            _CHAPTER_HREF.search(parts.path)
-            or _NUMERIC_CHAPTER_PATH.search(parts.path)
-            or any(key.lower() in {"cid", "chapter_id", "chapterid"} for key in query)
-        )
-
-    @staticmethod
-    def _login_form(soup: BeautifulSoup, title: str) -> bool:
+    def _login_form(soup: BeautifulSoup, title: str, primary_heading: str) -> bool:
+        if not _AUTH_TITLE.search(f"{title} {primary_heading}"):
+            return False
         for password in soup.select("form input[type=password]"):
             form = password.find_parent("form")
             if form is None or form.has_attr("hidden") or "display:none" in str(form.get("style", "")).replace(" ", ""):
                 continue
-            context = " ".join(
-                (title, str(form.get("action", "")), str(form.get("id", "")), " ".join(form.get("class", [])))
-            )
-            if _AUTH_TITLE.search(context):
-                return True
+            return True
         return False
 
     @staticmethod
