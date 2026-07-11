@@ -471,13 +471,10 @@ class BrowserContextWorker:
         return self._submit("capture")
 
     def close(self) -> None:
-        if self._partial_cleanup is not None:
-            self._partial_cleanup.close()
-            self._partial_cleanup = None
-            self._closed = True
-            return
         if self._closed:
             return
+        if self._started and not self._thread.is_alive() and self._partial_cleanup is not None:
+            raise RuntimeError("browser_cleanup_owner_unavailable")
         self._submit("close", allow_expired=True)
 
     def is_alive(self) -> bool:
@@ -508,6 +505,8 @@ class BrowserContextWorker:
             self._closed = exc.closed_ok
             self._notify_terminal("crash", exc.closed_ok)
             self._ready.set_exception(exc)
+            if not exc.closed_ok and exc.cleanup is not None:
+                self._run_failed_cleanup()
             return
         except Exception as exc:
             self._closed = True
@@ -587,6 +586,32 @@ class BrowserContextWorker:
                         return
                 else:
                     future.set_result(result)
+
+    def _run_failed_cleanup(self) -> None:
+        while self._partial_cleanup is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                self._expired = True
+                return
+            try:
+                action, _, future = self._commands.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+            if action == "is_alive":
+                future.set_result(False)
+                continue
+            if action != "close":
+                future.set_exception(RuntimeError("browser_worker_closed"))
+                continue
+            try:
+                self._partial_cleanup.close()
+            except Exception:
+                future.set_exception(RuntimeError("browser_launch_cleanup_failed"))
+                continue
+            self._partial_cleanup = None
+            self._closed = True
+            future.set_result(None)
+            return
 
     def _notify_terminal(self, reason: str, closed_ok: bool) -> None:
         if self._terminal_notified:

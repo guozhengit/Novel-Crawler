@@ -648,10 +648,12 @@ def test_begin_failure_releases_resources_even_when_ledger_finish_fails(
 
 def test_partial_launch_cleanup_is_quarantined_until_retry_releases_lease(tmp_path: Path) -> None:
     class Cleanup:
-        attempts = 1
+        attempts = 0
 
         def close(self) -> None:
             self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("cleanup failed")
 
     cleanup = Cleanup()
 
@@ -664,6 +666,9 @@ def test_partial_launch_cleanup_is_quarantined_until_retry_releases_lease(tmp_pa
     with pytest.raises(VerificationRequired, match="verification_start_failed") as caught:
         coordinator.begin("https://example.test/a", task_key="download")
     assert caught.value.ticket is not None
+    with pytest.raises(SessionLockTimeout):
+        sessions.acquire("example.test", timeout=0.01)
+    assert not coordinator.retry_cleanup(caught.value.ticket.token)
     with pytest.raises(SessionLockTimeout):
         sessions.acquire("example.test", timeout=0.01)
     assert coordinator.retry_cleanup(caught.value.ticket.token)

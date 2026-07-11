@@ -420,21 +420,25 @@ def test_capture_rejects_dom_before_materializing_content() -> None:
     assert content_calls == 0
 
 
-def test_worker_retries_partial_launch_cleanup_and_reports_real_state(tmp_path: Path) -> None:
+def test_worker_retries_partial_launch_cleanup_only_on_owner_thread(tmp_path: Path) -> None:
     terminal: list[tuple[str, bool]] = []
 
     class PartialCleanup:
-        attempts = 1
+        creator_thread = 0
+        call_threads: list[int] = []
+        failures = 1
 
         def close(self) -> None:
-            self.attempts += 1
-            if self.attempts == 1:
+            self.call_threads.append(threading.get_ident())
+            if self.failures:
+                self.failures -= 1
                 raise RuntimeError("partial cleanup failed")
 
     cleanup = PartialCleanup()
 
     class Broken:
         def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> object:
+            cleanup.creator_thread = threading.get_ident()
             raise DriverLaunchFailure(closed_ok=False, cleanup=cleanup)
 
     guard = BrowserRequestPolicy(public_policy())
@@ -446,8 +450,37 @@ def test_worker_retries_partial_launch_cleanup_and_reports_real_state(tmp_path: 
     with pytest.raises(DriverLaunchFailure, match="browser_launch_failed"):
         worker.start()
     assert terminal == [("crash", False)]
+    assert worker.is_alive() is False
+    with pytest.raises(RuntimeError, match="browser_worker_closed"):
+        worker.capture()
+    with pytest.raises(RuntimeError, match="browser_launch_cleanup_failed"):
+        worker.close()
     worker.close()
-    assert cleanup.attempts == 2
+    worker._thread.join(timeout=1)
+    assert cleanup.call_threads == [cleanup.creator_thread, cleanup.creator_thread]
+    assert not worker._thread.is_alive()
+
+
+def test_partial_launch_cleanup_owner_exits_at_shutdown_deadline(tmp_path: Path) -> None:
+    class Cleanup:
+        def close(self) -> None:
+            raise AssertionError("cleanup requires an explicit retry")
+
+    cleanup = Cleanup()
+
+    class Broken:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> object:
+            raise DriverLaunchFailure(closed_ok=False, cleanup=cleanup)
+
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    worker = BrowserContextWorker(Broken(), user_data_dir=tmp_path, headless=True, policy=guard, ttl=0.05)
+    with pytest.raises(DriverLaunchFailure):
+        worker.start()
+    worker._thread.join(timeout=1)
+    assert not worker._thread.is_alive()
+    with pytest.raises(RuntimeError, match="browser_cleanup_owner_unavailable"):
+        worker.close()
 
 
 def test_capture_precheck_uses_encoded_byte_length_not_character_count() -> None:
