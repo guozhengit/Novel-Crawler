@@ -362,6 +362,34 @@ def test_visible_cleanup_signal_is_retained_until_retry() -> None:
     assert service.retry_cleanup(cleanup.cleanup_ticket).kind is ResolutionKind.VERIFICATION_FAILED
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (VerificationStatus.TIMED_OUT, ResolutionKind.TIMED_OUT),
+        (VerificationStatus.FAILED, ResolutionKind.VERIFICATION_FAILED),
+    ],
+)
+def test_visible_cleanup_retry_preserves_authoritative_terminal_status(
+    status: VerificationStatus, expected: ResolutionKind
+) -> None:
+    url = "https://example.test/private"
+    coordinator = FakeCoordinator(
+        [
+            VerificationOutcome(
+                status,
+                "https://example.test",
+                cleanup_required=True,
+                cleanup_ticket="visible-cleanup-token",
+            )
+        ]
+    )
+    service = AdaptiveBrowserService(FakeManager([required(url)]), FakeAcquirer(), coordinator)
+    waiting = service.resolve(url, "download")
+    cleanup = service.continue_verification(waiting.ticket)
+    assert cleanup.kind is ResolutionKind.CLEANUP_REQUIRED
+    assert service.retry_cleanup(cleanup.cleanup_ticket).kind is expected
+
+
 def test_headless_cleanup_signal_retries_acquirer_then_resolution() -> None:
     url = "https://example.test/private"
     manager = FakeManager(
@@ -382,8 +410,8 @@ def test_headless_cleanup_signal_retries_acquirer_then_resolution() -> None:
 def test_cancel_cleanup_retries_then_returns_cancelled() -> None:
     class CleanupCancel(FakeCoordinator):
         def cancel(self, token: str) -> VerificationOutcome:
-            return VerificationOutcome(
-                VerificationStatus.FAILED,
+                return VerificationOutcome(
+                VerificationStatus.CANCELLED,
                 "https://example.test",
                 cleanup_required=True,
                 cleanup_ticket="cancel-cleanup-token",
@@ -437,7 +465,7 @@ def test_cleanup_retry_error_remains_retryable_and_unknown_token_fails() -> None
 
 @pytest.mark.parametrize(
     ("expired", "kind"),
-    [(False, ResolutionKind.VERIFICATION_FAILED), (True, ResolutionKind.TIMED_OUT)],
+    [(False, ResolutionKind.VERIFICATION_FAILED), (True, ResolutionKind.VERIFICATION_FAILED)],
 )
 def test_continue_coordinator_error_maps_safely(expired: bool, kind: ResolutionKind) -> None:
     class ContinueError(FakeCoordinator):

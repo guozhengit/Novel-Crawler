@@ -49,6 +49,7 @@ class _ActiveVerification:
     worker: BrowserContextWorker = field(repr=False)
     attempt: int = 0
     lifecycle: str = "pending"
+    cleanup_status: VerificationStatus | None = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -444,7 +445,7 @@ class VerificationCoordinator:
     @staticmethod
     def _cleanup_outcome(active: _ActiveVerification) -> VerificationOutcome:
         return VerificationOutcome(
-            VerificationStatus.FAILED,
+            active.cleanup_status or VerificationStatus.FAILED,
             active.safe_origin,
             active.attempt,
             cleanup_required=True,
@@ -468,25 +469,25 @@ class VerificationCoordinator:
         try:
             active.worker.close()
         except Exception:
-            self._quarantine(active)
+            self._quarantine(active, status)
             self._finish_ledger(
                 active.token, active.ledger_key, active.reservation_id,
                 consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
             )
             return VerificationOutcome(
-                VerificationStatus.FAILED, active.safe_origin, active.attempt, page,
+                status, active.safe_origin, active.attempt, page,
                 cleanup_required=True, cleanup_ticket=active.token,
             )
         try:
             active.lease.close()
         except Exception:
-            self._quarantine(active)
+            self._quarantine(active, status)
             self._finish_ledger(
                 active.token, active.ledger_key, active.reservation_id,
                 consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
             )
             return VerificationOutcome(
-                VerificationStatus.FAILED, active.safe_origin, active.attempt, page,
+                status, active.safe_origin, active.attempt, page,
                 cleanup_required=True, cleanup_ticket=active.token,
             )
         with self._guard:
@@ -524,7 +525,7 @@ class VerificationCoordinator:
             consumed = active.lifecycle != "pending"
             active.lifecycle = "terminating"
         if not closed_ok:
-            self._quarantine(active)
+            self._quarantine(active, VerificationStatus.FAILED)
             self._finish_ledger(token, active.ledger_key, active.reservation_id, consumed=consumed)
             return
         if reason == "crash":
@@ -535,7 +536,7 @@ class VerificationCoordinator:
         try:
             active.lease.close()
         except Exception:
-            self._quarantine(active)
+            self._quarantine(active, VerificationStatus.FAILED)
         else:
             with self._guard:
                 self._active.pop(token, None)
@@ -545,13 +546,14 @@ class VerificationCoordinator:
     def _capacity_used(self) -> int:
         return len(set(self._active) | set(self._failed_closures))
 
-    def _quarantine(self, active: _ActiveVerification) -> None:
+    def _quarantine(self, active: _ActiveVerification, status: VerificationStatus) -> None:
         try:
             active.lease.mark_stale()
         except Exception:
             pass
         with self._guard:
             active.lifecycle = "quarantined"
+            active.cleanup_status = status
             self._failed_closures[active.token] = active
 
     def _finish_ledger(self, token: str, key: str, reservation_id: str, *, consumed: bool) -> None:

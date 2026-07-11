@@ -234,21 +234,14 @@ class AdaptiveBrowserService:
             try:
                 outcome = self.verification_coordinator.continue_verification(token)
             except VerificationRequired as exc:
-                if context.ticket.expires_at is not None and context.ticket.expires_at <= datetime.now(UTC):
-                    result = self._from_status(VerificationStatus.TIMED_OUT)
-                else:
-                    result = self._failure(exc.code)
-                return self._finish(context, result)
+                return self._finish(context, self._failure(exc.code))
             context.generation += 1
             if outcome.cleanup_required:
-                terminal_kind = ResolutionKind.TIMED_OUT if (
-                    context.ticket.expires_at is not None and context.ticket.expires_at <= datetime.now(UTC)
-                ) else ResolutionKind.VERIFICATION_FAILED
                 return self._hold_visible_cleanup(
                     context,
                     outcome.cleanup_ticket,
                     resume=outcome.page is not None,
-                    terminal_kind=terminal_kind,
+                    terminal_kind=self._resolution_kind(outcome.status),
                 )
             if outcome.status is VerificationStatus.WAITING:
                 updated = VerificationTicket(
@@ -290,7 +283,7 @@ class AdaptiveBrowserService:
             else:
                 if outcome.cleanup_required:
                     return self._hold_visible_cleanup(
-                        context, outcome.cleanup_ticket, resume=False, terminal_kind=ResolutionKind.CANCELLED
+                        context, outcome.cleanup_ticket, resume=False, terminal_kind=self._resolution_kind(outcome.status)
                     )
                 result = self._from_status(outcome.status)
             return self._finish(context, result)
@@ -494,13 +487,17 @@ class AdaptiveBrowserService:
 
     @staticmethod
     def _from_status(status: VerificationStatus) -> AdaptiveResult:
+        kind = AdaptiveBrowserService._resolution_kind(status)
+        return AdaptiveResult(ConfigResolution(kind, reason_ids=(f"verification_{status.value}",)))
+
+    @staticmethod
+    def _resolution_kind(status: VerificationStatus) -> ResolutionKind:
         mapping = {
             VerificationStatus.CANCELLED: ResolutionKind.CANCELLED,
             VerificationStatus.TIMED_OUT: ResolutionKind.TIMED_OUT,
             VerificationStatus.FAILED: ResolutionKind.VERIFICATION_FAILED,
         }
-        kind = mapping.get(status, ResolutionKind.VERIFICATION_FAILED)
-        return AdaptiveResult(ConfigResolution(kind, reason_ids=(f"verification_{status.value}",)))
+        return mapping.get(status, ResolutionKind.VERIFICATION_FAILED)
 
     @staticmethod
     def _token(ticket: VerificationTicket | str) -> str:

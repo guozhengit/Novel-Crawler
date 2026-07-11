@@ -406,7 +406,7 @@ def test_failed_close_keeps_stale_lease_and_capacity_until_explicit_retry(tmp_pa
     )
     ticket = coordinator.begin("https://example.test/a", task_key="download")
     outcome = coordinator.cancel(ticket.token)
-    assert outcome.status is VerificationStatus.FAILED
+    assert outcome.status is VerificationStatus.CANCELLED
     assert outcome.cleanup_required
     assert outcome.cleanup_ticket == ticket.token
     assert "cleanup-token" not in repr(outcome)
@@ -419,6 +419,32 @@ def test_failed_close_keeps_stale_lease_and_capacity_until_explicit_retry(tmp_pa
     assert coordinator.retry_cleanup(ticket.token)
     with sessions.acquire("example.test", timeout=0.1):
         pass
+
+
+def test_timeout_cleanup_preserves_timeout_status_with_injected_clock(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 12, tzinfo=UTC)
+
+    class CloseFailsOnce(FakeContext):
+        failures = 1
+
+        def close(self) -> None:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("private close failure")
+
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([CloseFailsOnce([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+        ttl=timedelta(seconds=1),
+        clock=lambda: now,
+    )
+    ticket = coordinator.begin("https://example.test/private", task_key="download")
+    now += timedelta(seconds=2)
+    outcome = coordinator.continue_verification(ticket.token)
+    assert outcome.status is VerificationStatus.TIMED_OUT
+    assert outcome.cleanup_required and outcome.cleanup_ticket == ticket.token
+    assert coordinator.retry_cleanup(ticket.token)
 
 
 def test_browser_acquirer_passes_limits_and_classifiable_statuses_to_http(tmp_path: Path) -> None:
@@ -484,7 +510,7 @@ def test_retry_cleanup_can_report_repeated_close_failure(tmp_path: Path) -> None
         safety_policy=PUBLIC_POLICY,
     )
     ticket = coordinator.begin("https://example.test/a", task_key="download")
-    assert coordinator.cancel(ticket.token).status is VerificationStatus.FAILED
+    assert coordinator.cancel(ticket.token).status is VerificationStatus.CANCELLED
     assert coordinator.retry_cleanup(ticket.token) is False
 
 
@@ -624,7 +650,7 @@ def test_lease_close_failure_keeps_coordinator_capacity_until_retry(
         original(lease)
 
     monkeypatch.setattr(BrowserSessionLease, "close", fail_once)
-    assert coordinator.cancel(ticket.token).status is VerificationStatus.FAILED
+    assert coordinator.cancel(ticket.token).status is VerificationStatus.CANCELLED
     with pytest.raises(VerificationRequired, match="verification_capacity"):
         coordinator.begin("https://other.test/a", task_key="other")
     assert coordinator.retry_cleanup(ticket.token)
