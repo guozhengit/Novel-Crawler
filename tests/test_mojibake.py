@@ -45,6 +45,18 @@ def test_auto_adapter_removes_promotional_phrases_without_dropping_story_text(mo
     assert content == "正文开始。\n正文继续。"
 
 
+def test_auto_adapter_stops_url_cleanup_before_following_story(monkeypatch):
+    monkeypatch.setattr(
+        "novel_crawler.sites.auto.inspect_html",
+        lambda html, url: SiteInspection(content_selector="#content"),
+    )
+    html = '<div id="content"><p>正文一。最新网址：www.example.test。正文二。</p></div>'
+
+    _, content = AutoAdapter().parse_chapter(html, "https://example.test/1")
+
+    assert content == "正文一。正文二。"
+
+
 def test_fetcher_empty_content_error_is_readable_chinese(monkeypatch):
     fetcher = Fetcher(options=FetchOptions(retries=1))
     monkeypatch.setattr(fetcher, "fetch_bytes", lambda url, referer=None: b"")

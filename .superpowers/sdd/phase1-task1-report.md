@@ -15,7 +15,7 @@ Implemented Task 1 within the planned production boundary: `auto.py`, `detector.
 - Kept the existing readable chapter-title regular expression and added acceptance coverage for Chinese numerals, spaced Arabic numerals, and English chapter titles.
 - Centralized the four planned promotional phrases and removed those phrases from paragraphs while preserving surrounding story content.
 - Replaced the two remaining user-facing English fetch errors with readable Chinese.
-- Added a UTF-8 semantic source guard for Python, Markdown, JSON, and YAML. It only checks the explicit known-fragment list and skips deliberately marked fixture lines, negative assertions, and Markdown inline-code examples.
+- Added a UTF-8 semantic source guard for Python, Markdown, JSON, and YAML. It only checks the explicit known-fragment list and skips deliberately marked fixture lines and Markdown inline-code examples.
 
 ## Verification
 
@@ -38,3 +38,9 @@ Implemented Task 1 within the planned production boundary: `auto.py`, `detector.
 - Replaced single-character blacklist entries with encoding-specific multi-character corruption tokens. Added a regression proving legitimate “璇玑” text is accepted.
 - Removed the broad negative-assertion exemption. Only lines explicitly carrying `# mojibake-fixture` and Markdown inline-code examples are exempt.
 - Fresh verification after review: focused pytest 9 passed; full pytest 93 passed; build succeeded; `ruff check novel_crawler tests` passed.
+
+## Second review follow-up
+
+- RED: an inline `最新网址：www.example.test。正文二。` regression proved the previous non-whitespace URL match swallowed following story text.
+- GREEN: URL cleanup now recognizes a structured domain/URL and stops at whitespace or Chinese/ASCII sentence punctuation, preserving both surrounding story segments.
+- Fresh verification is recorded in the task handoff after this report update.
