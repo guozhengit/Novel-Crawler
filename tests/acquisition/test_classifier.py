@@ -69,7 +69,7 @@ class LocalFixtureTransport:
 
     def request(
         self, *, approved_ip: str, original_host: str, port: int, scheme: str, path: str,
-        headers: Mapping[str, str], timeout: float,
+        headers: Mapping[str, str], timeout: float, max_body_bytes: int,
     ) -> TransportResponse:
         assert approved_ip == "93.184.216.34"
         assert original_host == "fixture.example"
@@ -78,7 +78,7 @@ class LocalFixtureTransport:
         try:
             connection.request("GET", path, headers=dict(headers))
             response = connection.getresponse()
-            return TransportResponse(response.status, dict(response.getheaders()), response.read())
+            return TransportResponse(response.status, dict(response.getheaders()), response.read(max_body_bytes + 1))
         finally:
             connection.close()
 

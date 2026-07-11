@@ -38,6 +38,7 @@ class HttpTransport(Protocol):
         path: str,
         headers: Mapping[str, str],
         timeout: float,
+        max_body_bytes: int,
     ) -> TransportResponse: ...
 
 
@@ -54,6 +55,7 @@ class Urllib3PinnedTransport:
         path: str,
         headers: Mapping[str, str],
         timeout: float,
+        max_body_bytes: int,
     ) -> TransportResponse:
         pool: urllib3.HTTPConnectionPool
         if scheme == "https":
@@ -73,8 +75,32 @@ class Urllib3PinnedTransport:
                 redirect=False,
                 retries=False,
                 timeout=urllib3.Timeout(total=timeout),
+                preload_content=False,
             )
-            return TransportResponse(response.status, dict(response.headers), response.data)
+            try:
+                response_headers = dict(response.headers)
+                if response.status in REDIRECT_STATUSES:
+                    return TransportResponse(response.status, response_headers, b"")
+                content_length = next(
+                    (value for name, value in response_headers.items() if name.lower() == "content-length"),
+                    None,
+                )
+                try:
+                    declared_length = int(content_length) if content_length is not None else None
+                except ValueError:
+                    declared_length = None
+                safe_url = redact_url(f"{scheme}://{original_host}:{port}{path}")
+                if declared_length is not None and declared_length > max_body_bytes:
+                    raise AcquisitionError("response_too_large", safe_url, False)
+                body = bytearray()
+                for chunk in response.stream(64 * 1024, decode_content=True):
+                    body.extend(chunk)
+                    if len(body) > max_body_bytes:
+                        raise AcquisitionError("response_too_large", safe_url, False)
+                return TransportResponse(response.status, response_headers, bytes(body))
+            finally:
+                response.release_conn()
+                response.close()
         finally:
             pool.close()
 
@@ -95,19 +121,22 @@ class HttpPageAcquirer:
         timeout: float = 25,
         max_redirects: int = 10,
         user_agent: str = "novel-crawler/0.1",
+        max_body_bytes: int = 10 * 1024 * 1024,
     ) -> None:
         self.transport = transport or Urllib3PinnedTransport()
         self.policy = policy or UrlSafetyPolicy()
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.user_agent = user_agent
+        self.max_body_bytes = max_body_bytes
 
     def fetch(self, url: str) -> PageSnapshot:
-        requested_url = url
+        requested_url = redact_url(url)
         current_url = url
         seen = {current_url}
         redirects: list[RedirectHop] = []
         target: ResolvedTarget | None = None
+        deadline = time.monotonic() + self.timeout
 
         while True:
             try:
@@ -120,13 +149,14 @@ class HttpPageAcquirer:
                 "Host": self._host_header(target.host, target.port, scheme),
                 "User-Agent": self.user_agent,
             }
-            deadline = time.monotonic() + self.timeout
             response: TransportResponse | None = None
             failures: list[Exception] = []
+            deadline_exhausted = False
             for approved_ip in target.addresses:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     failures.append(TimeoutError())
+                    deadline_exhausted = True
                     break
                 try:
                     response = self.transport.request(
@@ -137,15 +167,18 @@ class HttpPageAcquirer:
                         path=self._request_target(parts.path, parts.query),
                         headers=headers,
                         timeout=remaining,
+                        max_body_bytes=self.max_body_bytes,
                     )
                     break
+                except AcquisitionError:
+                    raise
                 except Exception as exc:
                     failures.append(exc)
             if response is None:
                 timed_out = bool(failures) and all(
                     isinstance(exc, (TimeoutError, urllib3.exceptions.TimeoutError)) for exc in failures
                 )
-                code = "timeout" if timed_out else "transport_error"
+                code = "timeout" if timed_out or deadline_exhausted else "transport_error"
                 raise AcquisitionError(code, redact_url(current_url), True) from None
 
             if response.status_code in REDIRECT_STATUSES:
@@ -161,7 +194,7 @@ class HttpPageAcquirer:
                     next_target = self.policy.validate_redirect(current_url, location)
                 except UrlSafetyError as exc:
                     raise AcquisitionError(exc.code, exc.safe_url, False) from None
-                redirects.append(RedirectHop(current_url, response.status_code))
+                redirects.append(RedirectHop(redact_url(current_url), response.status_code))
                 seen.add(next_url)
                 current_url = next_url
                 target = next_target
@@ -171,13 +204,24 @@ class HttpPageAcquirer:
                 recoverable = response.status_code in {408, 429} or response.status_code >= 500
                 raise AcquisitionError(f"http_{response.status_code}", redact_url(current_url), recoverable)
 
+            content_length = self._header(response.headers, "content-length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except ValueError:
+                    declared_length = None
+                if declared_length is not None and declared_length > self.max_body_bytes:
+                    raise AcquisitionError("response_too_large", redact_url(current_url), False)
+            if len(response.body) > self.max_body_bytes:
+                raise AcquisitionError("response_too_large", redact_url(current_url), False)
+
             filtered = {
                 name.lower(): value for name, value in response.headers.items() if name.lower() in RETAINED_HEADERS
             }
             encoding, html = self._decode(response.body, filtered.get("content-type"))
             return PageSnapshot(
                 requested_url=requested_url,
-                final_url=current_url,
+                final_url=redact_url(current_url),
                 status_code=response.status_code,
                 headers=filtered,
                 encoding=encoding,
