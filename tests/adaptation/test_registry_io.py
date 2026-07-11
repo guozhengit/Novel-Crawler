@@ -42,6 +42,9 @@ class FakeWindowsAPI:
             raise RegistryIOError("already exists")
         os.replace(source, destination)
 
+    def delete_private_path(self, path: Path) -> None:
+        path.unlink(missing_ok=True)
+
 
 def test_windows_atomic_write_orders_acl_flush_and_write_through_move(tmp_path: Path) -> None:
     api = FakeWindowsAPI()
@@ -110,6 +113,86 @@ def test_windows_actual_private_acl_round_trip(tmp_path: Path) -> None:
     root = tmp_path / "private"
     io.ensure_directory(root)
     io.verify_private(root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file/directory DACL flags")
+def test_windows_private_acl_round_trip_uses_object_appropriate_ace_flags(tmp_path: Path) -> None:
+    class AclHeader(ctypes.Structure):
+        _fields_ = [
+            ("AclRevision", ctypes.c_ubyte),
+            ("Sbz1", ctypes.c_ubyte),
+            ("AclSize", ctypes.c_ushort),
+            ("AceCount", ctypes.c_ushort),
+            ("Sbz2", ctypes.c_ushort),
+        ]
+
+    def ace_flags(api: WindowsAPI, path: Path) -> list[int]:
+        handle = api._open_path_handle(path, 0x00020000)
+        dacl = wintypes.LPVOID()
+        descriptor = wintypes.LPVOID()
+        try:
+            result = api._advapi32.GetSecurityInfo(
+                handle, 1, api._DACL, None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor)
+            )
+            assert result == 0 and dacl and descriptor
+            acl = ctypes.cast(dacl, ctypes.POINTER(AclHeader)).contents
+            assert acl.AceCount == 2
+            result_flags: list[int] = []
+            for index in range(acl.AceCount):
+                ace = wintypes.LPVOID()
+                assert api._advapi32.GetAce(dacl, index, ctypes.byref(ace))
+                assert ace.value is not None
+                result_flags.append(ctypes.c_ubyte.from_address(ace.value + 1).value)
+            return result_flags
+        finally:
+            if descriptor:
+                api._kernel32.LocalFree(descriptor)
+            api._kernel32.CloseHandle(handle)
+
+    api = WindowsAPI()
+    io = WindowsRegistryIO(api=api)
+    root = tmp_path / "private"
+    target = root / "value.json"
+    io.ensure_directory(root)
+    io.atomic_write(target, b"payload")
+
+    assert ace_flags(api, root) == [0x03, 0x03]
+    assert ace_flags(api, target) == [0x00, 0x00]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows object-specific SDDL")
+@pytest.mark.parametrize(("attributes", "expected_flags"), [(0x10, "OICI"), (0x80, "")])
+def test_windows_acl_application_selects_sddl_from_handle_type(
+    monkeypatch: pytest.MonkeyPatch, attributes: int, expected_flags: str
+) -> None:
+    api = WindowsAPI()
+    captured: list[str] = []
+
+    def get_information(handle: int, information: object) -> bool:
+        information._obj.dwFileAttributes = attributes  # type: ignore[attr-defined]
+        return True
+
+    def convert(sddl: str, revision: int, descriptor: object, size: object) -> bool:
+        captured.append(sddl)
+        descriptor._obj.value = 1  # type: ignore[attr-defined]
+        return True
+
+    def get_dacl(descriptor: object, present: object, dacl: object, defaulted: object) -> bool:
+        present._obj.value = 1  # type: ignore[attr-defined]
+        dacl._obj.value = 1  # type: ignore[attr-defined]
+        return True
+
+    monkeypatch.setattr(api._kernel32, "GetFileInformationByHandle", get_information)
+    monkeypatch.setattr(api._advapi32, "ConvertStringSecurityDescriptorToSecurityDescriptorW", convert)
+    monkeypatch.setattr(api._advapi32, "GetSecurityDescriptorDacl", get_dacl)
+    monkeypatch.setattr(api._advapi32, "SetSecurityInfo", lambda *args: 0)
+    monkeypatch.setattr(api._kernel32, "LocalFree", lambda value: None)
+
+    api._apply_private_handle(123)
+
+    assert captured == [
+        f"O:{api._owner_sid}D:P(A;{expected_flags};FA;;;{api._owner_sid})(A;{expected_flags};FA;;;SY)"
+    ]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DACL exactness")
@@ -341,6 +424,75 @@ def test_windows_write_through_failure_leaves_target_uncommitted(tmp_path: Path)
         io.atomic_write(target, b"secret")
     assert not target.exists()
     assert not list(target.parent.glob("*.tmp"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows anchored failure cleanup")
+@pytest.mark.parametrize("boundary", ["flush", "move"])
+def test_windows_failed_publish_keeps_parent_anchored_through_temp_cleanup(
+    tmp_path: Path, boundary: str
+) -> None:
+    class BrokenPublishAPI(WindowsAPI):
+        failure: str | None = None
+        cleanup_hook: object | None = None
+
+        def flush_file(self, descriptor: int) -> None:
+            if self.failure == "flush":
+                raise RegistryIOError("injected flush failure")
+            super().flush_file(descriptor)
+
+        def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None:
+            if self.failure == "move":
+                raise RegistryIOError("injected move failure")
+            super().move_write_through(source, destination, replace=replace)
+
+        def delete_private_path(self, path: Path) -> None:
+            if callable(self.cleanup_hook):
+                self.cleanup_hook(path)
+            super().delete_private_path(path)
+
+    api = BrokenPublishAPI()
+    io = WindowsRegistryIO(api=api)
+    root = tmp_path / "private"
+    displaced = tmp_path / "displaced-private"
+    external = tmp_path / "external"
+    external.mkdir()
+    io.ensure_directory(root)
+    api.failure = boundary
+    swap_succeeded = False
+    sentinel: Path | None = None
+    junction_created = False
+
+    def before_cleanup(path: Path) -> None:
+        nonlocal swap_succeeded, sentinel, junction_created
+        if path.parent == root and path.name.endswith(".tmp"):
+            sentinel = external / path.name
+            sentinel.write_bytes(b"outside-sentinel")
+            swap_succeeded = bool(api._kernel32.MoveFileExW(str(root), str(displaced), 0x1))
+            if swap_succeeded:
+                linked = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(root), str(external)],
+                    capture_output=True,
+                    check=False,
+                )
+                if linked.returncode != 0:
+                    assert api._kernel32.MoveFileExW(str(displaced), str(root), 0x1)
+                    pytest.skip("directory junction creation unavailable")
+                junction_created = True
+
+    api.cleanup_hook = before_cleanup
+    try:
+        with pytest.raises(RegistryIOError, match=f"injected {boundary}"):
+            io.atomic_write(root / "value.json", b"secret")
+        sentinel_survived = sentinel is not None and sentinel.read_bytes() == b"outside-sentinel"
+    finally:
+        if junction_created:
+            os.rmdir(root)
+        if displaced.exists():
+            assert api._kernel32.MoveFileExW(str(displaced), str(root), 0x1)
+
+    assert not swap_succeeded
+    assert sentinel_survived
+    assert not list(root.glob("*.tmp"))
 
 
 def test_windows_lock_rejects_non_file_target(tmp_path: Path) -> None:

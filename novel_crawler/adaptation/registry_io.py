@@ -40,6 +40,10 @@ class _AceHeader(ctypes.Structure):
     _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", ctypes.c_ushort)]
 
 
+class _FileDispositionInfoEx(ctypes.Structure):
+    _fields_ = [("Flags", wintypes.DWORD)]
+
+
 class RegistryIOError(RuntimeError):
     """A private-access or durability guarantee could not be established."""
 
@@ -319,6 +323,7 @@ class _WindowsAPI(Protocol):
     def create_private_directory(self, path: Path) -> None: ...
     def apply_private_fd(self, descriptor: int) -> None: ...
     def verify_private_fd(self, descriptor: int, path: Path) -> None: ...
+    def delete_private_path(self, path: Path) -> None: ...
 
 
 class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
@@ -358,6 +363,10 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
         ]
         self._kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        self._kernel32.SetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        ]
+        self._kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
         self._kernel32.GetCurrentProcess.restype = wintypes.HANDLE
         self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
             wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.DWORD),
@@ -471,8 +480,12 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         self._apply_private_handle(msvcrt.get_osfhandle(descriptor))
 
     def _apply_private_handle(self, handle: int) -> None:
+        information = _ByHandleFileInformation()
+        if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            raise RegistryIOError("private ACL target verification failed")
+        ace_flags = "OICI" if information.dwFileAttributes & 0x10 else ""
         descriptor = ctypes.c_void_p()
-        sddl = f"O:{self._owner_sid}D:P(A;OICI;FA;;;{self._owner_sid})(A;OICI;FA;;;SY)"
+        sddl = f"O:{self._owner_sid}D:P(A;{ace_flags};FA;;;{self._owner_sid})(A;{ace_flags};FA;;;SY)"
         convert = self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
         if not convert(sddl, 1, ctypes.byref(descriptor), None):
             raise RegistryIOError("private ACL construction failed")
@@ -731,6 +744,32 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
                 raise RegistryIOExistsError("registry revision already exists")
             raise RegistryIOError("write-through atomic move failed")
 
+    def delete_private_path(self, path: Path) -> None:
+        ctypes.set_last_error(0)
+        handle = self._kernel32.CreateFileW(
+            str(path), 0x00030000, 0x3, None, 3, 0x80 | 0x00200000, None
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            if ctypes.get_last_error() in {2, 3}:
+                return
+            raise RegistryIOError("registry temporary file cannot be opened for deletion")
+        try:
+            information = _ByHandleFileInformation()
+            if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+                raise RegistryIOError("registry temporary deletion handle verification failed")
+            if information.dwFileAttributes & (self._REPARSE | 0x10):
+                raise RegistryIOError("registry temporary deletion target is unsafe")
+            if self._final_path(handle) != self._canonical(path):
+                raise RegistryIOError("canonical registry temporary deletion path mismatch")
+            disposition = _FileDispositionInfoEx(0x1)
+            if not self._kernel32.SetFileInformationByHandle(
+                handle, 21, ctypes.byref(disposition), ctypes.sizeof(disposition)
+            ):
+                raise RegistryIOError("registry temporary file deletion failed")
+        finally:
+            self._kernel32.CloseHandle(handle)
+
 
 class _HeldAnchorStream:
     def __init__(self, stream: BufferedRandom, guard: Any) -> None:
@@ -819,44 +858,49 @@ class WindowsRegistryIO:
         descriptor = -1
         try:
             with self._guard(path.parent):
-                self._api.reject_reparse(temporary)
-                secure_open = getattr(self._api, "open_nofollow_fd", None)
-                descriptor = (
-                    secure_open(temporary, write=True, create=True)
-                    if secure_open is not None
-                    else os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-                )
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise RegistryIOError("registry output is not a regular file")
-                _write_all(descriptor, payload)
-                self._api.flush_file(descriptor)
-                apply_fd = getattr(self._api, "apply_private_fd", None)
-                if apply_fd is None:
-                    self._api.apply_private_acl(temporary)
-                    self._api.verify_private_acl(temporary)
-                else:
-                    apply_fd(descriptor)
-                    self._api.verify_private_fd(descriptor, temporary)
-                os.close(descriptor)
-                descriptor = -1
-                self._api.reject_reparse(path)
-                mover = self._api.move_write_through
-                if replace:
-                    mover(temporary, path)
-                else:
-                    mover(temporary, path, replace=False)
-                self._api.verify_private_acl(path)
+                try:
+                    self._api.reject_reparse(temporary)
+                    secure_open = getattr(self._api, "open_nofollow_fd", None)
+                    descriptor = (
+                        secure_open(temporary, write=True, create=True)
+                        if secure_open is not None
+                        else os.open(
+                            temporary,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                            0o600,
+                        )
+                    )
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise RegistryIOError("registry output is not a regular file")
+                    _write_all(descriptor, payload)
+                    self._api.flush_file(descriptor)
+                    apply_fd = getattr(self._api, "apply_private_fd", None)
+                    if apply_fd is None:
+                        self._api.apply_private_acl(temporary)
+                        self._api.verify_private_acl(temporary)
+                    else:
+                        apply_fd(descriptor)
+                        self._api.verify_private_fd(descriptor, temporary)
+                    os.close(descriptor)
+                    descriptor = -1
+                    self._api.reject_reparse(path)
+                    mover = self._api.move_write_through
+                    if replace:
+                        mover(temporary, path)
+                    else:
+                        mover(temporary, path, replace=False)
+                    self._api.verify_private_acl(path)
+                finally:
+                    try:
+                        if descriptor >= 0:
+                            os.close(descriptor)
+                            descriptor = -1
+                    finally:
+                        self._api.delete_private_path(temporary)
         except RegistryIOExistsError:
             raise
         except OSError as exc:
             raise RegistryIOError("atomic durable registry write failed") from exc
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     def read_bounded(self, path: Path, limit: int) -> bytes:
         descriptor = -1
