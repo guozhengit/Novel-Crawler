@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-import posixpath
 import re
 import secrets
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -17,11 +17,13 @@ from novel_crawler.acquisition.classifier import Classification, PageClassifier,
 from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 
+from .config_schema import validate_candidate_selectors
 from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
 from .extractor import CandidateExtractor
 from .fingerprint import fingerprint_html
 from .models import ExtractionResult, FieldKind
-from .scoring import CandidateScorer, ScoringContext
+from .scoring import CandidateScorer, ScoredCandidate, ScoringContext
+from .url_paths import canonical_path
 from .validation import ConfigDraft, MultiPageValidator, PageValidation, ValidationResult
 
 
@@ -33,7 +35,16 @@ class PageAcquirer(Protocol):
 class _Analysis:
     classification: Classification
     extraction: ExtractionResult
+    scored: tuple[ScoredCandidate, ...]
     decision: AdaptationDecision
+
+
+@dataclass
+class _ProbeRunContext:
+    origin: tuple[str, str, int]
+    fingerprint_salt: bytes
+    fetches: int = 0
+    bytes_read: int = 0
 
 
 class ProbeService:
@@ -48,21 +59,17 @@ class ProbeService:
         self.scorer = scorer or CandidateScorer()
         self.decision_policy = decision_policy or DecisionPolicy()
         self.validator = validator or MultiPageValidator()
-        self._fetches = 0
-        self._bytes = 0
-        self._origin: tuple[str, str, int] | None = None
-        self._fingerprint_salt = b""
-
-    def probe(self, book_or_chapter_url: str) -> ValidationResult:
-        self._fetches = self._bytes = 0
-        self._origin = None
-        self._fingerprint_salt = secrets.token_bytes(32)
+    def probe(self, book_or_chapter_url: str, *, overrides: Mapping[str, str] | None = None) -> ValidationResult:
         try:
             try:
-                self._origin = self._origin_key(book_or_chapter_url)
+                context = _ProbeRunContext(self._origin_key(book_or_chapter_url), secrets.token_bytes(32))
+                validated_overrides = dict(overrides or {})
+                validate_candidate_selectors(validated_overrides)
+                if not set(validated_overrides) <= {field.value for field in FieldKind}:
+                    raise ValueError("selector override contains an unknown field")
             except ValueError:
                 return self._safe_failure("probe_invalid_url")
-            start = self._fetch(book_or_chapter_url)
+            start = self._fetch(book_or_chapter_url, context)
             start_analysis = self._analyze(start.snapshot)
             if start_analysis.classification.kind not in {PageKind.BOOK_INDEX, PageKind.CHAPTER}:
                 return self._reject(start_analysis.decision, "page_rejected")
@@ -71,14 +78,14 @@ class ProbeService:
             prefetched: AcquiredPage | None = None
             if start_analysis.classification.kind is PageKind.CHAPTER:
                 prefetched = start
-                index_href = self._candidate_href(start, start_analysis.extraction, FieldKind.INDEX_LINK)
+                index_href = self._selected_href(start, validated_overrides.get(FieldKind.INDEX_LINK.value)) or self._candidate_href(start, start_analysis.extraction, FieldKind.INDEX_LINK)
                 if not index_href:
                     return self._reject(start_analysis.decision, "missing_index_link")
-                index = self._fetch(urljoin(start.navigation_url, index_href))
+                index = self._fetch(urljoin(start.navigation_url, index_href), context)
                 index_analysis = self._analyze(index.snapshot)
             if index_analysis.classification.kind is not PageKind.BOOK_INDEX:
                 return self._reject(index_analysis.decision, "catalog_order_invalid")
-            links = self._chapter_links(index, index_analysis.decision)
+            links = self._chapter_links(index, index_analysis.decision, validated_overrides.get(FieldKind.CHAPTER_LIST.value))
             if len(links) < 2 or len(set(map(self._canonical, links))) != len(links):
                 return self._reject(index_analysis.decision, "catalog_order_invalid")
             if prefetched:
@@ -87,14 +94,14 @@ class ProbeService:
                 if position < 0:
                     return self._reject(index_analysis.decision, "chapter_not_in_catalog")
                 neighbor = position + 1 if position + 1 < len(links) else position - 1
-                first, second = (prefetched, self._fetch(links[neighbor])) if neighbor > position else (self._fetch(links[neighbor]), prefetched)
+                first, second = (prefetched, self._fetch(links[neighbor], context)) if neighbor > position else (self._fetch(links[neighbor], context), prefetched)
             else:
-                first, second = self._fetch(links[0]), self._fetch(links[1])
+                first, second = self._fetch(links[0], context), self._fetch(links[1], context)
             first_analysis, second_analysis = self._analyze(first.snapshot), self._analyze(second.snapshot)
             index_identity = self._book_identity(index.snapshot.html)
-            first_item = self._page_validation(first, first_analysis, second.navigation_url, index_identity)
-            second_item = self._page_validation(second, second_analysis, None, index_identity)
-            draft = self._draft(index, index_analysis.decision, first_analysis, second_analysis, first, second, first_item, second_item)
+            first_item = self._page_validation(first, first_analysis, second.navigation_url, index_identity, validated_overrides)
+            second_item = self._page_validation(second, second_analysis, None, index_identity, validated_overrides)
+            draft = self._draft(index, index_analysis, first_analysis, second_analysis, first, second, first_item, second_item, context, validated_overrides)
             if draft is None:
                 return self._safe_failure("selector_not_reusable")
             return self.validator.validate(first_item, second_item, draft, index_decision=index_analysis.decision.kind)
@@ -103,22 +110,22 @@ class ProbeService:
         except (SelectorSyntaxError, ValueError, TypeError, RuntimeError):
             return self._safe_failure("probe_invalid_content")
 
-    def _fetch(self, url: str) -> AcquiredPage:
-        if self._fetches >= self.max_pages:
+    def _fetch(self, url: str, context: _ProbeRunContext) -> AcquiredPage:
+        if context.fetches >= self.max_pages:
             raise RuntimeError("probe page limit")
         requested_origin = self._origin_key(url)
-        if self._origin is not None and requested_origin != self._origin:
+        if requested_origin != context.origin:
             raise AcquisitionError("cross_origin", self._origin_display(url), False)
-        remaining = self.max_probe_bytes - self._bytes
+        remaining = self.max_probe_bytes - context.bytes_read
         page = self.acquirer.fetch_page(url, max_body_bytes=remaining, locked_origin=self._origin_display(url))
         actual_origin = self._origin_key(page.navigation_url)
-        if actual_origin != self._origin:
+        if actual_origin != context.origin:
             raise AcquisitionError("cross_origin", self._origin_display(page.navigation_url), False)
         size = len(page.snapshot.body)
-        if size > self.max_probe_bytes or self._bytes + size > self.max_probe_bytes:
+        if size > self.max_probe_bytes or context.bytes_read + size > self.max_probe_bytes:
             raise ValueError("probe byte budget")
-        self._fetches += 1
-        self._bytes += size
+        context.fetches += 1
+        context.bytes_read += size
         return page
 
     def _analyze(self, snapshot: PageSnapshot) -> _Analysis:
@@ -127,10 +134,10 @@ class ProbeService:
         context = ScoringContext(classification.kind, snapshot)
         values = tuple(self.scorer.score(item, context) for item in extraction)
         decision = self.decision_policy.decide(classification, ScoredPageBatch(context.sample_id, context.origin_key, classification.kind, values))
-        return _Analysis(classification, extraction, decision)
+        return _Analysis(classification, extraction, values, decision)
 
-    def _chapter_links(self, index: AcquiredPage, decision: AdaptationDecision) -> list[str]:
-        selector = self._selector(decision, FieldKind.CHAPTER_LIST)
+    def _chapter_links(self, index: AcquiredPage, decision: AdaptationDecision, override: str | None = None) -> list[str]:
+        selector = override or self._selector(decision, FieldKind.CHAPTER_LIST)
         if not selector:
             return []
         soup = BeautifulSoup(index.snapshot.html, "lxml")
@@ -145,12 +152,19 @@ class ProbeService:
                 return str(node.get("href"))
         return None
 
-    def _page_validation(self, page: AcquiredPage, analysis: _Analysis, expected_next: str | None, index_identity: str | None) -> PageValidation:
-        content = self._selector(analysis.decision, FieldKind.CONTENT) or ""
+    @staticmethod
+    def _selected_href(page: AcquiredPage, selector: str | None) -> str | None:
+        if not selector:
+            return None
+        nodes = BeautifulSoup(page.snapshot.html, "lxml").select(selector)
+        return str(nodes[0].get("href")) if len(nodes) == 1 and isinstance(nodes[0], Tag) and nodes[0].get("href") else None
+
+    def _page_validation(self, page: AcquiredPage, analysis: _Analysis, expected_next: str | None, index_identity: str | None, overrides: Mapping[str, str]) -> PageValidation:
+        content = overrides.get(FieldKind.CONTENT.value) or self._selector(analysis.decision, FieldKind.CONTENT) or ""
         soup = BeautifulSoup(page.snapshot.html, "lxml")
         nodes = soup.select(content) if content else []
         node = nodes[0] if len(nodes) == 1 and isinstance(nodes[0], Tag) else None
-        next_href = self._candidate_href(page, analysis.extraction, FieldKind.NEXT_LINK)
+        next_href = self._selected_href(page, overrides.get(FieldKind.NEXT_LINK.value)) or self._candidate_href(page, analysis.extraction, FieldKind.NEXT_LINK)
         matches = expected_next is None or next_href is not None and self._canonical(urljoin(page.navigation_url, next_href)) == self._canonical(expected_next)
         fingerprint = self._fingerprint(node) if node else ""
         page_identity = self._book_identity(page.snapshot.html)
@@ -175,7 +189,8 @@ class ProbeService:
         normalized = re.sub(r"\s+", " ", value).strip().casefold()
         return normalized or None
 
-    def _draft(self, index: AcquiredPage, index_decision: AdaptationDecision, first_analysis: _Analysis, second_analysis: _Analysis, first_acquired: AcquiredPage, second_acquired: AcquiredPage, first_page: PageValidation, second_page: PageValidation) -> ConfigDraft | None:
+    def _draft(self, index: AcquiredPage, index_analysis: _Analysis, first_analysis: _Analysis, second_analysis: _Analysis, first_acquired: AcquiredPage, second_acquired: AcquiredPage, first_page: PageValidation, second_page: PageValidation, context: _ProbeRunContext, overrides: Mapping[str, str]) -> ConfigDraft | None:
+        index_decision = index_analysis.decision
         first, second = first_analysis.decision, second_analysis.decision
         all_fields = (*index_decision.fields, *first.fields, *second.fields)
         grouped: dict[FieldKind, list[FieldDecision]] = {}
@@ -189,25 +204,34 @@ class ProbeService:
             return None
         first_soup = BeautifulSoup(first_acquired.snapshot.html, "lxml")
         second_soup = BeautifulSoup(second_acquired.snapshot.html, "lxml")
+        index_soup = BeautifulSoup(index.snapshot.html, "lxml")
+        override_scores = self._override_scores(overrides, index_analysis, first_analysis, second_analysis, index_soup, first_soup, second_soup)
+        if override_scores is None:
+            return None
+        scores.update(override_scores)
         first_selected = first_soup.select(first_page.content_selector)
         second_selected = second_soup.select(second_page.content_selector)
         if len(first_selected) != 1 or len(second_selected) != 1:
             return None
-        reusable = []
-        for selector in sorted(first_candidates & second_candidates):
-            first_nodes = first_soup.select(selector)
-            second_nodes = second_soup.select(selector)
-            if len(first_nodes) == len(second_nodes) == 1 and first_nodes[0] is first_selected[0] and second_nodes[0] is second_selected[0]:
-                reusable.append(selector)
-        if not reusable:
-            return None
-        selectors[FieldKind.CONTENT.value] = reusable[0]
+        if FieldKind.CONTENT.value in overrides:
+            selectors[FieldKind.CONTENT.value] = overrides[FieldKind.CONTENT.value]
+        else:
+            reusable = []
+            for selector in sorted(first_candidates & second_candidates):
+                first_nodes = first_soup.select(selector)
+                second_nodes = second_soup.select(selector)
+                if len(first_nodes) == len(second_nodes) == 1 and first_nodes[0] is first_selected[0] and second_nodes[0] is second_selected[0]:
+                    reusable.append(selector)
+            if not reusable:
+                return None
+            selectors[FieldKind.CONTENT.value] = reusable[0]
+        selectors.update(overrides)
         book_selectors = {key: value for key, value in selectors.items() if key in {"title", "author", "chapter_list"}}
         chapter_selectors = {key: value for key, value in selectors.items() if key not in book_selectors and key != "clean_selector"}
         fingerprints = {
-            "book": fingerprint_html(index.snapshot.html, "book", book_selectors, self._fingerprint_salt),
-            "chapter_first": fingerprint_html(first_acquired.snapshot.html, "chapter", chapter_selectors, self._fingerprint_salt),
-            "chapter_second": fingerprint_html(second_acquired.snapshot.html, "chapter", chapter_selectors, self._fingerprint_salt),
+            "book": fingerprint_html(index.snapshot.html, "book", book_selectors, context.fingerprint_salt),
+            "chapter_first": fingerprint_html(first_acquired.snapshot.html, "chapter", chapter_selectors, context.fingerprint_salt),
+            "chapter_second": fingerprint_html(second_acquired.snapshot.html, "chapter", chapter_selectors, context.fingerprint_salt),
         }
         return ConfigDraft(
             "draft-v1",
@@ -215,8 +239,49 @@ class ProbeService:
             scores,
             selectors,
             fingerprints=fingerprints,
-            fingerprint_salt=self._fingerprint_salt,
+            fingerprint_salt=context.fingerprint_salt,
+            navigation_paths=(index.navigation_url, first_acquired.navigation_url, second_acquired.navigation_url),
         )
+
+    @staticmethod
+    def _override_scores(overrides: Mapping[str, str], index_analysis: _Analysis, first_analysis: _Analysis, second_analysis: _Analysis, index: BeautifulSoup, first: BeautifulSoup, second: BeautifulSoup) -> dict[str, float] | None:
+        book_fields = {"title", "author", "chapter_list"}
+        optional_links = {"prev_link", "next_link", "index_link"}
+        scores: dict[str, float] = {}
+        pairs: tuple[tuple[BeautifulSoup, _Analysis], ...]
+        for field, selector in overrides.items():
+            try:
+                field_kind = FieldKind(field)
+            except ValueError:
+                return None
+            if field == "clean_selector":
+                pairs = ((index, index_analysis), (first, first_analysis), (second, second_analysis))
+            else:
+                pairs = ((index, index_analysis),) if field in book_fields else ((first, first_analysis), (second, second_analysis))
+            soups = tuple(pair[0] for pair in pairs)
+            counts = [len(soup.select(selector)) for soup in soups]
+            if field == "clean_selector":
+                if not any(counts):
+                    return None
+            elif field == "chapter_list":
+                if counts[0] < 2:
+                    return None
+            elif field in optional_links:
+                if not any(counts) or any(count > 1 for count in counts):
+                    return None
+            elif any(count != 1 for count in counts):
+                return None
+            matched_scores = [
+                item.score
+                for (soup, analysis), count in zip(pairs, counts, strict=True)
+                for item in analysis.scored
+                if count and item.candidate.field is field_kind and item.candidate.selector == selector
+            ]
+            if sum(1 for count in counts if count) != len(matched_scores):
+                return None
+            if matched_scores:
+                scores[field] = min(matched_scores)
+        return scores
 
     @staticmethod
     def _origin_key(url: str) -> tuple[str, str, int]:
@@ -245,8 +310,10 @@ class ProbeService:
     @staticmethod
     def _canonical(url: str) -> str:
         parts = urlsplit(url)
-        path = posixpath.normpath(parts.path or "/")
-        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, parts.query, ""))
+        scheme, host, port = ProbeService._origin_key(url)
+        default = 443 if scheme == "https" else 80
+        authority = host + (f":{port}" if port != default else "")
+        return urlunsplit((scheme, authority, canonical_path(parts.path or "/"), parts.query, ""))
 
     @staticmethod
     def _catalog_key(url: str) -> str:

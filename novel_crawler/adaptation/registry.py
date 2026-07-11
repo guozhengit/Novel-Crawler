@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from .config_schema import SiteConfig
 from .registry_io import RegistryIO, RegistryIOError, RegistryIOExistsError, RegistryIOSizeError, default_registry_io
+from .url_paths import canonical_path
 
 _REGISTRY_SCHEMA_VERSION = 1
 _REVISION_NAME = re.compile(r"rev-([0-9]{6})\.json")
@@ -187,14 +188,6 @@ class ConfigRegistry:
             self._io.verify_private(directory)
         self._history: dict[str, list[_Record]] = {}
         with self._global_lock():
-            resolution_stream = self._io.open_lock(self._locks / "resolution.lock")
-            try:
-                resolution_stream.seek(0, os.SEEK_END)
-                if resolution_stream.tell() == 0:
-                    resolution_stream.write(b"\0")
-                    resolution_stream.flush()
-            finally:
-                resolution_stream.close()
             self._recover()
 
     @contextmanager
@@ -221,9 +214,20 @@ class ConfigRegistry:
             raise ValueError("domain is invalid") from None
         if not normalized or any(char in normalized for char in "/@?#:"):
             raise ValueError("domain is invalid")
-        key = f"{self.root.resolve(strict=False)}:resolution"
+        name = _hash(f"resolution:{normalized}")
+        path = self._locks / f"{name}.lock"
+        with self._global_lock():
+            stream = self._io.open_lock(path)
+            try:
+                stream.seek(0, os.SEEK_END)
+                if stream.tell() == 0:
+                    stream.write(b"\0")
+                    stream.flush()
+            finally:
+                stream.close()
+        key = f"{self.root.resolve(strict=False)}:{name}"
         with _bounded_thread_lock(_thread_lock(key), self._lock_timeout):
-            with _FileLock(self._locks / "resolution.lock", self._lock_timeout, self._io):
+            with _FileLock(path, self._lock_timeout, self._io):
                 yield
 
     def register(self, config: SiteConfig) -> RegistryEntry:
@@ -279,7 +283,10 @@ class ConfigRegistry:
             port = parsed.port
         except (UnicodeError, ValueError):
             return None
-        relative = parsed.path or "/"
+        try:
+            relative = canonical_path(parsed.path or "/")
+        except ValueError:
+            return None
         absolute = f"{parsed.scheme}://{domain}" + (f":{port}" if port is not None else "") + relative
         matches: list[tuple[_Record, SiteConfig]] = []
         for records in self._history.values():
@@ -316,6 +323,28 @@ class ConfigRegistry:
             if record is None:
                 raise KeyError(f"unknown config revision {selected_version}")
             loaded = self._load_record(record)
+            if loaded is None:
+                raise RegistryError("stored config revision is unavailable")
+            return loaded
+
+    def load_exact(
+        self,
+        config_id: str,
+        version: int,
+        allowed_status: ConfigStatus | frozenset[ConfigStatus],
+    ) -> SiteConfig:
+        statuses = frozenset({allowed_status}) if isinstance(allowed_status, ConfigStatus) else frozenset(allowed_status)
+        if not statuses:
+            raise ValueError("allowed_status must not be empty")
+        with self._global_lock():
+            self._recover()
+            records = self._history.get(config_id)
+            if not records:
+                raise ConfigConflictError("config identity changed")
+            latest = records[-1]
+            if latest.entry.version != version or latest.entry.status not in statuses:
+                raise ConfigConflictError("config revision or status changed")
+            loaded = self._load_record(latest)
             if loaded is None:
                 raise RegistryError("stored config revision is unavailable")
             return loaded

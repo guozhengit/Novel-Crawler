@@ -27,6 +27,7 @@ from .fingerprint import StructureFingerprint, fingerprint_html
 from .models import ExtractionResult
 from .registry import ConfigConflictError, ConfigRegistry, ConfigStatus, RegistryEntry, RegistryError
 from .scoring import CandidateScorer, ScoredCandidate, ScoringContext
+from .url_paths import canonical_path
 
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 _FINGERPRINT_KINDS = {"book": PageKind.BOOK_INDEX, "chapter_first": PageKind.CHAPTER, "chapter_second": PageKind.CHAPTER}
@@ -44,7 +45,7 @@ class RevalidationStatus(StrEnum):
 class RevalidationResult:
     """Immutable public result containing structural summaries only."""
 
-    __slots__ = ("_checked_at", "_field_scores", "_fingerprint_matches", "_reason_ids", "_status")
+    __slots__ = ("_checked_at", "_entry", "_field_scores", "_fingerprint_matches", "_reason_ids", "_status")
 
     def __init__(
         self,
@@ -53,6 +54,7 @@ class RevalidationResult:
         field_scores: Mapping[str, float],
         fingerprint_matches: Mapping[str, bool],
         checked_at: str,
+        entry: RegistryEntry | None = None,
     ) -> None:
         if not isinstance(status, RevalidationStatus):
             raise TypeError("status must be RevalidationStatus")
@@ -84,6 +86,7 @@ class RevalidationResult:
         object.__setattr__(self, "_field_scores", MappingProxyType({key: float(value) for key, value in scores.items()}))
         object.__setattr__(self, "_fingerprint_matches", MappingProxyType(matches))
         object.__setattr__(self, "_checked_at", checked_at)
+        object.__setattr__(self, "_entry", entry)
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -94,6 +97,7 @@ class RevalidationResult:
     field_scores = property(lambda self: self._field_scores)
     fingerprint_matches = property(lambda self: self._fingerprint_matches)
     checked_at = property(lambda self: self._checked_at)
+    entry = property(lambda self: self._entry)
 
     def __repr__(self) -> str:
         return (
@@ -206,10 +210,11 @@ class ConfigRevalidator:
             decisions_are_high_confidence = all(
                 page.decision.kind is DecisionKind.AUTO_ACCEPT for page in (index, first, second)
             )
+            required_fields = _CORE_FIELDS | ({"clean_selector"} if config.selectors["clean"] else set())
             low = tuple(
                 sorted(
                     key
-                    for key in _CORE_FIELDS
+                    for key in required_fields
                     if scores.get(key, 0.0) < self.minimum_score
                     or scores.get(key, 0.0)
                     < float(config.field_scores.get(key, scores.get(key, 0.0))) - self.minor_drift_tolerance
@@ -220,9 +225,10 @@ class ConfigRevalidator:
             matches = self._fingerprint_matches(config, index, first, second)
             if not matches or not all(matches.values()):
                 return self._stale(entry, ("fingerprint_mismatch",), scores, matches, checked_at)
-            if not self._mark_valid(entry, checked_at):
+            validated_entry = self._mark_valid(entry, checked_at)
+            if validated_entry is None:
                 return self._conflict_result(entry, scores, matches, checked_at)
-            return RevalidationResult(RevalidationStatus.VALID, (), scores, matches, checked_at)
+            return RevalidationResult(RevalidationStatus.VALID, (), scores, matches, checked_at, validated_entry)
         except _AuthRequired:
             return self._stale(entry, ("auth_required",), {}, {}, checked_at)
         except _HardPageError:
@@ -276,7 +282,21 @@ class ConfigRevalidator:
         snapshot = page.acquired.snapshot
         soup = BeautifulSoup(snapshot.html, "lxml")
         for clean_selector in config.selectors["clean"]:
-            soup.select(str(clean_selector))
+            selector = str(clean_selector)
+            nodes = soup.select(selector)
+            if not nodes:
+                continue
+            scored_clean = next(
+                (
+                    item
+                    for item in page.scored
+                    if item.candidate.field.value == "clean_selector" and item.candidate.selector == selector
+                ),
+                None,
+            )
+            if scored_clean is None:
+                raise ValueError("saved clean selector is absent from extracted candidates")
+            scores["clean_selector"] = min(scores.get("clean_selector", 1.0), scored_clean.score)
         for field, selector in selectors.items():
             nodes = soup.select(selector)
             if field == "chapter_list":
@@ -405,18 +425,18 @@ class ConfigRevalidator:
             raise ValueError("selector group is invalid")
         return dict(raw)
 
-    def _mark_valid(self, entry: RegistryEntry, checked_at: str) -> bool:
+    def _mark_valid(self, entry: RegistryEntry, checked_at: str) -> RegistryEntry | None:
         try:
-            self.registry.mark_validated(
+            transitioned = self.registry.mark_validated(
                 entry.config_id,
                 checked_at,
                 expected_version=entry.version,
                 expected_status=entry.status,
             )
-            return True
+            return transitioned or RegistryEntry(entry.config_id, entry.domain, ConfigStatus.ACTIVE, entry.version + 1, entry.created, checked_at)
         except ConfigConflictError:
             self.registry.load(entry.config_id)
-            return False
+            return None
 
     def _stale(
         self,
@@ -427,7 +447,7 @@ class ConfigRevalidator:
         checked_at: str,
     ) -> RevalidationResult:
         try:
-            self.registry.mark_stale(
+            transitioned = self.registry.mark_stale(
                 entry.config_id,
                 expected_version=entry.version,
                 expected_status=entry.status,
@@ -435,11 +455,12 @@ class ConfigRevalidator:
         except ConfigConflictError:
             self.registry.load(entry.config_id)
             reasons = (*reasons, "concurrent_revision")
-        return RevalidationResult(RevalidationStatus.STALE, reasons, scores, matches, checked_at)
+            transitioned = None
+        return RevalidationResult(RevalidationStatus.STALE, reasons, scores, matches, checked_at, transitioned)
 
     def _invalid(self, entry: RegistryEntry, reasons: tuple[str, ...], checked_at: str) -> RevalidationResult:
         try:
-            self.registry.mark_invalid(
+            transitioned = self.registry.mark_invalid(
                 entry.config_id,
                 reasons,
                 expected_version=entry.version,
@@ -451,7 +472,8 @@ class ConfigRevalidator:
             except (KeyError, RegistryError, TypeError, ValueError):
                 pass
             reasons = (*reasons, "concurrent_revision")
-        return RevalidationResult(RevalidationStatus.INVALID, reasons, {}, {}, checked_at)
+            transitioned = None
+        return RevalidationResult(RevalidationStatus.INVALID, reasons, {}, {}, checked_at, transitioned)
 
     def _conflict_result(
         self,
@@ -488,7 +510,7 @@ class ConfigRevalidator:
         parts = urlsplit(url)
         default = 443 if scheme == "https" else 80
         authority = host + (f":{port}" if port != default else "")
-        return f"{scheme}://{authority}{parts.path or '/'}" + (f"?{parts.query}" if parts.query else "")
+        return f"{scheme}://{authority}{canonical_path(parts.path or '/')}" + (f"?{parts.query}" if parts.query else "")
 
 
 __all__ = ["ConfigRevalidator", "RevalidationResult", "RevalidationStatus"]

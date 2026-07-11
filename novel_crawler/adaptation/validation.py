@@ -14,6 +14,7 @@ from novel_crawler.acquisition.classifier import PageKind
 
 from .decision import DecisionKind
 from .fingerprint import StructureFingerprint
+from .url_paths import canonical_path
 
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 
@@ -21,10 +22,11 @@ _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 class ConfigDraft:
     """Draft configuration whose selectors remain process-private."""
 
-    __slots__ = ("_domain", "_fingerprint_salt", "_fingerprints", "_scores", "_selectors", "_version")
+    __slots__ = ("_domain", "_fingerprint_salt", "_fingerprints", "_navigation_paths", "_scores", "_selectors", "_version")
     _selectors: Mapping[str, str]
     _fingerprints: Mapping[str, StructureFingerprint]
     _fingerprint_salt: bytes | None
+    _navigation_paths: tuple[str, ...]
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -39,6 +41,7 @@ class ConfigDraft:
         *,
         fingerprints: Mapping[str, StructureFingerprint] | None = None,
         fingerprint_salt: bytes | None = None,
+        navigation_paths: tuple[str, ...] = (),
     ) -> None:
         if not _SAFE_ID.fullmatch(version) or not domain or "/" in domain:
             raise ValueError("invalid draft identity")
@@ -62,6 +65,10 @@ class ConfigDraft:
             raise ValueError("fingerprints and fingerprint_salt must be supplied together")
         object.__setattr__(self, "_fingerprints", MappingProxyType(values))
         object.__setattr__(self, "_fingerprint_salt", fingerprint_salt)
+        paths = tuple(dict.fromkeys(canonical_path(path) for path in navigation_paths))
+        if paths and len(paths) != 3:
+            raise ValueError("navigation_paths must contain three unique canonical paths")
+        object.__setattr__(self, "_navigation_paths", paths)
 
     version = property(lambda self: self._version)
     domain = property(lambda self: self._domain)
@@ -81,6 +88,7 @@ class ConfigDraft:
             "selectors": dict(self._selectors),
             "fingerprints": dict(self._fingerprints),
             "fingerprint_salt": self._fingerprint_salt,
+            "navigation_paths": self._navigation_paths,
         }
 
 

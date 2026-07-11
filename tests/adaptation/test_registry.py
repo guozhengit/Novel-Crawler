@@ -795,3 +795,37 @@ def test_abrupt_crash_before_revision_replace_leaves_only_ignored_temp(tmp_path:
     assert process.exitcode == 78
     recovered = ConfigRegistry(tmp_path)
     assert recovered.list() == ()
+
+
+def test_load_exact_rejects_revision_or_status_races(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    entry = registry.register(config())
+    assert registry.load_exact(entry.config_id, entry.version, ConfigStatus.ACTIVE).config_id == entry.config_id
+    stale = registry.mark_stale(entry.config_id, expected_version=entry.version)
+    with pytest.raises(ConfigConflictError):
+        registry.load_exact(entry.config_id, entry.version, ConfigStatus.ACTIVE)
+    assert registry.load_exact(stale.config_id, stale.version, ConfigStatus.STALE).config_id == entry.config_id
+
+
+def test_resolution_locks_are_real_and_domain_scoped(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path, lock_timeout=0.1)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with registry.resolution_lock("a.example"):
+            entered.set()
+            release.wait(timeout=2)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    assert entered.wait(timeout=1)
+    with registry.resolution_lock("b.example"):
+        pass
+    with pytest.raises(RegistryLockTimeout, match="timed out"):
+        with ConfigRegistry(tmp_path, lock_timeout=0.05).resolution_lock("a.example"):
+            pass
+    release.set()
+    thread.join(timeout=2)
+    lock_names = {path.name for path in (tmp_path / "locks").glob("*.lock")}
+    assert len([name for name in lock_names if name != "registry.lock"]) >= 2

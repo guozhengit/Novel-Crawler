@@ -264,6 +264,20 @@ def test_missing_fingerprint_baseline_is_stale_not_valid(tmp_path: Path) -> None
     assert registry.list()[0].status is ConfigStatus.STALE
 
 
+def test_saved_clean_selector_must_remain_a_scored_noise_candidate(tmp_path: Path) -> None:
+    noisy = '<aside class="ad-banner">advertisement</aside>'
+    original = {INDEX: _index(wrapper=noisy), C1: _chapter(1, wrapper=noisy), C2: _chapter(2, wrapper=noisy)}
+    payload = _config(original).to_dict(include_sensitive=True)
+    payload["selectors"]["clean"] = [".ad-banner"]  # type: ignore[index]
+    payload["field_scores"]["clean_selector"] = 0.5  # type: ignore[index]
+    registry = ConfigRegistry(tmp_path)
+    entry = registry.register(SiteConfig.from_dict(payload))
+    clean_pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    result = _service(registry, FakeAcquirer(clean_pages)).revalidate(entry, INDEX)
+    assert result.status is RevalidationStatus.STALE
+    assert result.reason_ids == ("score_below_threshold",)
+
+
 def test_budget_and_cross_origin_are_enforced_before_fetch(tmp_path: Path) -> None:
     pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
     registry, entry = _registered(tmp_path, pages)

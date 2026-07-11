@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ from novel_crawler.adaptation.decision import DecisionKind
 from novel_crawler.adaptation.fingerprint import StructureFingerprint
 from novel_crawler.adaptation.registry import ConfigRegistry, ConfigStatus, RegistryEntry
 from novel_crawler.adaptation.revalidation import RevalidationResult, RevalidationStatus
+from novel_crawler.adaptation.url_paths import canonical_path
 from novel_crawler.adaptation.validation import ConfigDraft, ValidationResult
 
 
@@ -29,6 +31,7 @@ def _draft(domain: str = "example.test") -> ConfigDraft:
         {"title": "h1.book", "chapter_list": "nav a", "chapter_title": "h1", "content": "article"},
         fingerprints=fingerprints,
         fingerprint_salt=b"s" * 32,
+        navigation_paths=("/book/1", "/chapter/1", "/chapter/2"),
     )
 
 
@@ -42,7 +45,8 @@ class Probe:
         self.result = result
         self.calls: list[str] = []
 
-    def probe(self, url: str) -> ValidationResult:
+    def probe(self, url: str, *, overrides: object = None) -> ValidationResult:
+        del overrides
         self.calls.append(url)
         return self.result
 
@@ -58,7 +62,27 @@ class Revalidator:
         self.calls += 1
         if self.status is RevalidationStatus.STALE and self.registry is not None:
             self.registry.mark_stale(entry.config_id, expected_version=entry.version)  # type: ignore[attr-defined]
-        return RevalidationResult(self.status, (), {}, {}, "2026-07-11T09:00:00Z")
+        return RevalidationResult(self.status, (), {}, {}, "2026-07-11T09:00:00Z", entry if self.status is RevalidationStatus.VALID else None)  # type: ignore[arg-type]
+
+
+class _ProcessProbe:
+    def __init__(self, counter: object) -> None:
+        self.counter = counter
+
+    def probe(self, url: str, *, overrides: object = None) -> ValidationResult:
+        del url, overrides
+        lock = self.counter.get_lock()  # type: ignore[attr-defined]
+        with lock:
+            self.counter.value += 1  # type: ignore[attr-defined]
+        time.sleep(0.1)
+        return _validation(DecisionKind.AUTO_ACCEPT, _draft())
+
+
+def _process_resolve(root: str, counter: object, barrier: object, queue: object) -> None:
+    registry = ConfigRegistry(root)
+    manager = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), _ProcessProbe(counter))  # type: ignore[arg-type]
+    barrier.wait()  # type: ignore[attr-defined]
+    queue.put(manager.resolve("https://example.test/book/1").kind.value)  # type: ignore[attr-defined]
 
 
 def test_auto_register_then_reuse_without_second_probe(tmp_path: Path) -> None:
@@ -90,6 +114,29 @@ def test_transient_revalidation_never_probes_or_mutates(tmp_path: Path) -> None:
     assert result.kind is ResolutionKind.TRANSIENT_FAILURE
     assert probe.calls == []
     assert registry.list(include_history=True) == before
+
+
+def test_concurrent_revalidation_restarts_entire_resolution_before_reuse(tmp_path: Path) -> None:
+    registry = ConfigRegistry(tmp_path)
+    created = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.AUTO_ACCEPT, _draft()))).resolve("https://example.test/book/1")
+    assert created.config is not None
+
+    class RacingRevalidator:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def revalidate(self, entry: RegistryEntry, url: str) -> RevalidationResult:
+            del url
+            self.calls += 1
+            if self.calls == 1:
+                return RevalidationResult(RevalidationStatus.STALE, ("concurrent_revision",), {}, {}, "2026-07-11T09:00:00Z")
+            return RevalidationResult(RevalidationStatus.VALID, (), {}, {}, "2026-07-11T09:00:00Z", entry)
+
+    racing = RacingRevalidator()
+    probe = Probe(_validation(DecisionKind.REJECT))
+    result = ConfigManager(registry, racing, probe).resolve("https://example.test/book/1")
+    assert result.kind is ResolutionKind.REUSED and result.config is not None
+    assert racing.calls == 2 and probe.calls == []
 
 
 def test_stale_reprobes_and_keeps_old_history_under_new_id(tmp_path: Path) -> None:
@@ -127,13 +174,35 @@ def test_confirmation_expiry_one_use_cancel_and_override_validation(tmp_path: Pa
         manager.confirm(expired.confirmation_token)
 
 
+def test_slow_override_confirmation_does_not_block_unrelated_token_cancel(tmp_path: Path) -> None:
+    manager = ConfigManager(ConfigRegistry(tmp_path), Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.REQUIRE_CONFIRMATION, _draft())))
+    first = manager.resolve("https://example.test/book/1")
+    second = manager.resolve("https://example.test/book/2")
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingProbe(Probe):
+        def probe(self, url: str, *, overrides: object = None) -> ValidationResult:
+            entered.set()
+            release.wait(timeout=2)
+            return super().probe(url, overrides=overrides)
+
+    manager.probe = BlockingProbe(_validation(DecisionKind.REQUIRE_CONFIRMATION, _draft()))
+    thread = threading.Thread(target=manager.confirm, args=(first.confirmation_token, {"content": "article"}))
+    thread.start()
+    assert entered.wait(timeout=1)
+    assert manager.cancel(second.confirmation_token) is True
+    release.set()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+
+
 def test_reject_and_incomplete_baseline_never_write(tmp_path: Path) -> None:
     rejected_root = tmp_path / "rejected"
     registry = ConfigRegistry(rejected_root)
-    before = set(rejected_root.rglob("*"))
     result = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.REJECT))).resolve("https://example.test/book/1")
     assert result.kind is ResolutionKind.REJECTED
-    assert registry.list() == () and set(rejected_root.rglob("*")) == before
+    assert registry.list() == () and not list((rejected_root / "configs").glob("*.json"))
 
     incomplete = ConfigDraft("draft-v1", "example.test", {"content": 0.9}, {"content": "article"})
     result2 = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.AUTO_ACCEPT, incomplete))).resolve("https://example.test/book/1")
@@ -162,8 +231,30 @@ def test_idna_slug_pattern_is_narrow_and_drops_query(tmp_path: Path) -> None:
     ).resolve("https://例子.测试/book/private-title?access_token=private")
     assert result.kind is ResolutionKind.REGISTERED and result.config is not None
     assert result.config.domain == "xn--fsqu00a.xn--0zwm56d"
-    assert result.config.url_patterns[0].template == "/book/{slug}"
+    assert {item.template for item in result.config.url_patterns} == {"/book/{int}", "/chapter/{int}"}
     assert "access_token" not in result.config.to_json(include_sensitive=True)
+
+
+def test_materializes_all_verified_canonical_paths_and_percent_encoded_digits_match(tmp_path: Path) -> None:
+    original = _draft()
+    private = original.to_config()
+    draft = ConfigDraft(
+        original.version,
+        original.domain,
+        original.scores,
+        private["selectors"],
+        fingerprints=private["fingerprints"],
+        fingerprint_salt=private["fingerprint_salt"],
+        navigation_paths=("/book/%31", "/chapter/%31", "/chapter/%32"),
+    )
+    registry = ConfigRegistry(tmp_path)
+    result = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.AUTO_ACCEPT, draft))).resolve("https://example.test/book/%31")
+    assert result.config is not None
+    assert {pattern.template for pattern in result.config.url_patterns} == {"/book/{int}", "/chapter/{int}"}
+    assert registry.lookup("https://example.test/book/%31") is not None
+    assert registry.lookup("https://example.test/chapter/2") is not None
+    assert canonical_path("/book%2fadmin") == "/book%2Fadmin"
+    assert canonical_path("/a/%2e%2e/b") == "/a/%2E%2E/b"
 
 
 def test_resolution_invariants_and_exact_root_pattern() -> None:
@@ -175,6 +266,22 @@ def test_resolution_invariants_and_exact_root_pattern() -> None:
     assert ConfigManager(ConfigRegistry.__new__(ConfigRegistry), Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.REJECT))).resolve("https://example.test/%ZZ").kind is ResolutionKind.REJECTED
 
 
+@pytest.mark.parametrize(
+    ("kind", "kwargs"),
+    [
+        (ResolutionKind.REUSED, {}),
+        (ResolutionKind.REGISTERED, {"confirmation_token": "private"}),
+        (ResolutionKind.CONFIRMATION_REQUIRED, {}),
+        (ResolutionKind.CONFIRMATION_REQUIRED, {"config": object(), "confirmation_token": "private"}),
+        (ResolutionKind.REJECTED, {"confirmation_token": "private"}),
+        (ResolutionKind.TRANSIENT_FAILURE, {"config": object()}),
+    ],
+)
+def test_resolution_rejects_every_invalid_sensitive_handle_combination(kind: ResolutionKind, kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        ConfigResolution(kind, **kwargs)  # type: ignore[arg-type]
+
+
 def test_valid_revalidation_never_falls_back_to_entry_removed_by_concurrent_change() -> None:
     class VanishingRegistry:
         def __init__(self) -> None:
@@ -184,7 +291,7 @@ def test_valid_revalidation_never_falls_back_to_entry_removed_by_concurrent_chan
         def lookup(self, url: str) -> object | None:
             del url
             self.calls += 1
-            return object() if self.calls == 1 else None
+            return RegistryEntry("cfg_abcdefghijklmnop", "example.test", ConfigStatus.ACTIVE, 1, "2026-07-11T09:00:00Z", "2026-07-11T09:00:00Z") if self.calls == 1 else None
 
         def load(self, entry: object) -> object:
             self.loaded = True
@@ -192,7 +299,7 @@ def test_valid_revalidation_never_falls_back_to_entry_removed_by_concurrent_chan
 
     registry = VanishingRegistry()
     result = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.REJECT))).resolve("https://example.test/book/1")  # type: ignore[arg-type]
-    assert result.kind is ResolutionKind.TRANSIENT_FAILURE
+    assert result.kind is ResolutionKind.REJECTED
     assert registry.loaded is False
 
 
@@ -235,6 +342,7 @@ def test_clean_selector_is_materialized_and_confirmation_retry_keeps_config_id(t
         selectors,
         fingerprints=private["fingerprints"],
         fingerprint_salt=private["fingerprint_salt"],
+        navigation_paths=private["navigation_paths"],
     )
 
     class FlakyRegistry:
@@ -252,13 +360,15 @@ def test_clean_selector_is_materialized_and_confirmation_retry_keeps_config_id(t
             return object()
 
     registry = FlakyRegistry()
-    manager = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.REQUIRE_CONFIRMATION, clean_draft)))  # type: ignore[arg-type]
+    probe = Probe(_validation(DecisionKind.REQUIRE_CONFIRMATION, clean_draft))
+    manager = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), probe)  # type: ignore[arg-type]
     pending = manager.resolve("https://example.test/book/1")
     with pytest.raises(RuntimeError):
         manager.confirm(pending.confirmation_token, {"content": "main article"})
     confirmed = manager.confirm(pending.confirmation_token, {"content": "main article"})
     assert confirmed.config is not None and confirmed.config.selectors["clean"] == (".advert",)
     assert len(set(registry.ids)) == 1
+    assert len(probe.calls) == 2
 
 
 def test_registration_that_resolves_to_non_active_revision_is_not_reported_registered() -> None:
@@ -275,7 +385,7 @@ def test_registration_that_resolves_to_non_active_revision_is_not_reported_regis
         Revalidator(RevalidationStatus.VALID),
         Probe(_validation(DecisionKind.AUTO_ACCEPT, _draft())),
     ).resolve("https://example.test/book/1")
-    assert result.kind is ResolutionKind.REJECTED and result.config is None
+    assert result.kind is ResolutionKind.TRANSIENT_FAILURE and result.config is None
 
 
 def test_concurrent_resolve_is_idempotent(tmp_path: Path) -> None:
@@ -294,6 +404,21 @@ def test_concurrent_resolve_is_idempotent(tmp_path: Path) -> None:
     assert len(registry.list()) == 1
     assert len(probe.calls) == 1
     assert {result.config.config_id for result in results if result.config} == {registry.list()[0].config_id}
+
+
+def test_cross_process_managers_probe_and_register_once(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    counter = context.Value("i", 0)
+    barrier = context.Barrier(2)
+    queue = context.Queue()
+    processes = [context.Process(target=_process_resolve, args=(str(tmp_path), counter, barrier, queue)) for _ in range(2)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=15)
+        assert process.exitcode == 0
+    assert counter.value == 1
+    assert {queue.get(timeout=2) for _ in processes} == {ResolutionKind.REGISTERED.value, ResolutionKind.REUSED.value}
 
 
 def test_revoked_never_reused_and_registry_corruption_is_isolated(tmp_path: Path) -> None:

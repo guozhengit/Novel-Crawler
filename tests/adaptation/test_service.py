@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -73,6 +74,40 @@ def test_each_probe_uses_a_fresh_private_salt_and_complete_structural_baseline()
     assert first_private["fingerprint_salt"] != second_private["fingerprint_salt"]
     assert first_private["fingerprints"] != second_private["fingerprints"]
     assert "digest" not in first.to_json() and "salt" not in first.to_json()
+
+
+def test_direct_concurrent_probes_keep_run_state_and_salts_isolated() -> None:
+    pages = {
+        "https://example.test/book": '<h1>Book A</h1><div id="list"><a href="/c1">Chapter 1</a><a href="/c2">Chapter 2</a><a href="/c3">Chapter 3</a></div>',
+        "https://example.test/c1": '<h1>Chapter 1</h1><article><p>' + "a" * 80 + '</p><p>x</p></article><a rel="next" href="/c2">Next</a>',
+        "https://example.test/c2": '<h1>Chapter 2</h1><article><p>' + "b" * 90 + "</p><p>y</p></article>",
+    }
+    service = ProbeService(acquirer=FakeAcquirer(pages))
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(service.probe("https://example.test/book"))) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    private = [result.config_draft.to_config() for result in results if result.config_draft]
+    assert len(private) == 2
+    assert private[0]["fingerprint_salt"] != private[1]["fingerprint_salt"]
+    assert private[0]["fingerprints"] != private[1]["fingerprints"]
+
+
+def test_probe_overrides_are_revalidated_and_recompute_all_fingerprints() -> None:
+    pages = {
+        "https://example.test/book": '<h1>Book A</h1><div id="list"><a href="/c1">Chapter 1</a><a href="/c2">Chapter 2</a><a href="/c3">Chapter 3</a></div>',
+        "https://example.test/c1": '<h1>Chapter 1</h1><article><p>' + "a" * 80 + '</p><p>x</p></article><a rel="next" href="/c2">Next</a>',
+        "https://example.test/c2": '<h1>Chapter 2</h1><article><p>' + "b" * 90 + "</p><p>y</p></article>",
+    }
+    service = ProbeService(acquirer=FakeAcquirer(pages))
+    original = service.probe("https://example.test/book")
+    overridden = service.probe("https://example.test/book", overrides={"content": "article"})
+    assert original.config_draft is not None and overridden.config_draft is not None
+    assert overridden.config_draft.selector("content") == "article"
+    assert overridden.config_draft.to_config()["fingerprint_salt"] != original.config_draft.to_config()["fingerprint_salt"]
+    assert set(overridden.config_draft.to_config()["fingerprints"]) == {"book", "chapter_first", "chapter_second"}
 
 
 def test_probe_rejects_wrong_next_and_never_fetches_more_than_three_pages() -> None:
