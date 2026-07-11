@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -631,6 +632,148 @@ def test_unified_delete_rejects_unsafe_manifest_before_database_commit(tmp_path:
     assert storage.conn.execute("SELECT COUNT(*) FROM deletion_jobs").fetchone()[0] == 0
     assert outside.read_text(encoding="utf-8") == "private"
     storage.close()
+
+
+def test_retryable_cleanup_returns_safe_result_and_manifest_contains_only_relative_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    storage.mark_done(book_id, chapter, "body")
+    original = storage.remove_tree_under
+    failed = False
+
+    def fail_once(root: Path, target: Path) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise PermissionError("locked")
+        original(root, target)
+
+    monkeypatch.setattr(storage, "remove_tree_under", fail_once)
+    result = storage.delete_book(book_id)
+    assert result.state == "pending" and result.cleanup_required and not result.completed
+    assert result.error_code == "deletion_cleanup_retryable"
+    assert str(tmp_path) not in repr(result)
+    assert set(result.to_safe_dict()) == {"job_id", "state", "completed", "cleanup_required", "error_code"}
+    raw = storage.conn.execute("SELECT manifest_json FROM deletion_jobs WHERE id=?", (result.job_id,)).fetchone()[0]
+    assert str(tmp_path) not in raw
+    manifest = json.loads(raw)
+    for key in ("cache_trees", "content_files", "content_trees"):
+        for value in manifest[key]:
+            assert not Path(value).is_absolute()
+            assert ".." not in PurePosixPath(value).parts
+            assert "\\" not in value and "\x00" not in value
+    storage.close()
+
+    reopened = Storage(data / "crawler.db", data)
+    try:
+        assert reopened.conn.execute("SELECT COUNT(*) FROM deletion_jobs").fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+def test_retryable_job_is_attempted_only_once_per_startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    storage.mark_done(book_id, chapter, "body")
+    monkeypatch.setattr(storage, "remove_tree_under", lambda *_args: (_ for _ in ()).throw(PermissionError("locked")))
+    result = storage.delete_book(book_id)
+    initial_attempts = storage.conn.execute("SELECT attempt_count FROM deletion_jobs").fetchone()[0]
+    storage.close()
+
+    calls = 0
+
+    def always_locked(_root: Path, _target: Path) -> None:
+        nonlocal calls
+        calls += 1
+        raise PermissionError("still locked")
+
+    monkeypatch.setattr(Storage, "remove_tree_under", staticmethod(always_locked))
+    reopened = Storage(data / "crawler.db", data)
+    try:
+        row = reopened.conn.execute("SELECT state, attempt_count FROM deletion_jobs WHERE id=?", (result.job_id,)).fetchone()
+        assert row["state"] == "pending"
+        assert row["attempt_count"] == initial_attempts + 1
+        assert calls == 1
+    finally:
+        reopened.close()
+
+
+def test_safety_blocked_job_is_visible_not_auto_retried_and_force_is_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    content = storage.mark_done(book_id, chapter, "body")
+    monkeypatch.setattr(storage, "remove_tree_under", lambda *_args: (_ for _ in ()).throw(PermissionError("locked")))
+    pending = storage.delete_book(book_id)
+    storage.close()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    link = content.parent / "unsafe-link"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    reopened = Storage(data / "crawler.db", data)
+    row = reopened.conn.execute("SELECT state, attempt_count FROM deletion_jobs WHERE id=?", (pending.job_id,)).fetchone()
+    assert row["state"] == "blocked"
+    attempts = row["attempt_count"]
+    reopened.close()
+
+    again = Storage(data / "crawler.db", data)
+    try:
+        row = again.conn.execute("SELECT attempt_count FROM deletion_jobs WHERE id=?", (pending.job_id,)).fetchone()
+        assert row["attempt_count"] == attempts
+        visible = again.retry_deletion_job(pending.job_id)
+        assert visible.state == "blocked" and visible.cleanup_required
+        assert str(tmp_path) not in repr(visible) and str(tmp_path) not in str(visible.to_safe_dict())
+        forced = again.retry_deletion_job(pending.job_id, force=True)
+        assert forced.state == "blocked"
+        assert again.conn.execute("SELECT attempt_count FROM deletion_jobs WHERE id=?", (pending.job_id,)).fetchone()[0] == attempts + 1
+    finally:
+        again.close()
+
+
+@pytest.mark.parametrize(
+    "path", ["/absolute", "C:/absolute", "../escape", "a//b", "", "a\\b", "a\x00b", "a/./b"]
+)
+def test_deletion_manifest_rejects_non_relative_posix_paths(path: str) -> None:
+    encoded = json.dumps({"cache_trees": [], "content_files": [path], "content_trees": [], "version": 1})
+    with pytest.raises(ValueError, match="deletion_manifest_invalid"):
+        Storage._decode_deletion_manifest(encoded)
+
+
+def test_schema_migrates_old_absolute_delete_manifest_without_retaining_private_parent(tmp_path: Path) -> None:
+    data = tmp_path / "private-workspace" / "data"
+    storage = Storage(data / "crawler.db", data)
+    absolute = data / "contents" / "7" / "00001.txt"
+    old = json.dumps(
+        {"cache_trees": [], "content_files": [str(absolute)], "content_trees": [str(absolute.parent)], "version": 1}
+    )
+    storage.conn.execute(
+        "INSERT INTO deletion_jobs(manifest_json,state,error_code) VALUES(?,'blocked','old')", (old,)
+    )
+    storage.conn.commit()
+    storage.close()
+
+    reopened = Storage(data / "crawler.db", data)
+    try:
+        raw = reopened.conn.execute("SELECT manifest_json FROM deletion_jobs").fetchone()[0]
+        assert str(tmp_path) not in raw
+        assert json.loads(raw)["content_files"] == ["7/00001.txt"]
+    finally:
+        reopened.close()
 
 
 def test_secure_content_delete_rejects_paths_outside_root(tmp_path: Path) -> None:

@@ -9,7 +9,9 @@ import stat
 import tempfile
 import threading
 from collections.abc import Iterable
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Literal
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from novel_crawler.core.domains import canonical_domain
@@ -36,6 +38,30 @@ _MAX_DELETION_MANIFEST_BYTES = 1_048_576
 
 class ChapterContentConflict(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class BookDeletionResult:
+    job_id: int | None
+    state: Literal["completed", "pending", "blocked"]
+    error_code: str | None = None
+
+    @property
+    def completed(self) -> bool:
+        return self.state == "completed"
+
+    @property
+    def cleanup_required(self) -> bool:
+        return self.state != "completed"
+
+    def to_safe_dict(self) -> dict[str, int | str | bool | None]:
+        return {
+            "job_id": self.job_id,
+            "state": self.state,
+            "completed": self.completed,
+            "cleanup_required": self.cleanup_required,
+            "error_code": self.error_code,
+        }
 
 
 def canonical_chapter_url(url: str) -> str:
@@ -164,6 +190,7 @@ class Storage:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     manifest_json TEXT NOT NULL CHECK(length(manifest_json) <= 1048576),
                     state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending', 'blocked')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
                     error_code TEXT,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -178,7 +205,52 @@ class Storage:
             self.conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_chapters_book_canonical_url ON chapters(book_id, canonical_url)"
             )
+            deletion_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(deletion_jobs)")}
+            if "attempt_count" not in deletion_columns:
+                self.conn.execute("ALTER TABLE deletion_jobs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+            self._migrate_deletion_job_manifests()
             self.conn.commit()
+
+    def _migrate_deletion_job_manifests(self) -> None:
+        content_root = self.data_dir / "contents"
+        cache_root = self.data_dir / "cache"
+        rows = self.conn.execute("SELECT id, manifest_json FROM deletion_jobs").fetchall()
+        for row in rows:
+            try:
+                value = json.loads(str(row["manifest_json"]))
+                if not isinstance(value, dict) or set(value) != {
+                    "cache_trees",
+                    "content_files",
+                    "content_trees",
+                    "version",
+                }:
+                    raise ValueError("deletion_manifest_invalid")
+                migrated: dict[str, object] = {"version": value["version"]}
+                for key, root in (
+                    ("cache_trees", cache_root),
+                    ("content_files", content_root),
+                    ("content_trees", content_root),
+                ):
+                    items = value[key]
+                    if not isinstance(items, list) or any(not isinstance(item, str) for item in items):
+                        raise ValueError("deletion_manifest_invalid")
+                    migrated[key] = [
+                        self._relative_manifest_path(root, Path(item))
+                        if Path(item).is_absolute()
+                        else item
+                        for item in items
+                    ]
+                encoded = json.dumps(migrated, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+                self._decode_deletion_manifest(encoded)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                encoded = '{"cache_trees":[],"content_files":[],"content_trees":[],"version":1}'
+                self.conn.execute(
+                    """UPDATE deletion_jobs SET manifest_json=?, state='blocked',
+                       error_code='deletion_manifest_migration_blocked', updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (encoded, row["id"]),
+                )
+            else:
+                self.conn.execute("UPDATE deletion_jobs SET manifest_json=? WHERE id=?", (encoded, row["id"]))
 
     def _migrate_chapters(self) -> None:
         columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(chapters)")}
@@ -450,7 +522,7 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def delete_book(self, book_id: int) -> None:
+    def delete_book(self, book_id: int) -> BookDeletionResult:
         job_id: int | None = None
         with self._lock:
             try:
@@ -473,8 +545,9 @@ class Storage:
             except BaseException:
                 self.conn.rollback()
                 raise
-        if job_id is not None:
-            self._process_deletion_job(job_id)
+        if job_id is None:
+            return BookDeletionResult(None, "completed")
+        return self._process_deletion_job(job_id)
 
     def _build_deletion_manifest_locked(self, book_id: int, book: sqlite3.Row) -> dict[str, object]:
         content_root = self.data_dir / "contents"
@@ -493,7 +566,11 @@ class Storage:
             if (key := self._content_path_key(content_root, Path(str(row["content_path"])))) is not None
         }
         files = sorted(
-            {str(path) for path in paths if self._content_path_key(content_root, path) not in shared_keys}
+            {
+                self._relative_manifest_path(content_root, path)
+                for path in paths
+                if self._content_path_key(content_root, path) not in shared_keys
+            }
         )
         tree_candidates = {self.chapter_content_dir(book_id, str(book["title"]))}
         content_root_resolved = content_root.resolve(strict=False)
@@ -509,7 +586,7 @@ class Storage:
         for tree in sorted(tree_candidates, key=str):
             self.validate_tree_under(content_root, tree)
             if not any(self._key_is_under_tree(key, tree.resolve(strict=False)) for key in shared_keys):
-                content_trees.append(str(Path(os.path.abspath(tree))))
+                content_trees.append(self._relative_manifest_path(content_root, tree))
 
         cache_tree = cache_root / str(book["site"]) / safe_filename(str(book["title"]))
         cache_trees: list[str] = []
@@ -520,39 +597,62 @@ class Storage:
         )
         if not cache_shared:
             self.validate_tree_under(cache_root, cache_tree)
-            cache_trees.append(str(Path(os.path.abspath(cache_tree))))
+            cache_trees.append(self._relative_manifest_path(cache_root, cache_tree))
         count = len(files) + len(content_trees) + len(cache_trees)
         if count > _MAX_DELETION_PATHS:
             raise ValueError("deletion_manifest_too_many_paths")
         return {"cache_trees": cache_trees, "content_files": files, "content_trees": content_trees, "version": 1}
 
     def _retry_deletion_jobs(self) -> None:
-        processed = 0
-        while processed < 10_000:
-            with self._lock:
-                rows = self.conn.execute(
-                    "SELECT id FROM deletion_jobs WHERE state='pending' ORDER BY id LIMIT 1000"
-                ).fetchall()
-            if not rows:
-                return
-            for row in rows:
-                self._process_deletion_job(int(row["id"]))
-                processed += 1
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id FROM deletion_jobs WHERE state='pending' ORDER BY id LIMIT 1000"
+            ).fetchall()
+        for row in rows:
+            self._process_deletion_job(int(row["id"]))
 
-    def _process_deletion_job(self, job_id: int) -> bool:
+    def retry_deletion_job(self, job_id: int, *, force: bool = False) -> BookDeletionResult:
+        if isinstance(job_id, bool) or not isinstance(job_id, int) or job_id <= 0:
+            raise ValueError("deletion_job_id_invalid")
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT state, error_code FROM deletion_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return BookDeletionResult(job_id, "completed")
+            if row["state"] == "blocked" and not force:
+                return BookDeletionResult(job_id, "blocked", str(row["error_code"]) if row["error_code"] else None)
+            if row["state"] == "blocked":
+                self.conn.execute(
+                    "UPDATE deletion_jobs SET state='pending', error_code=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (job_id,),
+                )
+                self.conn.commit()
+        return self._process_deletion_job(job_id)
+
+    def _process_deletion_job(self, job_id: int) -> BookDeletionResult:
         try:
             with self._lock:
+                self.conn.execute(
+                    """UPDATE deletion_jobs SET attempt_count=attempt_count+1, updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND state='pending'""",
+                    (job_id,),
+                )
+                self.conn.commit()
                 row = self.conn.execute(
                     "SELECT manifest_json FROM deletion_jobs WHERE id=? AND state='pending'", (job_id,)
                 ).fetchone()
             if row is None:
-                return False
+                return BookDeletionResult(job_id, "completed")
             manifest = self._decode_deletion_manifest(str(row["manifest_json"]))
             content_root = self.data_dir / "contents"
             cache_root = self.data_dir / "cache"
-            files = [self._validate_content_path(content_root, Path(value)) for value in manifest["content_files"]]
-            content_trees = [Path(value) for value in manifest["content_trees"]]
-            cache_trees = [Path(value) for value in manifest["cache_trees"]]
+            files = [
+                self._validate_content_path(content_root, self._join_manifest_path(content_root, value))
+                for value in manifest["content_files"]
+            ]
+            content_trees = [self._join_manifest_path(content_root, value) for value in manifest["content_trees"]]
+            cache_trees = [self._join_manifest_path(cache_root, value) for value in manifest["cache_trees"]]
             for tree in content_trees:
                 self.validate_tree_under(content_root, tree)
             for tree in cache_trees:
@@ -568,16 +668,30 @@ class Storage:
             with self._lock:
                 self.conn.execute("DELETE FROM deletion_jobs WHERE id=? AND state='pending'", (job_id,))
                 self.conn.commit()
-            return True
-        except Exception:
+            return BookDeletionResult(job_id, "completed")
+        except OSError:
             with self._lock:
                 self.conn.execute(
-                    """UPDATE deletion_jobs SET state='blocked', error_code='deletion_cleanup_failed',
+                    """UPDATE deletion_jobs SET state='pending', error_code='deletion_cleanup_retryable',
                        updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                     (job_id,),
                 )
                 self.conn.commit()
-            return False
+            return BookDeletionResult(job_id, "pending", "deletion_cleanup_retryable")
+        except ValueError:
+            return self._block_deletion_job(job_id, "deletion_safety_blocked")
+        except Exception:
+            return self._block_deletion_job(job_id, "deletion_cleanup_failed")
+
+    def _block_deletion_job(self, job_id: int, error_code: str) -> BookDeletionResult:
+        with self._lock:
+            self.conn.execute(
+                """UPDATE deletion_jobs SET state='blocked', error_code=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (error_code, job_id),
+            )
+            self.conn.commit()
+        return BookDeletionResult(job_id, "blocked", error_code)
 
     @staticmethod
     def _decode_deletion_manifest(encoded: str) -> dict[str, list[str] | int]:
@@ -595,13 +709,38 @@ class Storage:
         for key in ("cache_trees", "content_files", "content_trees"):
             items = value[key]
             if not isinstance(items, list) or any(
-                not isinstance(item, str) or not item or len(item) > 4096 for item in items
+                not isinstance(item, str) or len(item) > 4096 or not Storage._valid_manifest_relative_path(item)
+                for item in items
             ):
                 raise ValueError("deletion_manifest_invalid")
             total += len(items)
         if total > _MAX_DELETION_PATHS:
             raise ValueError("deletion_manifest_too_many_paths")
         return value
+
+    @staticmethod
+    def _valid_manifest_relative_path(value: str) -> bool:
+        if not value or "\x00" in value or "\\" in value or ":" in value or "//" in value or value.endswith("/"):
+            return False
+        path = PurePosixPath(value)
+        return not path.is_absolute() and all(part not in {"", ".", ".."} for part in value.split("/"))
+
+    @staticmethod
+    def _join_manifest_path(root: Path, value: str) -> Path:
+        if not Storage._valid_manifest_relative_path(value):
+            raise ValueError("deletion_manifest_invalid")
+        return root.joinpath(*PurePosixPath(value).parts)
+
+    def _relative_manifest_path(self, root: Path, path: Path) -> str:
+        root_resolved = root.resolve(strict=False)
+        resolved = path.resolve(strict=False)
+        try:
+            relative = resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            raise ValueError("deletion_manifest_path_outside_root") from None
+        if not self._valid_manifest_relative_path(relative):
+            raise ValueError("deletion_manifest_invalid")
+        return relative
 
     def has_other_book(self, book_id: int, title: str, *, site: str | None = None) -> bool:
         with self._lock:

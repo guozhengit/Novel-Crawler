@@ -6,7 +6,7 @@ from novel_crawler.core.dedup import Deduplicator, DedupResult
 from novel_crawler.core.fetcher import Fetcher
 from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.proxy_pool import ProxyPool
-from novel_crawler.core.storage import Storage
+from novel_crawler.core.storage import BookDeletionResult, Storage
 from novel_crawler.core.title_fixer import TitleFixer, TitleFixResult
 from novel_crawler.core.utils import ensure_dir, progress_bar, safe_filename
 from novel_crawler.core.validator import ValidationReport, Validator
@@ -85,8 +85,8 @@ class CrawlerService:
     def list_books(self) -> list[dict[str, object]]:
         return self.storage.list_books()
 
-    def delete_book(self, book_id: int) -> None:
-        self.storage.delete_book(book_id)
+    def delete_book(self, book_id: int) -> BookDeletionResult:
+        return self.storage.delete_book(book_id)
 
     def validate(self, book_id: int) -> ValidationReport:
         return Validator(self.storage).validate(book_id)
