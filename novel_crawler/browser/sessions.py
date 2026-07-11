@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -23,6 +24,11 @@ from novel_crawler.core.domains import canonical_domain
 
 _SCHEMA_VERSION = 1
 _HASH_NAME = re.compile(r"[0-9a-f]{64}")
+_NORMAL_METADATA_FIELDS = frozenset({
+    "binding", "created", "domain", "last_used", "profile_key", "schema_version",
+    "session_id", "size_bucket", "status",
+})
+_DELETING_METADATA_FIELDS = _NORMAL_METADATA_FIELDS | {"tombstone_id"}
 _PROCESS_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 _PROCESS_LOCKS_GUARD = threading.Lock()
 
@@ -99,6 +105,7 @@ class _DomainLock:
         self._thread_lock = _process_lock(str(path.absolute()))
         self._thread_locked = False
         self._os_locked = False
+        self._identity: tuple[int, int] | None = None
 
     def acquire(self) -> None:
         deadline = time.monotonic() + self._timeout
@@ -106,16 +113,22 @@ class _DomainLock:
             raise SessionLockTimeout("lock_timeout")
         self._thread_locked = True
         try:
-            self._stream = self._io.open_lock(self._path)
-            self._stream.seek(0, os.SEEK_END)
-            if self._stream.tell() == 0:
-                self._stream.write(b"\0")
-                self._stream.flush()
-                os.fsync(self._stream.fileno())
+            self._open_stream()
             while True:
                 try:
                     self._try_lock()
                     self._os_locked = True
+                    if not self.identity_matches():  # pragma: no cover - POSIX ABA regression
+                        self.release()  # pragma: no cover - POSIX ABA regression
+                        if time.monotonic() >= deadline:  # pragma: no cover - POSIX ABA regression
+                            raise SessionLockTimeout("lock_generation_changed") from None
+                        if not self._thread_lock.acquire(  # pragma: no cover - POSIX ABA regression
+                            timeout=max(0.001, deadline - time.monotonic())
+                        ):
+                            raise SessionLockTimeout("lock_timeout") from None
+                        self._thread_locked = True  # pragma: no cover - POSIX ABA regression
+                        self._open_stream()  # pragma: no cover - POSIX ABA regression
+                        continue  # pragma: no cover - POSIX ABA regression
                     return
                 except (BlockingIOError, OSError):
                     if time.monotonic() >= deadline:
@@ -124,6 +137,14 @@ class _DomainLock:
         except Exception:
             self.release()
             raise
+
+    def _open_stream(self) -> None:
+        self._stream = self._io.open_lock(self._path)
+        self._stream.seek(0, os.SEEK_END)
+        if self._stream.tell() == 0:
+            self._stream.write(b"\0")
+            self._stream.flush()
+            os.fsync(self._stream.fileno())
 
     def _try_lock(self) -> None:
         assert self._stream is not None
@@ -151,10 +172,26 @@ class _DomainLock:
             finally:
                 self._os_locked = False
                 self._stream.close()
-                self._stream = None
+            self._stream = None
+            self._identity = None
         if self._thread_locked:
             self._thread_locked = False
             self._thread_lock.release()
+
+    def identity_matches(self) -> bool:
+        if self._stream is None:  # pragma: no cover - defensive internal call
+            return False  # pragma: no cover
+        held = os.fstat(self._stream.fileno())
+        self._identity = self._identity or (held.st_dev, held.st_ino)
+        try:
+            current = os.stat(self._path, follow_symlinks=False)
+        except OSError:  # pragma: no cover - POSIX unlink fence
+            return False  # pragma: no cover
+        return self._identity == (current.st_dev, current.st_ino) and stat.S_ISREG(current.st_mode)
+
+    @property
+    def identity(self) -> tuple[int, int] | None:
+        return self._identity
 
 
 class BrowserSessionLease:
@@ -288,14 +325,20 @@ class BrowserSessionStore:
             preallocation.acquire()
         except (RegistryIOError, OSError):
             raise BrowserSessionError("allocation_io", canonical) from None
-        preview = self._read_info(metadata_path, quarantine=True)
+        try:
+            preview = self._read_info(metadata_path, quarantine=False)
+        except BrowserSessionError as exc:
+            if exc.code not in {"metadata_corrupt", "metadata_io"}:
+                preallocation.release()
+                raise
+            preview = None
         if preview is not None and preview.status is not BrowserSessionStatus.STALE:
             preallocation.release()
             allocation = None
         lock = self._lock(canonical, timeout)
         try:
             _, profile, metadata, _ = self._paths(canonical)
-            info = self._read_info(metadata, quarantine=True)
+            info = self._read_info(metadata, quarantine=allocation is not None)
             if info is not None and info.domain != canonical:
                 self._quarantine_metadata(metadata)
                 info = None
@@ -336,19 +379,31 @@ class BrowserSessionStore:
                     size_bucket=self._size_bucket(size),
                 )
                 self._write_info(metadata, in_use)
+                committed = self._read_info(metadata, quarantine=False)
+                if (
+                    not lock.identity_matches()
+                    or committed is None
+                    or committed.session_id != in_use.session_id
+                ):
+                    lock.release()
+                    return self.acquire(canonical, timeout)
                 return BrowserSessionLease(self, in_use, profile, lock)
             finally:
                 if allocation is not None:
                     allocation.release()
-        except (RegistryIOError, OSError):
+        except (RegistryIOError, OSError):  # pragma: no cover - injected cleanup failure
+            identity = lock.identity
+            lock.release()
             if allocation is not None:
                 allocation.release()
-            lock.release()
-            raise BrowserSessionError("storage_io", canonical) from None
+            self._cleanup_failed_lock(canonical, identity)
+            raise BrowserSessionError("storage_io", canonical) from None  # pragma: no cover
         except Exception:
+            identity = lock.identity
+            lock.release()
             if allocation is not None:
                 allocation.release()
-            lock.release()
+            self._cleanup_failed_lock(canonical, identity)
             raise
 
     def _release(self, leased: BrowserSessionInfo) -> None:
@@ -364,12 +419,17 @@ class BrowserSessionStore:
         canonical = canonical_domain(domain)
         _, _, metadata_path, _ = self._paths(canonical)
         allocation = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
-        allocation.acquire()
         try:
+            allocation.acquire()
             if not metadata_path.exists():
                 return None
+        except (BrowserSessionError, RegistryIOError, OSError):
+            raise BrowserSessionError("storage_io", canonical) from None
         finally:
-            allocation.release()
+            try:
+                allocation.release()
+            except (RegistryIOError, OSError):
+                raise BrowserSessionError("storage_io", canonical) from None
         lock = self._lock(canonical)
         try:
             _, _, metadata, _ = self._paths(canonical)
@@ -421,8 +481,11 @@ class BrowserSessionStore:
         if confirmation is not True:
             raise SessionConfirmationError("confirmation_required", canonical)
         allocation = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
-        allocation.acquire()
-        allocation.release()
+        try:
+            allocation.acquire()
+            allocation.release()
+        except (BrowserSessionError, RegistryIOError, OSError):
+            raise BrowserSessionError("storage_io", canonical) from None
         lock = self._lock(canonical)
         try:
             _, profile, metadata, _ = self._paths(canonical)
@@ -441,15 +504,20 @@ class BrowserSessionStore:
         except (RegistryIOError, OSError):
             raise BrowserSessionError("deletion_io", canonical) from None
         finally:
-            lock.release()
-            cleanup = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
-            cleanup.acquire()
+            primary_active = sys.exc_info()[0] is not None
             try:
-                _, profile, metadata, lock_path = self._paths(canonical)
-                if not profile.exists() and not metadata.exists():
-                    self._delete_lock_file(lock_path)
-            finally:
-                cleanup.release()
+                lock.release()
+                cleanup = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
+                cleanup.acquire()
+                try:
+                    _, profile, metadata, lock_path = self._paths(canonical)
+                    if not profile.exists() and not metadata.exists():
+                        self._delete_lock_file(lock_path)
+                finally:
+                    cleanup.release()
+            except (BrowserSessionError, RegistryIOError, OSError):
+                if not primary_active:
+                    raise BrowserSessionError("clear_cleanup_failed", canonical) from None
 
     def _write_info(self, path: Path, info: BrowserSessionInfo) -> None:
         profile_key = _domain_key(info.domain)
@@ -507,6 +575,9 @@ class BrowserSessionStore:
         try:
             value = json.loads(payload)
             if not isinstance(value, dict) or value.get("schema_version") != _SCHEMA_VERSION:
+                raise ValueError
+            expected_fields = _DELETING_METADATA_FIELDS if value.get("status") == "deleting" else _NORMAL_METADATA_FIELDS
+            if set(value) != expected_fields:
                 raise ValueError
             if value.get("status") == "deleting":
                 info, tombstone_id = self._validate_deleting(path, value)
@@ -626,6 +697,15 @@ class BrowserSessionStore:
             if seen > self._max_scan_entries:
                 raise SessionLimitError("recovery_scan_limit")
             self._io.secure_remove_tree(trash, self._max_delete_entries)
+        tracked = {path.stem for path in self._metadata.glob("*.json")} | {
+            path.name for path in self._profiles.iterdir()
+        }
+        for lock_path in self._locks.glob("*.lock"):
+            seen += 1
+            if seen > self._max_scan_entries:
+                raise SessionLimitError("recovery_scan_limit")
+            if lock_path.name != "allocation.lock" and lock_path.stem not in tracked:
+                self._delete_lock_file(lock_path)
 
     def _quarantine_metadata(self, path: Path) -> None:
         if not path.exists():
@@ -652,7 +732,25 @@ class BrowserSessionStore:
             path.unlink()
         except FileNotFoundError:
             return
+        except PermissionError:
+            # An already-open waiter owns this generation. Its identity fence
+            # prevents it from crossing into a later recreated lock.
+            return
         self._sync_directory(path.parent)
+
+    def _cleanup_failed_lock(self, domain: str, expected: tuple[int, int] | None) -> None:
+        cleanup = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
+        try:
+            cleanup.acquire()
+            _, profile, metadata, lock_path = self._paths(domain)
+            if not profile.exists() and not metadata.exists() and expected is not None:
+                current = os.stat(lock_path, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) == expected:
+                    self._delete_lock_file(lock_path)
+        except (BrowserSessionError, RegistryIOError, OSError):  # pragma: no cover - best-effort cleanup
+            pass  # pragma: no cover
+        finally:
+            cleanup.release()
 
     def _verify_profile(self, profile: Path) -> None:
         try:
@@ -687,10 +785,6 @@ class BrowserSessionStore:
             raise BrowserSessionError("profile_remove_unsafe") from None
 
     @staticmethod
-    def _is_reparse(metadata: os.stat_result) -> bool:
-        return bool(getattr(metadata, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-
-    @staticmethod
     def _sync_directory(path: Path) -> None:
         if os.name == "nt":
             return
@@ -708,6 +802,7 @@ class BrowserSessionStore:
             (self._profiles, "domain:"),
             (self._tombstones, "tombstone:"),
             (self._trash, "trash:"),
+            (self._quarantine, "quarantine:"),
         ):
             for path in directory.iterdir():
                 count += 1

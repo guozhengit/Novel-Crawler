@@ -23,6 +23,7 @@ from novel_crawler.browser.sessions import (
     SessionConflictError,
     SessionLimitError,
     SessionLockTimeout,
+    _DomainLock,
 )
 
 
@@ -498,6 +499,34 @@ def test_exact_domain_locks_are_bounded_by_tracked_sessions(tmp_path: Path) -> N
     assert {path.name for path in (store.root / "locks").iterdir()} <= {"allocation.lock"}
 
 
+def test_failed_domain_allocations_leave_no_lock_artifacts(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions", max_sessions=1)
+    with store.acquire("kept.example"):
+        pass
+    for index in range(200):
+        with pytest.raises(SessionLimitError):
+            store.acquire(f"rejected-{index}.example")
+    lock_names = {path.name for path in (store.root / "locks").iterdir()}
+    assert len(lock_names) == 2
+    assert "allocation.lock" in lock_names
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows denies unlink of open locks")
+def test_lock_generation_identity_detects_unlink_and_recreate(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    with store.acquire("generation.example"):
+        pass
+    _, _, _, path = store._paths("generation.example")
+    lock = _DomainLock(path, 1, store._io)
+    lock.acquire()
+    assert lock.identity_matches()
+    path.unlink()
+    replacement = store._io.open_lock(path)
+    replacement.close()
+    assert not lock.identity_matches()
+    lock.release()
+
+
 def test_interrupted_transactional_clear_is_completed_on_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -697,6 +726,23 @@ def test_invalid_deletion_binding_is_quarantined(tmp_path: Path) -> None:
     with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
         store.get("deleting.example")
     assert not list((store.root / "quarantine").glob("*.bad"))
+
+
+def test_unknown_sensitive_metadata_fields_are_rejected_then_quarantined_under_lock(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    with store.acquire("schema.example"):
+        pass
+    metadata = next((store.root / "metadata").glob("*.json"))
+    value = json.loads(metadata.read_bytes())
+    value["cookie"] = "secret"
+    value["profile_path"] = "C:/private"
+    metadata.write_text(json.dumps(value), encoding="ascii")
+    with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
+        store.get("schema.example")
+    assert not list((store.root / "quarantine").glob("*.bad"))
+    with store.acquire("schema.example"):
+        pass
+    assert list((store.root / "quarantine").glob("*.bad"))
 
 
 def test_nonquarantining_read_and_profile_escape_fail_safely(tmp_path: Path) -> None:
