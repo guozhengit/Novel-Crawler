@@ -305,6 +305,8 @@ def test_books_with_same_title_never_share_chapter_files(tmp_path: Path) -> None
         first_path = storage.mark_done(first_id, first, "first body")
         second_path = storage.mark_done(second_id, second, "second body")
         assert first_path != second_path
+        assert first_path.parent.name == str(first_id)
+        assert second_path.parent.name == str(second_id)
         assert first_path.read_text(encoding="utf-8") == "first body"
         assert second_path.read_text(encoding="utf-8") == "second body"
 
@@ -322,7 +324,13 @@ def test_crawler_delete_removes_unique_and_safe_legacy_content_without_touching_
     second_path = storage.mark_done(second_id, second, "second")
     legacy = data / "contents" / "same"
     legacy.mkdir(parents=True)
-    (legacy / "old.txt").write_text("legacy", encoding="utf-8")
+    legacy_file = legacy / "old.txt"
+    legacy_file.write_text("legacy", encoding="utf-8")
+    storage.conn.execute(
+        "INSERT INTO chapters(book_id, chapter_index, title, url, canonical_url, status, content_path) VALUES(?,?,?,?,?,'done',?)",
+        (second_id, 2, "legacy", "https://two.example/2", "https://two.example/2", str(legacy_file)),
+    )
+    storage.conn.commit()
     ctx = RuntimeContext("test", "3.12", tmp_path, data, data / "cache", data / "output", data / "crawler.db", [], [], {}, {})
     service = CrawlerService.__new__(CrawlerService)
     service.ctx = ctx
@@ -337,6 +345,110 @@ def test_crawler_delete_removes_unique_and_safe_legacy_content_without_touching_
         assert not legacy.exists()
     finally:
         storage.close()
+
+
+def test_delete_uses_book_id_directory_after_title_changes(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    original = Book(title="old title", url="https://example.test/book", site="site")
+    book_id = storage.upsert_book(original)
+    chapter = Chapter(1, "one", "https://example.test/1")
+    storage.upsert_chapters(book_id, [chapter])
+    path = storage.mark_done(book_id, chapter, "body")
+    storage.upsert_book(Book(title="new title", url=original.url, site=original.site))
+    ctx = RuntimeContext("test", "3.12", tmp_path, data, data / "cache", data / "output", data / "crawler.db", [], [], {}, {})
+    service = CrawlerService.__new__(CrawlerService)
+    service.ctx = ctx
+    service.storage = storage
+    try:
+        service.delete_book(book_id)
+        assert not path.exists()
+        assert not (data / "contents" / str(book_id)).exists()
+    finally:
+        storage.close()
+
+
+def test_delete_legacy_paths_and_cache_use_safe_filename_collision_key(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    first_id = storage.upsert_book(Book(title="a/b", url="https://one.example/book", site="same"))
+    second_id = storage.upsert_book(Book(title="a:b", url="https://two.example/book", site="same"))
+    legacy = data / "contents" / "a_b"
+    legacy.mkdir(parents=True)
+    first_file, second_file = legacy / "first.txt", legacy / "second.txt"
+    first_file.write_text("first", encoding="utf-8")
+    second_file.write_text("second", encoding="utf-8")
+    for book_id, index, url, path in (
+        (first_id, 1, "https://one.example/1", first_file),
+        (second_id, 1, "https://two.example/1", second_file),
+    ):
+        storage.conn.execute(
+            "INSERT INTO chapters(book_id,chapter_index,title,url,canonical_url,status,content_path) VALUES(?,?,'x',?,?,'done',?)",
+            (book_id, index, url, url, str(path)),
+        )
+    storage.conn.commit()
+    cache = data / "cache" / "same" / "a_b"
+    cache.mkdir(parents=True)
+    (cache / "shared.html").write_text("cache", encoding="utf-8")
+    ctx = RuntimeContext("test", "3.12", tmp_path, data, data / "cache", data / "output", data / "crawler.db", [], [], {}, {})
+    service = CrawlerService.__new__(CrawlerService)
+    service.ctx = ctx
+    service.storage = storage
+    try:
+        service.delete_book(first_id)
+        assert not first_file.exists()
+        assert second_file.read_text(encoding="utf-8") == "second"
+        assert cache.exists()
+        service.delete_book(second_id)
+        assert not second_file.exists()
+        assert not legacy.exists()
+        assert not cache.exists()
+    finally:
+        storage.close()
+
+
+def test_delete_content_path_outside_root_fails_closed(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    outside = tmp_path / "private.txt"
+    outside.write_text("private", encoding="utf-8")
+    storage.conn.execute(
+        "INSERT INTO chapters(book_id,chapter_index,title,url,canonical_url,status,content_path) VALUES(?,1,'x','https://example.test/1','https://example.test/1','done',?)",
+        (book_id, str(outside)),
+    )
+    storage.conn.commit()
+    with pytest.raises(ValueError, match="content_path_outside_root"):
+        storage.delete_book_content(book_id, "book")
+    assert outside.read_text(encoding="utf-8") == "private"
+    assert storage.get_book(book_id).book_id == book_id
+    storage.close()
+
+
+def test_delete_content_symlink_fails_closed(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    root = data / "contents"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    private = outside / "private.txt"
+    private.write_text("private", encoding="utf-8")
+    link = root / "linked"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlink creation is unavailable")
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    storage.conn.execute(
+        "INSERT INTO chapters(book_id,chapter_index,title,url,canonical_url,status,content_path) VALUES(?,1,'x','https://example.test/1','https://example.test/1','done',?)",
+        (book_id, str(link / "private.txt")),
+    )
+    storage.conn.commit()
+    with pytest.raises(ValueError, match="content_path_(outside_root|reparse_point)"):
+        storage.delete_book_content(book_id, "book")
+    assert private.read_text(encoding="utf-8") == "private"
+    storage.close()
 
 
 def test_secure_content_delete_rejects_paths_outside_root(tmp_path: Path) -> None:

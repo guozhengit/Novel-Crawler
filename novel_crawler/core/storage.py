@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 import threading
 from collections.abc import Iterable
@@ -447,25 +448,77 @@ class Storage:
     def has_other_book(self, book_id: int, title: str, *, site: str | None = None) -> bool:
         with self._lock:
             if site is None:
-                row = self.conn.execute(
-                    "SELECT 1 FROM books WHERE id!=? AND title=? LIMIT 1", (book_id, title)
-                ).fetchone()
+                rows = self.conn.execute("SELECT title FROM books WHERE id!=?", (book_id,)).fetchall()
             else:
-                row = self.conn.execute(
-                    "SELECT 1 FROM books WHERE id!=? AND title=? AND site=? LIMIT 1", (book_id, title, site)
-                ).fetchone()
-        return row is not None
+                rows = self.conn.execute("SELECT title FROM books WHERE id!=? AND site=?", (book_id, site)).fetchall()
+        key = safe_filename(title)
+        return any(safe_filename(str(row["title"])) == key for row in rows)
 
     def chapter_content_dir(self, book_id: int, title: str) -> Path:
         if isinstance(book_id, bool) or not isinstance(book_id, int) or book_id <= 0:
             raise ValueError("book_id_invalid")
-        return self.data_dir / "contents" / f"{book_id}-{safe_filename(title)}"
+        return self.data_dir / "contents" / str(book_id)
 
     def delete_book_content(self, book_id: int, title: str) -> None:
         root = self.data_dir / "contents"
-        self.remove_tree_under(root, self.chapter_content_dir(book_id, title))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT content_path FROM chapters WHERE book_id=? AND content_path IS NOT NULL", (book_id,)
+            ).fetchall()
+        paths = [self._validate_content_path(root, Path(str(row["content_path"]))) for row in rows]
+        for path in paths:
+            if path.exists():
+                path.unlink()
+            self._prune_empty_parents(path.parent, root)
+        self._prune_empty_parents(self.chapter_content_dir(book_id, title), root)
         if not self.has_other_book(book_id, title):
-            self.remove_tree_under(root, root / safe_filename(title))
+            self._prune_empty_parents(root / safe_filename(title), root)
+
+    def _validate_content_path(self, root: Path, path: Path) -> Path:
+        candidate = path if path.is_absolute() else self.data_dir / path
+        root_absolute = Path(os.path.abspath(root))
+        candidate_absolute = Path(os.path.abspath(candidate))
+        try:
+            lexical_relative = candidate_absolute.relative_to(root_absolute)
+        except ValueError:
+            raise ValueError("content_path_outside_root") from None
+        root_resolved = root.resolve(strict=False)
+        candidate_resolved = candidate_absolute.resolve(strict=False)
+        if candidate_resolved == root_resolved or root_resolved not in candidate_resolved.parents:
+            raise ValueError("content_path_outside_root")
+        current = root_absolute
+        for part in lexical_relative.parts:
+            current /= part
+            if self._is_reparse_point(current):
+                raise ValueError("content_path_reparse_point")
+        if candidate_absolute.exists() and not candidate_absolute.is_file():
+            raise ValueError("content_path_not_file")
+        return candidate_absolute
+
+    @classmethod
+    def _prune_empty_parents(cls, directory: Path, root: Path) -> None:
+        root_resolved = root.resolve(strict=False)
+        current = directory
+        while current.resolve(strict=False) != root_resolved:
+            resolved = current.resolve(strict=False)
+            if root_resolved not in resolved.parents or cls._is_reparse_point(current):
+                raise ValueError("content_path_outside_root")
+            try:
+                current.rmdir()
+            except (FileNotFoundError, OSError):
+                return
+            current = current.parent
+
+    @staticmethod
+    def _is_reparse_point(path: Path) -> bool:
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        attributes = int(getattr(info, "st_file_attributes", 0))
+        return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)()) or bool(
+            attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
 
     @staticmethod
     def remove_tree_under(root: Path, target: Path) -> None:
@@ -477,10 +530,12 @@ class Storage:
             raise ValueError("delete_path_outside_root")
         if not target.exists() and not target.is_symlink():
             return
-        is_junction = bool(getattr(target, "is_junction", lambda: False)())
-        if target.is_symlink() or is_junction:
-            target.unlink() if target.is_symlink() else target.rmdir()
-        elif target.is_dir():
+        if Storage._is_reparse_point(target):
+            raise ValueError("delete_path_reparse_point")
+        if target.is_dir():
+            for descendant in target.rglob("*"):
+                if Storage._is_reparse_point(descendant):
+                    raise ValueError("delete_path_reparse_point")
             shutil.rmtree(target)
         else:
             target.unlink()
