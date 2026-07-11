@@ -29,3 +29,12 @@ Implemented Task 1 within the planned production boundary: `auto.py`, `detector.
 
 - Repository-wide `python -m ruff check .` still reports 57 pre-existing style findings in root-level legacy utility scripts. These are outside Task 1 and were not modified. The application package and complete test tree are Ruff-clean.
 - The source guard intentionally uses a narrow known-fragment list. This avoids broad heuristics that could flag ordinary Chinese, but newly observed corruption families should be added as explicit regression fixtures.
+
+## Review follow-up
+
+- RED: the strengthened content-quality assertion exposed leftover punctuation, a URL, and the promotional suffix in both sample paragraphs.
+- GREEN: promotional cleanup now removes only the four established phrases and their attached punctuation/fixed suffix/URL tail; the exact output is `正文开始。\n正文继续。`.
+- The source guard now obtains a deterministic file list from `git ls-files -z`, scans only `README.md`, `novel_crawler/`, and public `docs/` product text, and explicitly excludes `docs/superpowers/` internal plans.
+- Replaced single-character blacklist entries with encoding-specific multi-character corruption tokens. Added a regression proving legitimate “璇玑” text is accepted.
+- Removed the broad negative-assertion exemption. Only lines explicitly carrying `# mojibake-fixture` and Markdown inline-code examples are exempt.
+- Fresh verification after review: focused pytest 9 passed; full pytest 93 passed; build succeeded; `ruff check novel_crawler tests` passed.

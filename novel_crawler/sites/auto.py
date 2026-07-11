@@ -1,4 +1,5 @@
 import html as ihtml
+import re
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -6,7 +7,7 @@ from bs4 import BeautifulSoup
 from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.utils import normalize_blank_lines
 from novel_crawler.sites.base import SiteAdapter, domain_of
-from novel_crawler.sites.detector import CHAPTER_HREF_RE, CHAPTER_TEXT_RE, CLEAN_TEXT_PHRASES, inspect_html
+from novel_crawler.sites.detector import CHAPTER_HREF_RE, CHAPTER_TEXT_RE, CLEAN_TEXT_PATTERNS, inspect_html
 
 
 class AutoAdapter(SiteAdapter):
@@ -73,8 +74,8 @@ class AutoAdapter(SiteAdapter):
             text = ihtml.unescape(node.get_text("", strip=True))
             if not text:
                 continue
-            for phrase in CLEAN_TEXT_PHRASES:
-                text = text.replace(phrase, "")
+            for pattern in CLEAN_TEXT_PATTERNS:
+                text = re.sub(pattern, "", text)
             if text:
                 lines.append(text)
         return title, normalize_blank_lines("\n".join(lines))
