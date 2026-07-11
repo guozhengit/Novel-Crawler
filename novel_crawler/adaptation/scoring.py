@@ -1,239 +1,304 @@
-"""Deterministic field-local normalization of adaptation candidates."""
+"""Trusted, deterministic heuristic scoring for extracted field candidates.
+
+Scores are comparable only within a field.  ``confidence`` is retained as a
+compatibility alias for the heuristic score; it is not a probability.
+"""
 
 from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, runtime_checkable
+from urllib.parse import urljoin, urlsplit
+
+from bs4 import BeautifulSoup, Tag
 
 from novel_crawler.acquisition.classifier import PageKind
+from novel_crawler.acquisition.models import PageSnapshot
 
-from .models import Candidate, FieldKind, MetadataValue
+from .models import Candidate, FieldKind
 
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
-_STRUCTURAL_KEYS = re.compile(r"(?:count|ratio|density|precision|position|depth|role|bucket|match|index|order|siblings?)(?:_|$)", re.I)
-_SENSITIVE_KEY = re.compile(r"(?:html|body|text|title|author|content|url|href|hash|digest|selector|value|preview)", re.I)
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9_.+-]{0,80}")
+_CHAPTER = re.compile(
+    r"(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷]|chapter\s+(?:\d+|[a-z -]+)|part\s+(?:\d+|[ivxlcdm]+)|prologue|epilogue|foreword|afterword|interlude|序章|楔子|番外)",
+    re.I,
+)
+_AUTHOR = re.compile(r"^(?:作者\s*[：:]?|by\s+|written\s+by\s+|author\s*[：:]?\s*)\S+", re.I)
+_NOISE = re.compile(r"(?:comment|recommend|related|advert|\bad\b|banner|footer|share|评论|推荐|广告)", re.I)
+_NAV_TEXT = {
+    FieldKind.PREV_LINK: re.compile(r"^(?:上一[章节页]?|前一[章节页]?|previous(?:\s+chapter)?|prev)$", re.I),
+    FieldKind.NEXT_LINK: re.compile(r"^(?:下一[章节页]?|后一[章节页]?|next(?:\s+chapter)?)$", re.I),
+    FieldKind.INDEX_LINK: re.compile(r"^(?:目录|章节列表|返回书页|table\s+of\s+contents|contents|index)$", re.I),
+}
 
 
 @dataclass(frozen=True)
 class ScoringContext:
-    """Page classification and a small, content-free structural feature map."""
-
     page_kind: PageKind
-    snapshot: Mapping[str, MetadataValue]
+    snapshot: PageSnapshot
 
     def __post_init__(self) -> None:
-        if not isinstance(self.page_kind, PageKind):
-            raise TypeError("page_kind must be PageKind")
-        clean: dict[str, MetadataValue] = {}
-        for key, value in self.snapshot.items():
-            if not _SAFE_ID.fullmatch(key) or _SENSITIVE_KEY.search(key) or not _STRUCTURAL_KEYS.search(key):
-                raise ValueError("snapshot accepts structural feature keys only")
-            if not isinstance(value, str | int | float | bool) or isinstance(value, float) and not math.isfinite(value):
-                raise ValueError("snapshot values must be finite scalars")
-            if isinstance(value, str) and not _SAFE_TOKEN.fullmatch(value):
-                raise ValueError("snapshot strings must be stable tokens")
-            clean[key] = value
-        object.__setattr__(self, "snapshot", MappingProxyType(clean))
+        if not isinstance(self.page_kind, PageKind) or not isinstance(self.snapshot, PageSnapshot):
+            raise TypeError("ScoringContext requires PageKind and PageSnapshot")
 
 
 @dataclass(frozen=True)
 class ScoreComponent:
     rule_id: str
-    value: float
+    score: float
     weight: float
 
     def __post_init__(self) -> None:
         if not _SAFE_ID.fullmatch(self.rule_id):
-            raise ValueError("rule_id must be a stable identifier")
-        if not math.isfinite(self.value) or not 0 <= self.value <= 1:
-            raise ValueError("component value must be finite and between zero and one")
+            raise ValueError("rule_id must be a safe stable identifier")
+        if not math.isfinite(self.score) or not 0 <= self.score <= 1:
+            raise ValueError("component score must be finite and between zero and one")
         if not math.isfinite(self.weight) or self.weight <= 0:
             raise ValueError("component weight must be finite and positive")
+
+    @property
+    def value(self) -> float:
+        """Compatibility alias for older consumers."""
+        return self.score
 
 
 @dataclass(frozen=True)
 class ScoredCandidate:
     candidate: Candidate
-    confidence: float
+    score: float
     components: tuple[ScoreComponent, ...]
+    calibration_id: str
+    version: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.candidate, Candidate):
             raise TypeError("candidate must be Candidate")
-        if not math.isfinite(self.confidence) or not 0 <= self.confidence <= 1:
-            raise ValueError("confidence must be finite and between zero and one")
-        components = tuple(self.components)
-        if not components or not all(isinstance(item, ScoreComponent) for item in components):
-            raise ValueError("components must contain ScoreComponent values")
-        object.__setattr__(self, "components", components)
+        if not math.isfinite(self.score) or not 0 <= self.score <= 1:
+            raise ValueError("heuristic score must be finite and between zero and one")
+        values = tuple(self.components)
+        if not values or not all(isinstance(value, ScoreComponent) for value in values):
+            raise ValueError("components must be a nonempty tuple of ScoreComponent")
+        if not _SAFE_ID.fullmatch(self.calibration_id) or not _SAFE_ID.fullmatch(self.version):
+            raise ValueError("calibration_id and version must be stable identifiers")
+        object.__setattr__(self, "components", values)
+
+    @property
+    def confidence(self) -> float:
+        """Alias for the versioned heuristic score, not a probability."""
+        return self.score
 
 
 @dataclass(frozen=True)
-class ScorerConfig:
-    min_chapter_links: int = 3
-    target_chapter_links: int = 30
-    target_paragraphs: int = 10
-    max_link_density: float = 0.35
+class ScoringConfig:
     version: str = "score-v1"
+    calibration_id: str = "heuristic-v1"
+    target_chapter_links: int = 20
+    target_content_chars: int = 1000
+    target_paragraphs: int = 8
 
     def __post_init__(self) -> None:
-        if self.min_chapter_links < 1 or self.target_chapter_links < self.min_chapter_links:
-            raise ValueError("chapter link thresholds must be positive and ordered")
-        if self.target_paragraphs < 1 or not math.isfinite(self.max_link_density) or not 0 < self.max_link_density <= 1:
-            raise ValueError("content thresholds are invalid")
-        if not _SAFE_ID.fullmatch(self.version):
-            raise ValueError("version must be a stable identifier")
+        if not _SAFE_ID.fullmatch(self.version) or not _SAFE_ID.fullmatch(self.calibration_id):
+            raise ValueError("version identifiers must be safe and stable")
+        if min(self.target_chapter_links, self.target_content_chars, self.target_paragraphs) <= 0:
+            raise ValueError("thresholds must be positive")
+
+
+ScorerConfig = ScoringConfig
+
+
+@dataclass(frozen=True)
+class _Features:
+    valid: bool
+    tag: str = ""
+    text_length: int = 0
+    semantic: float = 0
+    count: int = 0
+    continuity: float = 0
+    same_origin: float = 0
+    precision: float = 0
+    paragraphs: int = 0
+    link_density: float = 1
+    clean_ratio: float = 0
+    rel: float = 0
+    order: float = 0
 
 
 @runtime_checkable
 class ScoringRule(Protocol):
-    rule_id: str
-    fields: frozenset[FieldKind]
+    @property
+    def rule_id(self) -> str: ...
 
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]: ...
+    @property
+    def field(self) -> FieldKind: ...
+
+    def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> tuple[ScoreComponent, ...]: ...
 
 
-def _number(item: Candidate, key: str) -> float:
-    value = item.metadata.get(key, 0)
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
+@dataclass(frozen=True)
+class _BuiltinRule:
+    field: FieldKind
+
+    @property
+    def rule_id(self) -> str:
+        return f"{self.field.value}.builtin"
+
+    def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> tuple[ScoreComponent, ...]:
+        del candidate
+        f = features if isinstance(features, _Features) else _Features(False)
+        prefix = self.field.value
+        if self.field is FieldKind.TITLE:
+            return (_component(prefix, "semantic", f.semantic, 3), _component(prefix, "dom", _tag_score(f.tag, {"h1": 1, "title": 0.7, "h2": 0.5}), 2), _component(prefix, "length", _length_score(f.text_length, 2, 80), 1))
+        if self.field is FieldKind.AUTHOR:
+            return (_component(prefix, "semantic", f.semantic, 4), _component(prefix, "length", _length_score(f.text_length, 2, 64), 1))
+        if self.field is FieldKind.CHAPTER_TITLE:
+            return (_component(prefix, "semantic", f.semantic, 4), _component(prefix, "dom", _tag_score(f.tag, {"h1": 1, "h2": 0.6, "title": 0.5}), 2), _component(prefix, "length", _length_score(f.text_length, 2, 100), 1))
+        if self.field is FieldKind.CHAPTER_LIST:
+            return (_component(prefix, "count", min(1, f.count / config.target_chapter_links), 2), _component(prefix, "continuity", f.continuity, 3), _component(prefix, "same_origin", f.same_origin, 1), _component(prefix, "selector_precision", f.precision, 4))
+        if self.field is FieldKind.CONTENT:
+            return (_component(prefix, "length", min(1, f.text_length / config.target_content_chars), 2), _component(prefix, "paragraphs", min(1, f.paragraphs / config.target_paragraphs), 2), _component(prefix, "link_density", max(0, 1 - f.link_density * 3), 3), _component(prefix, "cleanliness", f.clean_ratio, 5))
+        if self.field in _NAV_TEXT:
+            return (_component(prefix, "rel", f.rel, 3), _component(prefix, "text", f.semantic, 2), _component(prefix, "order", f.order, 1))
+        return (_component(prefix, "noise_marker", f.semantic, 1),)
+
+
+def _component(prefix: str, name: str, score: float, weight: float) -> ScoreComponent:
+    return ScoreComponent(f"{prefix}.{name}", max(0.0, min(1.0, score)) if math.isfinite(score) else 0.0, weight)
+
+
+def _tag_score(tag: str, scores: dict[str, float]) -> float:
+    return scores.get(tag, 0.0)
+
+
+def _length_score(length: int, minimum: int, maximum: int) -> float:
+    if length < minimum or length > maximum:
         return 0.0
-    return float(value)
-
-
-def _ratio(item: Candidate, key: str) -> float:
-    return max(0.0, min(1.0, _number(item, key)))
-
-
-def _token(item: Candidate, key: str) -> str:
-    value = item.metadata.get(key, "")
-    return value.casefold() if isinstance(value, str) else ""
-
-
-def _flag(item: Candidate, key: str) -> float:
-    return 1.0 if item.metadata.get(key) is True else 0.0
-
-
-def _bucket(value: str, scores: Mapping[str, float]) -> float:
-    return scores.get(value, 0.0)
-
-
-@dataclass(frozen=True)
-class _TitleRule:
-    rule_id: str = "title"
-    fields: frozenset[FieldKind] = frozenset({FieldKind.TITLE})
-
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-        del context, config
-        semantic = 1.0 if _token(item, "semantic_role") in {"book_title", "title", "book_title_zh"} else 0.0
-        dom = {"h1": 1.0, "title": 0.75, "h2": 0.5}.get(_token(item, "dom_role"), 0.0)
-        length = _bucket(_token(item, "length_bucket"), {"1-16": 0.75, "17-64": 1.0, "65+": 0.25})
-        return (ScoreComponent("title.semantic", semantic, 3), ScoreComponent("title.dom", dom, 2), ScoreComponent("title.length", length, 1))
-
-
-@dataclass(frozen=True)
-class _AuthorRule:
-    rule_id: str = "author"
-    fields: frozenset[FieldKind] = frozenset({FieldKind.AUTHOR})
-
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-        del context, config
-        semantic = 1.0 if _token(item, "semantic_role") in {"author", "author_label", "author_label_zh"} else 0.0
-        length = _bucket(_token(item, "length_bucket"), {"1-16": 1.0, "17-64": 0.65, "65+": 0.1})
-        return (ScoreComponent("author.semantic", semantic, 4), ScoreComponent("author.length", length, 1))
-
-
-@dataclass(frozen=True)
-class _ChapterTitleRule:
-    rule_id: str = "chapter_title"
-    fields: frozenset[FieldKind] = frozenset({FieldKind.CHAPTER_TITLE})
-
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-        del config
-        semantic = 1.0 if _token(item, "semantic_role") in {"chapter_title", "chapter_title_zh"} else 0.0
-        if context.page_kind is not PageKind.CHAPTER:
-            semantic *= 0.5
-        dom = {"h1": 1.0, "h2": 0.65, "title": 0.6}.get(_token(item, "dom_role"), 0.0)
-        length = _bucket(_token(item, "length_bucket"), {"1-16": 1.0, "17-64": 0.9, "65+": 0.2})
-        return (ScoreComponent("chapter_title.semantic", semantic, 4), ScoreComponent("chapter_title.dom", dom, 2), ScoreComponent("chapter_title.length", length, 1))
-
-
-@dataclass(frozen=True)
-class _ChapterListRule:
-    rule_id: str = "chapter_list"
-    fields: frozenset[FieldKind] = frozenset({FieldKind.CHAPTER_LIST})
-
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-        del context
-        count = max(0.0, _number(item, "link_count"))
-        count_score = max(0.0, min(1.0, (count - config.min_chapter_links + 1) / (config.target_chapter_links - config.min_chapter_links + 1)))
-        return (
-            ScoreComponent("chapter_list.count", count_score, 2),
-            ScoreComponent("chapter_list.continuity", _ratio(item, "continuity_ratio"), 3),
-            ScoreComponent("chapter_list.same_origin", _ratio(item, "same_origin_ratio"), 1),
-            ScoreComponent("chapter_list.selector_precision", _ratio(item, "selector_precision"), 4),
-        )
-
-
-@dataclass(frozen=True)
-class _ContentRule:
-    rule_id: str = "content"
-    fields: frozenset[FieldKind] = frozenset({FieldKind.CONTENT})
-
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-        del context
-        length = _bucket(_token(item, "length_bucket"), {"1-16": 0.0, "17-64": 0.15, "65+": 0.45, "65-256": 0.45, "257-1000": 0.85, "1000+": 1.0})
-        paragraphs = max(0.0, min(1.0, _number(item, "paragraph_count") / config.target_paragraphs))
-        link_density = max(0.0, 1.0 - max(0.0, _number(item, "link_density")) / config.max_link_density)
-        noise = 1.0 - _ratio(item, "noise_ratio")
-        return (ScoreComponent("content.length", length, 2), ScoreComponent("content.paragraphs", paragraphs, 2), ScoreComponent("content.link_density", link_density, 3), ScoreComponent("content.noise", noise, 5))
-
-
-@dataclass(frozen=True)
-class _NavigationRule:
-    rule_id: str = "navigation"
-    fields: frozenset[FieldKind] = frozenset({FieldKind.PREV_LINK, FieldKind.NEXT_LINK, FieldKind.INDEX_LINK})
-
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-        del context, config
-        return (ScoreComponent("navigation.rel", _flag(item, "rel_match"), 3), ScoreComponent("navigation.text", _flag(item, "text_match"), 2), ScoreComponent("navigation.order", _flag(item, "order_match"), 1))
-
-
-@dataclass(frozen=True)
-class _CleanRule:
-    rule_id: str = "clean_selector"
-    fields: frozenset[FieldKind] = frozenset({FieldKind.CLEAN_SELECTOR})
-
-    def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-        del context, config
-        return (ScoreComponent("clean_selector.noise_marker", _flag(item, "noise_marker"), 1),)
+    return min(1.0, length / 12)
 
 
 class CandidateScorer:
-    """Score candidates within their field; it intentionally has no decision threshold."""
+    """Resolve selectors against a trusted snapshot and score field-local evidence."""
 
-    def __init__(self, rules: Sequence[ScoringRule] | None = None, config: ScorerConfig | None = None) -> None:
-        self.config = config or ScorerConfig()
-        builtins = (_TitleRule(), _AuthorRule(), _ChapterTitleRule(), _ChapterListRule(), _ContentRule(), _NavigationRule(), _CleanRule())
-        self.rules: tuple[ScoringRule, ...] = tuple(rules) if rules is not None else cast(tuple[ScoringRule, ...], builtins)
-        if not self.rules or not all(isinstance(rule, ScoringRule) for rule in self.rules):
-            raise TypeError("rules must implement ScoringRule")
+    def __init__(self, rules: Sequence[ScoringRule] | None = None, config: ScoringConfig | None = None) -> None:
+        self.config = config or ScoringConfig()
+        values: tuple[ScoringRule, ...] = tuple(rules) if rules is not None else tuple(_BuiltinRule(field) for field in FieldKind)
+        if not values or not all(isinstance(rule, ScoringRule) for rule in values):
+            raise TypeError("rules must be a nonempty sequence of ScoringRule")
+        seen: set[FieldKind] = set()
+        for rule in values:
+            if not _SAFE_ID.fullmatch(rule.rule_id) or not isinstance(rule.field, FieldKind):
+                raise TypeError("rules must implement ScoringRule with stable identifiers")
+            if rule.field in seen:
+                raise ValueError("duplicate scoring field")
+            seen.add(rule.field)
+        self.rules = values
 
-    def score(self, item: Candidate, context: ScoringContext) -> ScoredCandidate:
-        components = tuple(component for rule in self.rules if item.field in rule.fields for component in rule.components(item, context, self.config))
-        if not components:
-            raise ValueError(f"no scoring rule for field {item.field.value}")
-        total_weight = sum(component.weight for component in components)
-        confidence = sum(component.value * component.weight for component in components) / total_weight
-        return ScoredCandidate(item, max(0.0, min(1.0, confidence)), components)
+    def score(self, candidate: Candidate, context: ScoringContext) -> ScoredCandidate:
+        rule = next((value for value in self.rules if value.field is candidate.field), None)
+        if rule is None:
+            raise ValueError(f"no scoring rule for field {candidate.field.value}")
+        features = self._derive(candidate, context)
+        raw = rule.components(candidate, features, self.config)
+        if not isinstance(raw, tuple) or not raw or not all(isinstance(value, ScoreComponent) for value in raw):
+            raise ValueError("components must be a nonempty tuple of ScoreComponent")
+        ids = [value.rule_id for value in raw]
+        prefix = candidate.field.value + "."
+        if len(ids) != len(set(ids)) or any(not value.startswith(prefix) for value in ids):
+            raise ValueError("components must have unique field-prefixed rule IDs")
+        total = sum(value.weight for value in raw)
+        score = sum(value.score * value.weight for value in raw) / total
+        return ScoredCandidate(candidate, score, raw, self.config.calibration_id, self.config.version)
 
-    def rank(self, items: Sequence[Candidate], context: ScoringContext) -> tuple[ScoredCandidate, ...]:
-        fields = {item.field for item in items}
-        if len(fields) > 1:
-            raise ValueError("candidates must have the same field; different fields are not comparable")
-        scored = (self.score(item, context) for item in items)
-        return tuple(sorted(scored, key=lambda item: (-item.confidence, item.candidate.selector)))
+    def rank(self, candidates: Sequence[Candidate], context: ScoringContext) -> tuple[ScoredCandidate, ...]:
+        if len({candidate.field for candidate in candidates}) > 1:
+            raise ValueError("different fields are not comparable")
+        return tuple(sorted((self.score(candidate, context) for candidate in candidates), key=lambda value: (-value.score, value.candidate.selector)))
+
+    @staticmethod
+    def _derive(candidate: Candidate, context: ScoringContext) -> _Features:
+        soup = BeautifulSoup(context.snapshot.html, "lxml")
+        try:
+            nodes = soup.select(candidate.selector)
+        except Exception:
+            return _Features(False)
+        tags = [node for node in nodes if isinstance(node, Tag)]
+        if not tags:
+            return _Features(False)
+        return _field_features(candidate.field, tags, context, soup)
+
+
+def _field_features(field: FieldKind, nodes: list[Tag], context: ScoringContext, soup: BeautifulSoup) -> _Features:
+    text = " ".join(node.get_text(" ", strip=True) for node in nodes).strip()
+    first = nodes[0]
+    tag = first.name
+    if field is FieldKind.TITLE:
+        valid = len(nodes) == 1 and tag in {"h1", "h2", "title"}
+        return _Features(valid, tag, len(text), float(valid and context.page_kind is not PageKind.CHAPTER)) if valid else _Features(False)
+    if field is FieldKind.AUTHOR:
+        semantic = float(len(nodes) == 1 and bool(_AUTHOR.search(text)))
+        return _Features(bool(semantic), tag, len(text), semantic) if semantic else _Features(False)
+    if field is FieldKind.CHAPTER_TITLE:
+        semantic = float(len(nodes) == 1 and tag in {"h1", "h2", "title"} and bool(_CHAPTER.search(text)))
+        return _Features(bool(semantic), tag, len(text), semantic) if semantic else _Features(False)
+    if field is FieldKind.CHAPTER_LIST:
+        if any(node.name != "a" for node in nodes):
+            return _Features(False)
+        chapter_flags = [bool(_CHAPTER.search(node.get_text(" ", strip=True))) for node in nodes]
+        count = sum(chapter_flags)
+        if count == 0:
+            return _Features(False)
+        precision = count / len(nodes)
+        origins = [urlsplit(urljoin(context.snapshot.final_url, str(node.get("href", "")))).netloc for node in nodes]
+        base = urlsplit(context.snapshot.final_url).netloc
+        same = sum(origin == base for origin in origins) / len(origins)
+        continuity = _continuity(nodes, chapter_flags)
+        return _Features(True, tag, len(text), precision, count, continuity, same, precision)
+    if field is FieldKind.CONTENT:
+        if len(nodes) != 1 or tag not in {"article", "main", "section", "div"} or _is_noise(first):
+            return _Features(False)
+        total_text = first.get_text(" ", strip=True)
+        noise_length = sum(len(node.get_text(" ", strip=True)) for node in first.find_all(_is_noise))
+        clean_length = max(0, len(total_text) - noise_length)
+        paragraphs = sum(1 for node in first.find_all("p") if not any(_is_noise(parent) for parent in node.parents if isinstance(parent, Tag)))
+        if clean_length < 45 or paragraphs == 0:
+            return _Features(False)
+        link_length = sum(len(node.get_text(" ", strip=True)) for node in first.find_all("a"))
+        density = link_length / max(1, len(total_text))
+        clean_ratio = clean_length / max(1, len(total_text))
+        return _Features(True, tag, clean_length, 1, paragraphs=paragraphs, link_density=density, clean_ratio=clean_ratio)
+    if field in _NAV_TEXT:
+        if len(nodes) != 1 or tag != "a":
+            return _Features(False)
+        rels = {str(value).casefold() for value in first.get("rel", [])}
+        expected = field.value.removesuffix("_link")
+        rel = float(expected in rels)
+        semantic = float(bool(_NAV_TEXT[field].fullmatch(text)))
+        if not rel and not semantic:
+            return _Features(False)
+        anchors = soup.find_all("a")
+        order = float(first in anchors and (field is FieldKind.INDEX_LINK or len(anchors) > 1))
+        return _Features(True, tag, len(text), semantic, rel=rel, order=order)
+    semantic = float(any(_is_noise(node) for node in nodes))
+    return _Features(bool(semantic), tag, len(text), semantic)
+
+
+def _is_noise(node: Tag) -> bool:
+    marker = " ".join([node.name, str(node.get("id", "")), *[str(value) for value in node.get("class", [])]])
+    return bool(_NOISE.search(marker))
+
+
+def _continuity(nodes: list[Tag], flags: list[bool]) -> float:
+    if not nodes:
+        return 0.0
+    if not all(flags):
+        return sum(flags) / len(flags)
+    numbers: list[int] = []
+    for node in nodes:
+        match = re.search(r"\d+", node.get_text(" ", strip=True)) or re.search(r"\d+", str(node.get("href", "")))
+        if match:
+            numbers.append(int(match.group()))
+    if len(numbers) < 2:
+        return 1.0
+    adjacent = sum(right > left for left, right in zip(numbers, numbers[1:], strict=False))
+    return adjacent / (len(numbers) - 1)

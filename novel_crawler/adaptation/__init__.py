@@ -2,7 +2,15 @@
 
 from .extractor import CandidateExtractor, ExtractionRule, ExtractorConfig
 from .models import Candidate, Evidence, ExtractionResult, FieldKind
-from .scoring import CandidateScorer, ScoreComponent, ScoredCandidate, ScorerConfig, ScoringContext, ScoringRule
+from .scoring import (
+    CandidateScorer,
+    ScoreComponent,
+    ScoredCandidate,
+    ScorerConfig,
+    ScoringConfig,
+    ScoringContext,
+    ScoringRule,
+)
 
 __all__ = [
     "Candidate",
@@ -16,6 +24,7 @@ __all__ = [
     "ScoreComponent",
     "ScoredCandidate",
     "ScorerConfig",
+    "ScoringConfig",
     "ScoringContext",
     "ScoringRule",
 ]

@@ -2,162 +2,178 @@ from __future__ import annotations
 
 import math
 from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
-import novel_crawler.adaptation as adaptation
 from novel_crawler.acquisition.classifier import PageKind
+from novel_crawler.acquisition.models import PageSnapshot
+from novel_crawler.adaptation.extractor import CandidateExtractor
 from novel_crawler.adaptation.models import Candidate, Evidence, FieldKind
 from novel_crawler.adaptation.scoring import (
     CandidateScorer,
     ScoreComponent,
     ScoredCandidate,
-    ScorerConfig,
+    ScoringConfig,
     ScoringContext,
     ScoringRule,
 )
 
-
-def candidate(field: FieldKind, metadata: dict[str, str | int | float | bool], *, raw: float = 99.0) -> Candidate:
-    return Candidate(field, "main > div", "count=1", raw, 0.01, (Evidence("extract.stable", 1.0, "count=1"),), metadata)
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def test_value_objects_are_frozen_validated_and_context_is_structural() -> None:
-    context = ScoringContext(PageKind.CHAPTER, {"dom_position": "primary", "sibling_count": 3})
-    component = ScoreComponent("title.dom", 0.8, 2.0)
-    result = ScoredCandidate(candidate(FieldKind.TITLE, {}), 0.8, (component,))
-    assert context.snapshot["sibling_count"] == 3 and result.confidence == 0.8
-    with pytest.raises(FrozenInstanceError):
-        component.value = 0.2  # type: ignore[misc]
+def snapshot(html: str, url: str = "https://reader.example/book/1") -> PageSnapshot:
+    return PageSnapshot(url, url, 200, {}, "utf-8", html, html.encode(), "GET", (), datetime.now(UTC))
+
+
+def item(field: FieldKind, selector: str, *, metadata: dict[str, str | int | float | bool] | None = None, raw: float = 999) -> Candidate:
+    return Candidate(field, selector, "count=1", raw, 0.99, (Evidence("extract.safe", 1, "count=1"),), metadata or {})
+
+
+def test_context_requires_real_snapshot_and_results_do_not_retain_derived_content() -> None:
+    page = snapshot("<h1>Private Book Title</h1>")
+    context = ScoringContext(PageKind.BOOK_INDEX, page)
+    scored = CandidateScorer().score(item(FieldKind.TITLE, "h1"), context)
+    assert scored.score > 0 and scored.confidence == scored.score
+    assert "Private Book Title" not in repr(scored)
+    assert scored.calibration_id == "heuristic-v1"
     with pytest.raises(TypeError):
-        context.snapshot["x"] = 1  # type: ignore[index]
-    for bad in (float("nan"), float("inf"), -0.1, 1.1):
-        with pytest.raises(ValueError):
-            ScoreComponent("safe.id", bad, 1.0)
-    with pytest.raises(ValueError):
-        ScoreComponent("safe.id", 0.5, 0)
-    for unsafe in ({"url": "https://secret.test"}, {"html": "<p>secret</p>"}, {"hash": "deadbeef"}, {"title": "private words"}):
-        with pytest.raises(ValueError):
-            ScoringContext(PageKind.CHAPTER, unsafe)
+        ScoringContext(PageKind.CHAPTER, {})  # type: ignore[arg-type]
+    with pytest.raises(FrozenInstanceError):
+        scored.score = 0.1  # type: ignore[misc]
 
 
-def test_scoring_api_is_exported_from_adaptation_package() -> None:
-    assert adaptation.CandidateScorer is CandidateScorer
-    assert adaptation.ScoringContext is ScoringContext
+def test_metadata_and_raw_score_cannot_spoof_quality() -> None:
+    context = ScoringContext(PageKind.CHAPTER, snapshot("<div id='x'>tiny</div>"))
+    honest = item(FieldKind.CONTENT, "#x", raw=-100, metadata={})
+    spoofed = item(FieldKind.CONTENT, "#x", raw=10000, metadata={"paragraph_count": 999, "noise_ratio": 0.0, "semantic_role": "content"})
+    assert CandidateScorer().score(honest, context).score == CandidateScorer().score(spoofed, context).score
 
 
-def test_title_has_separate_semantic_dom_and_length_components() -> None:
-    item = candidate(FieldKind.TITLE, {"semantic_role": "book_title", "dom_role": "h1", "length_bucket": "17-64"})
-    scored = CandidateScorer().score(item, ScoringContext(PageKind.BOOK_INDEX, {}))
-    assert {part.rule_id for part in scored.components} == {"title.semantic", "title.dom", "title.length"}
-    assert 0 <= scored.confidence <= 1
+@pytest.mark.parametrize("selector", ["#missing", "[", "script"])
+def test_missing_invalid_or_wrong_semantic_selector_scores_zero(selector: str) -> None:
+    context = ScoringContext(PageKind.CHAPTER, snapshot("<script>" + "private " * 100 + "</script><article>short</article>"))
+    scored = CandidateScorer().score(item(FieldKind.CONTENT, selector), context)
+    assert scored.score == 0 and all(component.score == 0 for component in scored.components)
+    assert all(math.isfinite(component.score) for component in scored.components)
+
+
+def test_extractor_to_scorer_scores_all_chapter_fields_and_comments_lose() -> None:
+    html = (FIXTURES / "chapter_nested_noise.html").read_text(encoding="utf-8")
+    extra = "<a rel='prev' href='/read/0'>Previous Chapter</a><a href='/book'>Table of Contents</a>"
+    extra += "<section class='comments'><p>" + "discussion words " * 500 + "</p><p>more comments</p></section>"
+    html = html.replace("</body>", extra + "</body>")
+    page = snapshot(html)
+    context = ScoringContext(PageKind.CHAPTER, page)
+    candidates = CandidateExtractor().extract(page, PageKind.CHAPTER)
+    scorer = CandidateScorer()
+    fields = {candidate.field for candidate in candidates}
+    for field in (FieldKind.CHAPTER_TITLE, FieldKind.CONTENT, FieldKind.PREV_LINK, FieldKind.NEXT_LINK, FieldKind.INDEX_LINK, FieldKind.CLEAN_SELECTOR):
+        assert field in fields
+        assert all(0 <= scorer.score(candidate, context).score <= 1 for candidate in candidates.for_field(field))
+    comment = item(FieldKind.CONTENT, ".comments")
+    article = candidates.for_field(FieldKind.CONTENT)[0]
+    assert scorer.score(article, context).score > scorer.score(comment, context).score
+
+
+def test_extractor_to_scorer_scores_catalog_title_author_and_mixed_list() -> None:
+    html = (FIXTURES / "catalog_mixed.html").read_text(encoding="utf-8")
+    html = "<h1>Example Novel</h1><p class='author'>Written by Ada Stone</p>" + html
+    page = snapshot(html)
+    context = ScoringContext(PageKind.BOOK_INDEX, page)
+    result = CandidateExtractor().extract(page, PageKind.BOOK_INDEX)
+    scorer = CandidateScorer()
+    for field in (FieldKind.TITLE, FieldKind.AUTHOR, FieldKind.CHAPTER_LIST):
+        assert result.for_field(field)
+        assert max(scorer.score(candidate, context).score for candidate in result.for_field(field)) > 0.4
+    selected = result.for_field(FieldKind.CHAPTER_LIST)[0]
+    auxiliary = item(FieldKind.CHAPTER_LIST, ".catalog-list a")
+    assert scorer.score(selected, context).score > scorer.score(auxiliary, context).score
 
 
 @pytest.mark.parametrize(
-    ("field", "metadata", "expected"),
+    ("field", "html", "selector", "prefixes"),
     [
-        (FieldKind.AUTHOR, {"semantic_role": "author_label", "length_bucket": "1-16"}, {"author.semantic", "author.length"}),
-        (FieldKind.CHAPTER_TITLE, {"semantic_role": "chapter_title", "dom_role": "h1", "length_bucket": "1-16"}, {"chapter_title.semantic", "chapter_title.dom", "chapter_title.length"}),
-        (FieldKind.CHAPTER_LIST, {"link_count": 20, "continuity_ratio": 0.9, "same_origin_ratio": 1.0, "selector_precision": 0.95}, {"chapter_list.count", "chapter_list.continuity", "chapter_list.same_origin", "chapter_list.selector_precision"}),
-        (FieldKind.CONTENT, {"length_bucket": "1000+", "paragraph_count": 12, "link_density": 0.02, "noise_ratio": 0.01}, {"content.length", "content.paragraphs", "content.link_density", "content.noise"}),
-        (FieldKind.NEXT_LINK, {"rel_match": True, "text_match": True, "order_match": True}, {"navigation.rel", "navigation.text", "navigation.order"}),
+        (FieldKind.TITLE, "<h1>长夜余火</h1>", "h1", {"title."}),
+        (FieldKind.AUTHOR, "<p>作者：余华</p>", "p", {"author."}),
+        (FieldKind.CHAPTER_TITLE, "<h1>第十二章 风雪</h1>", "h1", {"chapter_title."}),
+        (FieldKind.CHAPTER_LIST, "<nav><a href='/1'>第一章</a><a href='/2'>第二章</a><a href='/3'>第三章</a></nav>", "nav a", {"chapter_list."}),
+        (FieldKind.CONTENT, "<article><p>" + "正文段落。" * 30 + "</p><p>继续。</p></article>", "article", {"content."}),
+        (FieldKind.PREV_LINK, "<a rel='prev'>上一章</a>", "a", {"prev_link."}),
+        (FieldKind.NEXT_LINK, "<a rel='next'>Next Chapter</a>", "a", {"next_link."}),
+        (FieldKind.INDEX_LINK, "<a>目录</a>", "a", {"index_link."}),
+        (FieldKind.CLEAN_SELECTOR, "<aside class='comments'>评论</aside>", "aside", {"clean_selector."}),
     ],
 )
-def test_each_field_uses_its_own_rule_family(field: FieldKind, metadata: dict[str, str | int | float | bool], expected: set[str]) -> None:
-    scored = CandidateScorer().score(candidate(field, metadata), ScoringContext(PageKind.CHAPTER, {}))
-    assert {part.rule_id for part in scored.components} == expected
+def test_every_field_has_prefixed_bounded_components(field: FieldKind, html: str, selector: str, prefixes: set[str]) -> None:
+    scored = CandidateScorer().score(item(field, selector), ScoringContext(PageKind.CHAPTER, snapshot(html)))
+    assert scored.components
+    assert all(any(component.rule_id.startswith(prefix) for prefix in prefixes) for component in scored.components)
+    assert all(math.isfinite(component.score) and 0 <= component.score <= 1 and component.weight > 0 for component in scored.components)
 
 
-def test_weighted_mean_is_normalized_and_raw_score_is_ignored() -> None:
+def test_component_weights_form_exact_normalized_mean() -> None:
+    class FixedRule:
+        rule_id = "title.custom"
+        field = FieldKind.TITLE
+
+        def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> tuple[ScoreComponent, ...]:
+            del candidate, features, config
+            return (ScoreComponent("title.low", 0, 1), ScoreComponent("title.high", 1, 3))
+
+    scored = CandidateScorer([FixedRule()]).score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, snapshot("<h1>x</h1>")))
+    assert isinstance(FixedRule(), ScoringRule)
+    assert scored.score == 0.75
+
+
+@pytest.mark.parametrize(
+    ("field", "weak", "strong"),
+    [
+        (FieldKind.TITLE, "<div>Book</div>", "<h1>Book</h1>"),
+        (FieldKind.AUTHOR, "<p>Ada</p>", "<p>Written by Ada</p>"),
+        (FieldKind.CHAPTER_TITLE, "<div>Wind</div>", "<h1>Chapter 12: Wind</h1>"),
+        (FieldKind.CONTENT, "<article><p>short</p></article>", "<article><p>" + "prose " * 100 + "</p><p>continued</p></article>"),
+        (FieldKind.NEXT_LINK, "<a>link</a>", "<a rel='next'>Next Chapter</a>"),
+    ],
+)
+def test_representative_signals_are_monotonic(field: FieldKind, weak: str, strong: str) -> None:
+    scorer = CandidateScorer()
+    weak_score = scorer.score(item(field, weak.split("<", 2)[1].split(">", 1)[0].split()[0]), ScoringContext(PageKind.CHAPTER, snapshot(weak))).score
+    strong_score = scorer.score(item(field, strong.split("<", 2)[1].split(">", 1)[0].split()[0]), ScoringContext(PageKind.CHAPTER, snapshot(strong))).score
+    assert strong_score >= weak_score
+
+
+def test_rule_registry_and_malformed_outputs_fail_stably() -> None:
     class Rule:
-        rule_id = "custom.fixed"
-        fields = frozenset({FieldKind.TITLE})
+        field = FieldKind.TITLE
+        rule_id = "title.custom"
 
-        def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-            del item, context, config
-            return (ScoreComponent("custom.low", 0.0, 1.0), ScoreComponent("custom.high", 1.0, 3.0))
+        def __init__(self, result: object) -> None:
+            self.result = result
 
-    scorer = CandidateScorer(rules=[Rule()])
-    low_raw = scorer.score(candidate(FieldKind.TITLE, {}, raw=-1000), ScoringContext(PageKind.UNKNOWN, {}))
-    high_raw = scorer.score(candidate(FieldKind.TITLE, {}, raw=1000), ScoringContext(PageKind.UNKNOWN, {}))
-    assert isinstance(Rule(), ScoringRule)
-    assert low_raw.confidence == high_raw.confidence == 0.75
+        def components(self, candidate: Candidate, features: object, config: ScoringConfig) -> object:
+            del candidate, features, config
+            return self.result
 
-
-def test_boundaries_are_monotonic_and_never_nan() -> None:
-    scorer = CandidateScorer()
-    context = ScoringContext(PageKind.BOOK_INDEX, {})
-    values = [scorer.score(candidate(FieldKind.CHAPTER_LIST, {"link_count": count}), context).confidence for count in (0, 3, 10, 30, 1000000)]
-    assert values == sorted(values)
-    assert all(math.isfinite(value) and 0 <= value <= 1 for value in values)
-    malformed = candidate(FieldKind.CONTENT, {"paragraph_count": -99, "link_density": 999.0, "noise_ratio": -5.0, "length_bucket": "unknown"})
-    assert math.isfinite(scorer.score(malformed, ScoringContext(PageKind.CHAPTER, {})).confidence)
-
-
-def test_comments_with_more_text_do_not_beat_clean_main_content() -> None:
-    scorer = CandidateScorer()
-    context = ScoringContext(PageKind.CHAPTER, {})
-    comments = candidate(FieldKind.CONTENT, {"length_bucket": "1000+", "paragraph_count": 30, "link_density": 0.4, "noise_ratio": 0.9})
-    正文 = candidate(FieldKind.CONTENT, {"length_bucket": "257-1000", "paragraph_count": 8, "link_density": 0.02, "noise_ratio": 0.0})
-    assert scorer.score(正文, context).confidence > scorer.score(comments, context).confidence
-
-
-def test_catalog_auxiliary_links_reduce_precision_and_continuity() -> None:
-    scorer = CandidateScorer()
-    context = ScoringContext(PageKind.BOOK_INDEX, {})
-    clean = candidate(FieldKind.CHAPTER_LIST, {"link_count": 20, "continuity_ratio": 1.0, "same_origin_ratio": 1.0, "selector_precision": 1.0})
-    mixed = candidate(FieldKind.CHAPTER_LIST, {"link_count": 24, "continuity_ratio": 0.55, "same_origin_ratio": 1.0, "selector_precision": 0.7})
-    assert scorer.score(clean, context).confidence > scorer.score(mixed, context).confidence
-
-
-@pytest.mark.parametrize("semantic", ["chapter_title", "chapter_title_zh"])
-def test_chinese_and_english_semantic_tokens_are_supported(semantic: str) -> None:
-    item = candidate(FieldKind.CHAPTER_TITLE, {"semantic_role": semantic, "dom_role": "h1", "length_bucket": "1-16"})
-    assert CandidateScorer().score(item, ScoringContext(PageKind.CHAPTER, {})).confidence > 0.7
-
-
-def test_fields_are_not_ranked_together_and_config_has_versioned_thresholds() -> None:
-    config = ScorerConfig(min_chapter_links=5, target_chapter_links=25, version="score-v3")
-    scorer = CandidateScorer(config=config)
-    assert scorer.config.version == "score-v3"
-    with pytest.raises(ValueError, match="same field"):
-        scorer.rank([candidate(FieldKind.TITLE, {}), candidate(FieldKind.AUTHOR, {})], ScoringContext(PageKind.BOOK_INDEX, {}))
+    with pytest.raises(ValueError, match="duplicate scoring field"):
+        CandidateScorer([Rule((ScoreComponent("title.a", 1, 1),)), Rule((ScoreComponent("title.b", 1, 1),))])  # type: ignore[list-item]
+    for bad in ([], [object()]):
+        with pytest.raises(TypeError, match="ScoringRule"):
+            CandidateScorer(bad)  # type: ignore[arg-type]
+    for result in ([], (ScoreComponent("title.a", 1, 1), ScoreComponent("title.a", 0, 1)), (ScoreComponent("author.a", 1, 1),)):
+        with pytest.raises(ValueError, match="components"):
+            CandidateScorer([Rule(result)]).score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, snapshot("<h1>x</h1>")))  # type: ignore[list-item]
     with pytest.raises(ValueError):
-        ScorerConfig(min_chapter_links=10, target_chapter_links=5)
+        ScoreComponent("bad id", 1, 1)
 
 
-def test_invalid_protocol_context_and_nested_results_are_rejected() -> None:
-    with pytest.raises(TypeError):
-        ScoringContext("chapter", {})  # type: ignore[arg-type]
-    for snapshot in ({"sibling_count": object()}, {"sibling_count": float("nan")}, {"dom_role": "private words"}):
-        with pytest.raises(ValueError):
-            ScoringContext(PageKind.CHAPTER, snapshot)  # type: ignore[arg-type]
-    base = candidate(FieldKind.TITLE, {})
-    with pytest.raises(TypeError):
-        ScoredCandidate("bad", 0.5, (ScoreComponent("safe.id", 1, 1),))  # type: ignore[arg-type]
+def test_config_is_versioned_and_score_model_rejects_invalid_values() -> None:
+    config = ScoringConfig(version="v3", calibration_id="heuristic-v1")
+    assert config.version == "v3" and config.calibration_id == "heuristic-v1"
     with pytest.raises(ValueError):
-        ScoredCandidate(base, float("nan"), (ScoreComponent("safe.id", 1, 1),))
+        ScoringConfig(calibration_id="secret value")
     with pytest.raises(ValueError):
-        ScoredCandidate(base, 0.5, ())
-    with pytest.raises(TypeError):
-        CandidateScorer(rules=[object()])  # type: ignore[list-item]
-    class TitleOnly:
-        rule_id = "title.only"
-        fields = frozenset({FieldKind.TITLE})
-
-        def components(self, item: Candidate, context: ScoringContext, config: ScorerConfig) -> tuple[ScoreComponent, ...]:
-            del item, context, config
-            return (ScoreComponent("title.only", 1, 1),)
-
-    with pytest.raises(ValueError, match="no scoring rule"):
-        CandidateScorer(rules=[TitleOnly()]).score(candidate(FieldKind.AUTHOR, {}), ScoringContext(PageKind.BOOK_INDEX, {}))
-
-
-def test_clean_selector_and_navigation_variants_are_field_local() -> None:
-    scorer = CandidateScorer()
-    context = ScoringContext(PageKind.CHAPTER, {})
-    clean = scorer.score(candidate(FieldKind.CLEAN_SELECTOR, {"noise_marker": True}), context)
-    assert clean.confidence == 1
-    for field in (FieldKind.PREV_LINK, FieldKind.NEXT_LINK, FieldKind.INDEX_LINK):
-        assert scorer.score(candidate(field, {"text_match": True}), context).components[1].value == 1
-    assert scorer.rank([], context) == ()
+        ScoreComponent("title.x", float("nan"), 1)
+    with pytest.raises(ValueError):
+        ScoredCandidate(item(FieldKind.TITLE, "h1"), 2, (), "heuristic-v1", "v1")
