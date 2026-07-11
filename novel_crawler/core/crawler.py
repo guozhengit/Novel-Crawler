@@ -91,13 +91,10 @@ class CrawlerService:
         except KeyError:
             self.storage.delete_book(book_id)
             return
-        import shutil
-        content_dir = self.ctx.data_dir / "contents" / safe_filename(book.title)
-        if content_dir.exists():
-            shutil.rmtree(content_dir, ignore_errors=True)
+        self.storage.delete_book_content(book_id, book.title)
         cache_dir = self.ctx.cache_dir / book.site / safe_filename(book.title)
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir, ignore_errors=True)
+        if not self.storage.has_other_book(book_id, book.title, site=book.site):
+            self.storage.remove_tree_under(self.ctx.cache_dir, cache_dir)
         self.storage.delete_book(book_id)
 
     def validate(self, book_id: int) -> ValidationReport:

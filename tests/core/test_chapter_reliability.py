@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from novel_crawler.core.crawler import CrawlerService
 from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.storage import ChapterContentConflict, Storage, canonical_chapter_url
+from novel_crawler.runtime.env import RuntimeContext
 
 
 def _book(storage: Storage) -> int:
@@ -18,7 +20,18 @@ def _book(storage: Storage) -> int:
 
 def test_canonical_chapter_url_is_deterministic_and_strips_fragment() -> None:
     assert canonical_chapter_url("HTTPS://BÜCHER.Example:443/a/../c?q=two%20words&a=1#part") == (
-        "https://xn--bcher-kva.example/c?a=1&q=two%20words"
+        "https://xn--bcher-kva.example/c?q=two%20words&a=1"
+    )
+
+
+def test_canonical_chapter_url_preserves_signed_query_order_and_duplicates() -> None:
+    first = canonical_chapter_url("https://example.test/1?a=1&a=2&X-Signature=%7e%2f#fragment")
+    second = canonical_chapter_url("https://example.test/1?a=2&a=1&X-Signature=%7E%2F")
+    assert first == "https://example.test/1?a=1&a=2&X-Signature=~%2F"
+    assert second == "https://example.test/1?a=2&a=1&X-Signature=~%2F"
+    assert first != second
+    assert canonical_chapter_url("https://example.test/1?flag&empty=&q=a+b&&raw=%41%2f") == (
+        "https://example.test/1?flag&empty=&q=a+b&&raw=A%2F"
     )
 
 
@@ -126,6 +139,59 @@ def test_schema_migration_adds_integrity_columns_and_audit(tmp_path: Path) -> No
         assert "uq_chapters_book_canonical_url" in indexes
 
 
+def test_schema_migration_sanitizes_legacy_raw_error_details(tmp_path: Path) -> None:
+    db = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(db)
+    connection.executescript(
+        """
+        CREATE TABLE books(id INTEGER PRIMARY KEY, site TEXT, title TEXT, author TEXT, url TEXT UNIQUE, created_at TEXT);
+        INSERT INTO books VALUES(1, 'x', 'book', NULL, 'https://example.test/book', CURRENT_TIMESTAMP);
+        CREATE TABLE chapters(id INTEGER PRIMARY KEY, book_id INTEGER, chapter_index INTEGER, title TEXT, url TEXT,
+          status TEXT, content_path TEXT, error TEXT, updated_at TEXT);
+        INSERT INTO chapters VALUES(1,1,1,'failed','https://example.test/1','failed',NULL,
+          'Authorization: Bearer private-token <html>body</html>',CURRENT_TIMESTAMP);
+        """
+    )
+    connection.commit()
+    connection.close()
+    with Storage(db, tmp_path / "data") as storage:
+        assert storage.conn.execute("SELECT error FROM chapters").fetchone()[0] == "chapter_download_failed"
+
+
+@pytest.mark.parametrize(
+    ("loser_status", "loser_has_path", "expects_path"),
+    [("failed", True, False), ("pending", True, False), ("done", True, True), ("done", False, False)],
+)
+def test_migration_never_downgrades_done_or_attaches_untrusted_failed_content(
+    tmp_path: Path, loser_status: str, loser_has_path: bool, expects_path: bool
+) -> None:
+    db = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(db)
+    connection.executescript(
+        """
+        CREATE TABLE books(id INTEGER PRIMARY KEY, site TEXT, title TEXT, author TEXT, url TEXT UNIQUE, created_at TEXT);
+        INSERT INTO books VALUES(1, 'x', 'book', NULL, 'https://example.test/book', CURRENT_TIMESTAMP);
+        CREATE TABLE chapters(id INTEGER PRIMARY KEY, book_id INTEGER, chapter_index INTEGER, title TEXT, url TEXT,
+          status TEXT, content_path TEXT, error TEXT, updated_at TEXT);
+        INSERT INTO chapters VALUES(1,1,1,'winner','https://example.test/shared','done',NULL,NULL,CURRENT_TIMESTAMP);
+        """
+    )
+    trusted = tmp_path / "trusted.txt"
+    if loser_has_path:
+        trusted.write_text("preserved body", encoding="utf-8")
+    path = str(trusted) if loser_has_path else None
+    connection.execute(
+        "INSERT INTO chapters VALUES(2,1,2,'loser','https://EXAMPLE.test:443/shared',?,?,NULL,CURRENT_TIMESTAMP)",
+        (loser_status, path),
+    )
+    connection.commit()
+    connection.close()
+    with Storage(db, tmp_path / "data") as storage:
+        row = storage.conn.execute("SELECT status, content_path FROM chapters").fetchone()
+        assert row["status"] == "done"
+        assert row["content_path"] == (str(trusted) if expects_path else None)
+
+
 def test_content_hash_matches_committed_bytes(tmp_path: Path) -> None:
     with Storage(tmp_path / "db.sqlite", tmp_path / "data") as storage:
         book_id = _book(storage)
@@ -145,6 +211,21 @@ def test_legacy_mark_failed_records_attempt_without_double_counting_claim(tmp_pa
         assert storage.claim_chapter(book_id, 1, "owner", now=0, lease_seconds=10)
         storage.mark_failed(book_id, 1, "claimed")
         assert storage.conn.execute("SELECT attempt_count FROM chapters").fetchone()[0] == 2
+
+
+def test_mark_failed_never_persists_credentials_html_body_or_user_paths(tmp_path: Path) -> None:
+    with Storage(tmp_path / "db.sqlite", tmp_path / "data") as storage:
+        book_id = _book(storage)
+        storage.upsert_chapters(book_id, [Chapter(1, "one", "https://example.test/1")])
+        private = "Authorization: Bearer top-secret Cookie: sid=private password=hunter2 <html>BODY C:\\Users\\alice\\secret"
+        storage.mark_failed(book_id, 1, private)
+        error = storage.conn.execute("SELECT error FROM chapters").fetchone()[0]
+        assert error == "chapter_download_failed"
+        assert not any(value.casefold() in error.casefold() for value in ("secret", "cookie", "password", "html", "users"))
+        storage.mark_failed(book_id, 1, "connection_timeout")
+        assert storage.conn.execute("SELECT error FROM chapters").fetchone()[0] == "connection_timeout"
+        storage.mark_failed(book_id, 1, "topsecret")
+        assert storage.conn.execute("SELECT error FROM chapters").fetchone()[0] == "chapter_download_failed"
 
 
 def test_two_storage_instances_cannot_race_file_and_database_commit(tmp_path: Path) -> None:
@@ -226,3 +307,45 @@ def test_books_with_same_title_never_share_chapter_files(tmp_path: Path) -> None
         assert first_path != second_path
         assert first_path.read_text(encoding="utf-8") == "first body"
         assert second_path.read_text(encoding="utf-8") == "second body"
+
+
+def test_crawler_delete_removes_unique_and_safe_legacy_content_without_touching_same_title_book(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    first_id = storage.upsert_book(Book(title="same", url="https://one.example/book", site="same-site"))
+    second_id = storage.upsert_book(Book(title="same", url="https://two.example/book", site="same-site"))
+    first = Chapter(1, "one", "https://one.example/1")
+    second = Chapter(1, "two", "https://two.example/1")
+    storage.upsert_chapters(first_id, [first])
+    storage.upsert_chapters(second_id, [second])
+    first_path = storage.mark_done(first_id, first, "first")
+    second_path = storage.mark_done(second_id, second, "second")
+    legacy = data / "contents" / "same"
+    legacy.mkdir(parents=True)
+    (legacy / "old.txt").write_text("legacy", encoding="utf-8")
+    ctx = RuntimeContext("test", "3.12", tmp_path, data, data / "cache", data / "output", data / "crawler.db", [], [], {}, {})
+    service = CrawlerService.__new__(CrawlerService)
+    service.ctx = ctx
+    service.storage = storage
+    try:
+        service.delete_book(first_id)
+        assert not first_path.exists()
+        assert second_path.read_text(encoding="utf-8") == "second"
+        assert legacy.exists(), "shared legacy directory must remain while another same-title book exists"
+        service.delete_book(second_id)
+        assert not second_path.exists()
+        assert not legacy.exists()
+    finally:
+        storage.close()
+
+
+def test_secure_content_delete_rejects_paths_outside_root(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    with pytest.raises(ValueError, match="delete_path_outside_root"):
+        Storage.remove_tree_under(root, outside)
+    assert marker.read_text(encoding="utf-8") == "keep"

@@ -2,12 +2,13 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
 from collections.abc import Iterable
 from pathlib import Path
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from novel_crawler.core.domains import canonical_domain
 from novel_crawler.core.models import Book, Chapter
@@ -16,6 +17,17 @@ from novel_crawler.core.utils import ensure_dir, safe_filename
 
 logger = logging.getLogger(__name__)
 _BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_SAFE_ERROR_CODES = frozenset(
+    {
+        "chapter_download_failed",
+        "chapter_processor_failed",
+        "connection_timeout",
+        "duplicate_content",
+        "empty_content",
+        "parse_failed",
+        "source_fetch_failed",
+    }
+)
 
 
 class ChapterContentConflict(RuntimeError):
@@ -39,14 +51,37 @@ def canonical_chapter_url(url: str) -> str:
         raise ValueError("chapter_url_invalid")
     default_port = 443 if scheme == "https" else 80
     authority = host if port in {None, default_port} else f"{host}:{port}"
-    try:
-        pairs = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=False, encoding="utf-8", errors="strict")
-    except UnicodeError:
-        raise ValueError("chapter_url_invalid") from None
-    if any(any(ord(character) < 32 for character in key + value) for key, value in pairs):
-        raise ValueError("chapter_url_invalid")
-    query = urlencode(sorted(pairs), doseq=True, quote_via=quote, safe="-._~")
+    query = "&".join(_canonical_query_field(field) for field in parts.query.split("&")) if parts.query else ""
     return urlunsplit((scheme, authority, canonical_path(parts.path or "/"), query, ""))
+
+
+def _canonical_query_field(field: str) -> str:
+    key, separator, value = field.partition("=")
+    canonical = _canonical_query_component(key)
+    return canonical + ("=" + _canonical_query_component(value) if separator else "")
+
+
+def _canonical_query_component(value: str) -> str:
+    output: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "%":
+            byte = int(value[index + 1 : index + 3], 16)
+            decoded = chr(byte)
+            output.append(decoded if decoded.isascii() and (decoded.isalnum() or decoded in "-._~") else f"%{byte:02X}")
+            index += 3
+        elif character == "+":
+            output.append("+")
+            index += 1
+        else:
+            output.append(quote(character, safe="-._~"))
+            index += 1
+    return "".join(output)
+
+
+def _safe_error_code(error: object) -> str:
+    return error if isinstance(error, str) and error in _SAFE_ERROR_CODES else "chapter_download_failed"
 
 
 class Storage:
@@ -156,8 +191,9 @@ class Storage:
                 if path.is_file():
                     content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
             self.conn.execute(
-                "UPDATE chapters SET canonical_url=?, content_hash=?, attempt_count=COALESCE(attempt_count, 0) WHERE id=?",
-                (canonical, content_hash, row["id"]),
+                """UPDATE chapters SET canonical_url=?, content_hash=?, attempt_count=COALESCE(attempt_count, 0),
+                   error=CASE WHEN error IS NULL THEN NULL ELSE ? END WHERE id=?""",
+                (canonical, content_hash, _safe_error_code(row["error"]), row["id"]),
             )
         self._merge_duplicate_chapters("chapter_index", "chapter_index_conflict")
         self._merge_duplicate_chapters("canonical_url", "canonical_url_conflict")
@@ -173,10 +209,15 @@ class Storage:
             ).fetchall()
             winner = rows[0]
             for loser in rows[1:]:
-                if not winner["content_path"] and loser["content_path"]:
+                if (
+                    not winner["content_path"]
+                    and loser["status"] == "done"
+                    and loser["content_path"]
+                    and Path(str(loser["content_path"])).is_file()
+                ):
                     self.conn.execute(
-                        "UPDATE chapters SET status=?, content_path=?, content_hash=? WHERE id=?",
-                        (loser["status"], loser["content_path"], loser["content_hash"], winner["id"]),
+                        "UPDATE chapters SET content_path=?, content_hash=? WHERE id=?",
+                        (loser["content_path"], loser["content_hash"], winner["id"]),
                     )
                     winner = self.conn.execute("SELECT * FROM chapters WHERE id=?", (winner["id"],)).fetchone()
                 self.conn.execute(
@@ -278,7 +319,7 @@ class Storage:
                         return Path(row["content_path"])
                     raise ChapterContentConflict("chapter_content_conflict")
                 book = self.get_book(book_id)
-                content_dir = ensure_dir(self.data_dir / "contents" / f"{book_id}-{safe_filename(book.title)}")
+                content_dir = ensure_dir(self.chapter_content_dir(book_id, book.title))
                 path = content_dir / f"{chapter.index:05d}.txt"
                 descriptor, temporary_name = tempfile.mkstemp(
                     prefix=f".{chapter.index:05d}-", suffix=".tmp", dir=content_dir
@@ -329,6 +370,7 @@ class Storage:
             os.close(descriptor)
 
     def mark_failed(self, book_id: int, chapter_index: int, error: str) -> None:
+        error_code = _safe_error_code(error)
         with self._lock:
             self.conn.execute(
                 """
@@ -338,7 +380,7 @@ class Storage:
                 updated_at=CURRENT_TIMESTAMP
                 WHERE book_id=? AND chapter_index=? AND status!='done'
                 """,
-                (error[:1000], book_id, chapter_index),
+                (error_code, book_id, chapter_index),
             )
             self.conn.commit()
 
@@ -401,6 +443,47 @@ class Storage:
             self.conn.execute("DELETE FROM download_logs WHERE book_id=?", (book_id,))
             self.conn.execute("DELETE FROM books WHERE id=?", (book_id,))
             self.conn.commit()
+
+    def has_other_book(self, book_id: int, title: str, *, site: str | None = None) -> bool:
+        with self._lock:
+            if site is None:
+                row = self.conn.execute(
+                    "SELECT 1 FROM books WHERE id!=? AND title=? LIMIT 1", (book_id, title)
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT 1 FROM books WHERE id!=? AND title=? AND site=? LIMIT 1", (book_id, title, site)
+                ).fetchone()
+        return row is not None
+
+    def chapter_content_dir(self, book_id: int, title: str) -> Path:
+        if isinstance(book_id, bool) or not isinstance(book_id, int) or book_id <= 0:
+            raise ValueError("book_id_invalid")
+        return self.data_dir / "contents" / f"{book_id}-{safe_filename(title)}"
+
+    def delete_book_content(self, book_id: int, title: str) -> None:
+        root = self.data_dir / "contents"
+        self.remove_tree_under(root, self.chapter_content_dir(book_id, title))
+        if not self.has_other_book(book_id, title):
+            self.remove_tree_under(root, root / safe_filename(title))
+
+    @staticmethod
+    def remove_tree_under(root: Path, target: Path) -> None:
+        root_resolved = root.resolve(strict=False)
+        target_parent = target.parent.resolve(strict=False)
+        if target_parent != root_resolved and root_resolved not in target_parent.parents:
+            raise ValueError("delete_path_outside_root")
+        if target.resolve(strict=False) == root_resolved:
+            raise ValueError("delete_path_outside_root")
+        if not target.exists() and not target.is_symlink():
+            return
+        is_junction = bool(getattr(target, "is_junction", lambda: False)())
+        if target.is_symlink() or is_junction:
+            target.unlink() if target.is_symlink() else target.rmdir()
+        elif target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
 
     def progress(self, book_id: int) -> dict[str, int]:
         with self._lock:

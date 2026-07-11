@@ -75,8 +75,8 @@ class ChapterBatchRunner:
                     if not isinstance(content, str):
                         raise TypeError("chapter_processor_content_invalid")
                     self._storage.mark_done(book_id, chapter, content)
-                except Exception as exc:
-                    self._storage.mark_failed(book_id, chapter.index, str(exc))
+                except Exception:
+                    self._storage.mark_failed(book_id, chapter.index, "chapter_processor_failed")
                     retry_indices.append(chapter.index)
                 pending_batch += 1
             else:
