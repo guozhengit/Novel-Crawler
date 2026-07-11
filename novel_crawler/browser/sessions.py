@@ -60,6 +60,10 @@ class SessionLimitError(BrowserSessionError):
     """A bounded storage or scan limit was exceeded."""
 
 
+class _RetryAcquire(Exception):
+    pass
+
+
 class BrowserSessionStatus(StrEnum):
     AVAILABLE = "available"
     IN_USE = "in_use"
@@ -105,7 +109,6 @@ class _DomainLock:
         self._thread_lock = _process_lock(str(path.absolute()))
         self._thread_locked = False
         self._os_locked = False
-        self._identity: tuple[int, int] | None = None
 
     def acquire(self) -> None:
         deadline = time.monotonic() + self._timeout
@@ -118,17 +121,6 @@ class _DomainLock:
                 try:
                     self._try_lock()
                     self._os_locked = True
-                    if not self.identity_matches():  # pragma: no cover - POSIX ABA regression
-                        self.release()  # pragma: no cover - POSIX ABA regression
-                        if time.monotonic() >= deadline:  # pragma: no cover - POSIX ABA regression
-                            raise SessionLockTimeout("lock_generation_changed") from None
-                        if not self._thread_lock.acquire(  # pragma: no cover - POSIX ABA regression
-                            timeout=max(0.001, deadline - time.monotonic())
-                        ):
-                            raise SessionLockTimeout("lock_timeout") from None
-                        self._thread_locked = True  # pragma: no cover - POSIX ABA regression
-                        self._open_stream()  # pragma: no cover - POSIX ABA regression
-                        continue  # pragma: no cover - POSIX ABA regression
                     return
                 except (BlockingIOError, OSError):
                     if time.monotonic() >= deadline:
@@ -173,26 +165,9 @@ class _DomainLock:
                 self._os_locked = False
                 self._stream.close()
             self._stream = None
-            self._identity = None
         if self._thread_locked:
             self._thread_locked = False
             self._thread_lock.release()
-
-    def identity_matches(self) -> bool:
-        if self._stream is None:  # pragma: no cover - defensive internal call
-            return False  # pragma: no cover
-        held = os.fstat(self._stream.fileno())
-        self._identity = self._identity or (held.st_dev, held.st_ino)
-        try:
-            current = os.stat(self._path, follow_symlinks=False)
-        except OSError:  # pragma: no cover - POSIX unlink fence
-            return False  # pragma: no cover
-        return self._identity == (current.st_dev, current.st_ino) and stat.S_ISREG(current.st_mode)
-
-    @property
-    def identity(self) -> tuple[int, int] | None:
-        return self._identity
-
 
 class BrowserSessionLease:
     """An exclusive domain lease.
@@ -254,7 +229,12 @@ class BrowserSessionLease:
 
 
 class BrowserSessionStore:
-    """Persist and exclusively lease one browser profile per canonical domain."""
+    """Persist and exclusively lease one browser profile per canonical domain.
+
+    Exact domain lock files are permanent identities and remain after
+    :meth:`clear`. ``max_domain_locks`` bounds them. Offline administrative
+    cleanup is intentionally unsupported while any store process is running.
+    """
 
     def __init__(
         self,
@@ -265,11 +245,12 @@ class BrowserSessionStore:
         max_profile_bytes: int = 1_073_741_824,
         max_scan_entries: int = 100_000,
         max_delete_entries: int = 100_000,
+        max_domain_locks: int = 4096,
         _io: RegistryIO | None = None,
     ) -> None:
         if lock_timeout <= 0 or max_sessions <= 0 or max_profile_bytes <= 0:
             raise ValueError("browser session limits must be positive")
-        if max_scan_entries <= 0 or max_delete_entries <= 0:
+        if max_scan_entries <= 0 or max_delete_entries <= 0 or max_domain_locks < max_sessions:
             raise ValueError("browser session scan limits must be positive")
         self.root = Path(root).absolute()
         self._io = _io or default_registry_io()
@@ -278,6 +259,7 @@ class BrowserSessionStore:
         self._max_profile_bytes = max_profile_bytes
         self._max_scan_entries = max_scan_entries
         self._max_delete_entries = max_delete_entries
+        self._max_domain_locks = max_domain_locks
         self._profiles = self.root / "profiles"
         self._metadata = self.root / "metadata"
         self._locks = self.root / "locks"
@@ -314,7 +296,36 @@ class BrowserSessionStore:
             raise BrowserSessionError("lock_io", domain) from None
         return lock
 
+    def _ensure_domain_lock(self, path: Path) -> None:
+        if path.exists():
+            self._io.reject_link(path)
+            stream = self._io.open_lock(path)
+            stream.close()
+            return
+        count = 0
+        for candidate in self._locks.glob("*.lock"):
+            if candidate.name == "allocation.lock":
+                continue
+            count += 1
+            if count > self._max_scan_entries:  # pragma: no cover - defensive lock scan cap
+                raise SessionLimitError("metadata_scan_limit")  # pragma: no cover
+            self._io.reject_link(candidate)
+            metadata = candidate.stat(follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):  # pragma: no cover - platform tamper defense
+                raise BrowserSessionError("lock_unsafe")  # pragma: no cover
+        if count >= self._max_domain_locks:
+            raise SessionLimitError("domain_capacity")
+        stream = self._io.open_lock(path)
+        stream.close()
+
     def acquire(self, domain: str, timeout: float | None = None) -> BrowserSessionLease:
+        while True:
+            try:
+                return self._acquire_once(domain, timeout)
+            except _RetryAcquire:
+                continue
+
+    def _acquire_once(self, domain: str, timeout: float | None = None) -> BrowserSessionLease:
         canonical = canonical_domain(domain)
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
@@ -332,10 +343,19 @@ class BrowserSessionStore:
                 preallocation.release()
                 raise
             preview = None
+        if preview is None or preview.status is BrowserSessionStatus.STALE:
+            self._enforce_session_limit(excluding=metadata_path)
+        _, _, _, lock_path = self._paths(canonical)
+        self._ensure_domain_lock(lock_path)
         if preview is not None and preview.status is not BrowserSessionStatus.STALE:
             preallocation.release()
             allocation = None
-        lock = self._lock(canonical, timeout)
+        try:
+            lock = self._lock(canonical, timeout)
+        except Exception:  # pragma: no cover - injected lock-open failure
+            if allocation is not None:
+                allocation.release()
+            raise
         try:
             _, profile, metadata, _ = self._paths(canonical)
             info = self._read_info(metadata, quarantine=allocation is not None)
@@ -353,8 +373,7 @@ class BrowserSessionStore:
             if info is None:
                 if allocation is None:
                     lock.release()
-                    return self.acquire(canonical, timeout)
-                self._enforce_session_limit(excluding=metadata)
+                    raise _RetryAcquire
                 if profile.exists():
                     self._safe_delete_profile(profile)
                 self._io.ensure_directory(profile)
@@ -381,29 +400,24 @@ class BrowserSessionStore:
                 self._write_info(metadata, in_use)
                 committed = self._read_info(metadata, quarantine=False)
                 if (
-                    not lock.identity_matches()
-                    or committed is None
+                    committed is None
                     or committed.session_id != in_use.session_id
                 ):
                     lock.release()
-                    return self.acquire(canonical, timeout)
+                    raise _RetryAcquire
                 return BrowserSessionLease(self, in_use, profile, lock)
             finally:
                 if allocation is not None:
                     allocation.release()
         except (RegistryIOError, OSError):  # pragma: no cover - injected cleanup failure
-            identity = lock.identity
             lock.release()
             if allocation is not None:
                 allocation.release()
-            self._cleanup_failed_lock(canonical, identity)
             raise BrowserSessionError("storage_io", canonical) from None  # pragma: no cover
         except Exception:
-            identity = lock.identity
             lock.release()
             if allocation is not None:
                 allocation.release()
-            self._cleanup_failed_lock(canonical, identity)
             raise
 
     def _release(self, leased: BrowserSessionInfo) -> None:
@@ -483,10 +497,10 @@ class BrowserSessionStore:
         allocation = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
         try:
             allocation.acquire()
-            allocation.release()
+            lock = self._lock(canonical)
         except (BrowserSessionError, RegistryIOError, OSError):
+            allocation.release()
             raise BrowserSessionError("storage_io", canonical) from None
-        lock = self._lock(canonical)
         try:
             _, profile, metadata, _ = self._paths(canonical)
             info = self._read_info(metadata, quarantine=True)
@@ -507,14 +521,7 @@ class BrowserSessionStore:
             primary_active = sys.exc_info()[0] is not None
             try:
                 lock.release()
-                cleanup = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
-                cleanup.acquire()
-                try:
-                    _, profile, metadata, lock_path = self._paths(canonical)
-                    if not profile.exists() and not metadata.exists():
-                        self._delete_lock_file(lock_path)
-                finally:
-                    cleanup.release()
+                allocation.release()
             except (BrowserSessionError, RegistryIOError, OSError):
                 if not primary_active:
                     raise BrowserSessionError("clear_cleanup_failed", canonical) from None
@@ -697,15 +704,6 @@ class BrowserSessionStore:
             if seen > self._max_scan_entries:
                 raise SessionLimitError("recovery_scan_limit")
             self._io.secure_remove_tree(trash, self._max_delete_entries)
-        tracked = {path.stem for path in self._metadata.glob("*.json")} | {
-            path.name for path in self._profiles.iterdir()
-        }
-        for lock_path in self._locks.glob("*.lock"):
-            seen += 1
-            if seen > self._max_scan_entries:
-                raise SessionLimitError("recovery_scan_limit")
-            if lock_path.name != "allocation.lock" and lock_path.stem not in tracked:
-                self._delete_lock_file(lock_path)
 
     def _quarantine_metadata(self, path: Path) -> None:
         if not path.exists():
@@ -725,32 +723,6 @@ class BrowserSessionStore:
         except FileNotFoundError:
             return
         self._sync_directory(tombstone.parent)
-
-    def _delete_lock_file(self, path: Path) -> None:
-        self._io.reject_link(path)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            return
-        except PermissionError:
-            # An already-open waiter owns this generation. Its identity fence
-            # prevents it from crossing into a later recreated lock.
-            return
-        self._sync_directory(path.parent)
-
-    def _cleanup_failed_lock(self, domain: str, expected: tuple[int, int] | None) -> None:
-        cleanup = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
-        try:
-            cleanup.acquire()
-            _, profile, metadata, lock_path = self._paths(domain)
-            if not profile.exists() and not metadata.exists() and expected is not None:
-                current = os.stat(lock_path, follow_symlinks=False)
-                if (current.st_dev, current.st_ino) == expected:
-                    self._delete_lock_file(lock_path)
-        except (BrowserSessionError, RegistryIOError, OSError):  # pragma: no cover - best-effort cleanup
-            pass  # pragma: no cover
-        finally:
-            cleanup.release()
 
     def _verify_profile(self, profile: Path) -> None:
         try:

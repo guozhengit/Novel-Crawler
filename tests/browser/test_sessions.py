@@ -23,7 +23,6 @@ from novel_crawler.browser.sessions import (
     SessionConflictError,
     SessionLimitError,
     SessionLockTimeout,
-    _DomainLock,
 )
 
 
@@ -496,7 +495,7 @@ def test_exact_domain_locks_are_bounded_by_tracked_sessions(tmp_path: Path) -> N
     assert all(name == "allocation.lock" or re.fullmatch(r"[0-9a-f]{64}\.lock", name) for name in lock_names)
     for info in store.list_sessions():
         store.clear(info.domain, info.session_id, confirmation=True)
-    assert {path.name for path in (store.root / "locks").iterdir()} <= {"allocation.lock"}
+    assert len(list((store.root / "locks").glob("*.lock"))) == 71
 
 
 def test_failed_domain_allocations_leave_no_lock_artifacts(tmp_path: Path) -> None:
@@ -511,20 +510,75 @@ def test_failed_domain_allocations_leave_no_lock_artifacts(tmp_path: Path) -> No
     assert "allocation.lock" in lock_names
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows denies unlink of open locks")
-def test_lock_generation_identity_detects_unlink_and_recreate(tmp_path: Path) -> None:
-    store = BrowserSessionStore(tmp_path / "sessions")
-    with store.acquire("generation.example"):
-        pass
-    _, _, _, path = store._paths("generation.example")
-    lock = _DomainLock(path, 1, store._io)
-    lock.acquire()
-    assert lock.identity_matches()
-    path.unlink()
-    replacement = store._io.open_lock(path)
-    replacement.close()
-    assert not lock.identity_matches()
-    lock.release()
+def test_permanent_domain_lock_capacity_is_bounded(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions", max_sessions=2, max_domain_locks=2)
+    for domain in ("one.example", "two.example"):
+        with store.acquire(domain) as lease:
+            session_id = lease.info.session_id
+        store.clear(domain, session_id, confirmation=True)
+    with pytest.raises(SessionLimitError, match="domain_capacity"):
+        store.acquire("three.example")
+    assert len(list((store.root / "locks").glob("*.lock"))) == 3
+
+
+def test_clear_waiters_recreate_on_same_permanent_inode_with_one_active_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions", lock_timeout=3)
+    with store.acquire("permanent.example") as lease:
+        old_id = lease.info.session_id
+    _, _, _, lock_path = store._paths("permanent.example")
+    inode = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+    clearing = threading.Event()
+    allow_clear = threading.Event()
+    original_complete = store._complete_deletion
+    clear_errors: list[Exception] = []
+
+    def paused_complete(metadata: Path, info: object, tombstone_id: str) -> None:
+        clearing.set()
+        assert allow_clear.wait(5)
+        try:
+            original_complete(metadata, info, tombstone_id)  # type: ignore[arg-type]
+        except Exception as exc:
+            clear_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(store, "_complete_deletion", paused_complete)
+    clearer = threading.Thread(
+        target=lambda: store.clear("permanent.example", old_id, confirmation=True)
+    )
+    clearer.start()
+    assert clearing.wait(5)
+    active = 0
+    maximum = 0
+    guard = threading.Lock()
+    results: list[str] = []
+
+    def wait_for_lease() -> None:
+        nonlocal active, maximum
+        with store.acquire("permanent.example") as acquired:
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.05)
+            results.append(acquired.info.session_id)
+            with guard:
+                active -= 1
+
+    waiters = [threading.Thread(target=wait_for_lease) for _ in range(2)]
+    for waiter in waiters:
+        waiter.start()
+    allow_clear.set()
+    clearer.join(5)
+    monkeypatch.setattr(store, "_complete_deletion", original_complete)
+    for waiter in waiters:
+        waiter.join(5)
+        assert not waiter.is_alive()
+    assert maximum == 1
+    assert clear_errors == []
+    assert len(set(results)) == 1
+    assert results[0] != old_id
+    assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == inode
 
 
 def test_interrupted_transactional_clear_is_completed_on_reopen(
