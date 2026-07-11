@@ -4,18 +4,25 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from novel_crawler.adaptation.config_manager import ConfigResolution, ResolutionKind
+from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.application import (
     ApplicationError,
     ApplicationService,
     CrawlOptions,
     TaskView,
 )
+from novel_crawler.browser.adaptive import AdaptiveResult
+from novel_crawler.browser.models import VerificationStatus, VerificationTicket
 from novel_crawler.core.storage import BookDeletionResult
 from novel_crawler.task_engine import (
+    AdaptiveTaskController,
     BackgroundTaskExecutor,
     ExecutorClosed,
     ExecutorQueueFull,
@@ -326,7 +333,7 @@ def test_close_is_ordered_idempotent_and_rejects_new_work(tmp_path: Path) -> Non
     service = ApplicationService(repo, OrderedExecutor(), controller=OrderedController(), crawler=OrderedCrawler())
     service.close()
     service.close()
-    assert calls == ["controller", "executor", "repository", "crawler"]
+    assert calls == ["executor", "controller", "repository", "crawler"]
     with pytest.raises(ApplicationError) as caught:
         service.create_crawl_task("https://example.com", {})
     assert caught.value.code == "service_closed"
@@ -582,6 +589,93 @@ def test_close_is_retryable_and_keeps_dependencies_open_while_real_worker_is_blo
     assert repo.close_calls == 1
     assert crawler.closed is True
     assert service.close() is True
+
+
+def test_close_drains_real_adaptive_worker_before_controller_cancels_new_handle(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    private_token = "private-verification-token"
+
+    class Manager:
+        def confirm(self, token: str, selector_overrides=None):
+            return ConfigResolution(ResolutionKind.REGISTERED, config=cast(SiteConfig, object()))
+
+        def cancel(self, token: str) -> bool:
+            return True
+
+    class BlockingAdaptive:
+        def __init__(self) -> None:
+            self.config_manager = Manager()
+            self.cancelled: list[str] = []
+
+        def resolve(self, _url: str, _task_key: str) -> AdaptiveResult:
+            entered.set()
+            assert release.wait(5)
+            ticket = VerificationTicket(
+                private_token,
+                VerificationStatus.WAITING,
+                "example.com",
+                datetime.now(UTC) + timedelta(minutes=2),
+                1,
+            )
+            return AdaptiveResult(ConfigResolution(ResolutionKind.WAITING_FOR_USER), ticket)
+
+        def continue_verification(self, ticket):
+            raise AssertionError("not used")
+
+        def cancel(self, ticket) -> AdaptiveResult:
+            token = ticket.token if isinstance(ticket, VerificationTicket) else ticket
+            self.cancelled.append(token)
+            return AdaptiveResult(ConfigResolution(ResolutionKind.CANCELLED))
+
+        def retry_cleanup(self, ticket):
+            raise AssertionError("not used")
+
+        def expire_sweep(self) -> int:
+            return 0
+
+    class LeaseTrackingRepository(TaskRepository):
+        lease_count_before_close: int | None = None
+
+        def close(self) -> None:
+            self.lease_count_before_close = int(
+                self.connection.execute("SELECT COUNT(*) FROM task_interaction_leases").fetchone()[0]
+            )
+            super().close()
+
+    repo = LeaseTrackingRepository(tmp_path / "adaptive-close.db")
+    adaptive = BlockingAdaptive()
+    controller = AdaptiveTaskController(repo, adaptive)
+    executor = BackgroundTaskExecutor(
+        repo,
+        {TaskStatus.PROBING: controller.probe_handler},
+        max_workers=1,
+        max_queue_size=2,
+    )
+    service = ApplicationService(
+        repo,
+        executor,
+        controller=controller,
+        close_timeout=0,
+    )
+    view = service.create_crawl_task("https://example.com", {})
+    assert entered.wait(5)
+
+    assert service.close() is False
+    assert adaptive.cancelled == []
+    assert repo.connection.execute("SELECT 1").fetchone()[0] == 1
+    release.set()
+    deadline = time.monotonic() + 5
+    closed = service.close()
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+        closed = service.close()
+
+    assert closed is True
+    assert adaptive.cancelled == [private_token]
+    assert "active_count=0" in repr(controller)
+    assert repo.lease_count_before_close == 0
+    assert private_token not in repr(view)
 
 
 def test_close_retries_failed_controller_before_closing_downstream_resources(tmp_path: Path) -> None:

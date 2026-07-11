@@ -278,11 +278,6 @@ class ApplicationService:
             if self._state is _ServiceState.CLOSED:
                 return True
             self._state = _ServiceState.CLOSING
-            if not self._controller_closed and self._controller is not None:
-                try:
-                    self._controller_closed = bool(self._controller.close())
-                except Exception:
-                    self._controller_closed = False
             if not self._executor_closed:
                 try:
                     self._executor_closed = bool(
@@ -290,7 +285,14 @@ class ApplicationService:
                     )
                 except Exception:
                     self._executor_closed = False
-            if not self._controller_closed or not self._executor_closed:
+            if not self._executor_closed:
+                return False
+            if not self._controller_closed and self._controller is not None:
+                try:
+                    self._controller_closed = bool(self._controller.close())
+                except Exception:
+                    self._controller_closed = False
+            if not self._controller_closed:
                 return False
             if not self._repository_closed:
                 try:
