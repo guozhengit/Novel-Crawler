@@ -79,6 +79,7 @@ class InteractionView:
     kind: str
     attempt: int
     expires_at: str | None
+    safe_origin: str | None = field(repr=False)
     verification_required: bool
     confirmation_required: bool
     cleanup_required: bool
@@ -88,6 +89,7 @@ class InteractionView:
             "kind": self.kind,
             "attempt": self.attempt,
             "expires_at": self.expires_at,
+            "safe_origin": self.safe_origin,
             "verification_required": self.verification_required,
             "confirmation_required": self.confirmation_required,
             "cleanup_required": self.cleanup_required,

@@ -1,298 +1,420 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
+import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Protocol
 
-from novel_crawler.core.crawler import CrawlerService
-from novel_crawler.runtime.env import create_runtime_context, format_runtime_report
+from novel_crawler.application import ApplicationError, CrawlOptions, build_application
+from novel_crawler.runtime.env import RuntimeContext, create_runtime_context, format_runtime_report
+from novel_crawler.task_engine import TaskStatus
 
 LOG_FORMAT = "%(levelname)s %(name)s: %(message)s"
+_SELECTOR_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
+_TERMINAL_EXIT = {"completed": 0, "terminal_failed": 11, "cancelled": 12}
+_ERROR_MESSAGES = {
+    "task_not_found": "任务不存在",
+    "task_queue_full": "任务队列已满，请稍后重试",
+    "task_executor_closed": "任务执行器已关闭",
+    "task_state_conflict": "任务状态已变化，请刷新后重试",
+    "cleanup_required": "需要先完成浏览器资源清理",
+    "interaction_unavailable": "当前无法处理交互操作",
+    "interaction_failed": "交互操作失败",
+    "crawler_unavailable": "书籍服务不可用",
+    "crawler_operation_failed": "书籍操作失败",
+    "book_id_invalid": "书籍编号无效",
+    "export_format_invalid": "导出格式无效",
+    "service_closing": "服务正在关闭，请稍后重试",
+    "service_closed": "服务已关闭",
+    "chase_unsupported": "当前版本不支持递推抓取",
+    "concurrency_unsupported": "当前版本仅支持单任务顺序抓取",
+}
+
+
+class _SafeView(Protocol):
+    def to_safe_dict(self) -> dict[str, object]: ...
+
+
+class _Application(Protocol):
+    def close(self) -> bool: ...
+
+
+ApplicationFactory = Callable[[RuntimeContext], _Application]
+
+
+def _bounded_float(minimum: float, maximum: float) -> Callable[[str], float]:
+    def parse(value: str) -> float:
+        try:
+            result = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("必须是数字") from exc
+        if not minimum <= result <= maximum:
+            raise argparse.ArgumentTypeError(f"必须在 {minimum:g} 到 {maximum:g} 之间")
+        return result
+
+    return parse
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="novel-crawler", description="通用小说爬虫系统")
-    parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument("--data-dir", type=Path, default=None, help="私有运行数据目录")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("env", help="显示运行环境检测报告")
+    sub.add_parser("books", help="列出已抓取的小说")
 
-    sub.add_parser("books", help="列出所有已抓取的小说")
-    delete = sub.add_parser("delete", help="删除一本书及其所有数据")
+    delete = sub.add_parser("delete", help="删除一本书及其数据")
     delete.add_argument("book_id", type=int)
 
-    crawl = sub.add_parser("crawl", help="抓取小说")
+    crawl = sub.add_parser("crawl", help="抓取小说（创建后台任务）")
     crawl.add_argument("url")
     crawl.add_argument("--start", type=int, default=None, help="起始章节序号")
     crawl.add_argument("--count", type=int, default=None, help="下载章节数量")
-    crawl.add_argument("--no-export", action="store_true", help="只下载，不导出TXT")
-    crawl.add_argument("--concurrency", type=int, default=1, help="并发抓取数（默认1）")
-    crawl.add_argument("--max-chapters", type=int, default=None, help="本次最多下载章节数（暂停控制）")
-    crawl.add_argument("--chase", action="store_true", help="递推抓取模式：从首章逐章跟随下一章链接")
-    crawl.add_argument("--proxy-file", type=Path, default=None, help="代理列表文件（每行一个代理URL）")
+    crawl.add_argument("--no-export", action="store_true", help="完成后不导出")
+    crawl.add_argument("--concurrency", type=int, default=1, help="并发数（当前仅支持 1）")
+    crawl.add_argument("--max-chapters", type=int, default=None, help="本次最多下载章节数")
+    crawl.add_argument("--chase", action="store_true", help="递推抓取（当前不支持）")
+    crawl.add_argument("--proxy-file", type=Path, default=None, help="兼容参数（当前不支持）")
+    crawl.add_argument("--wait", action="store_true", help="等待任务结束或需要人工操作")
+    crawl.add_argument("--poll-interval", type=_bounded_float(0.05, 10), default=0.5)
+    crawl.add_argument("--timeout", type=_bounded_float(0.1, 86_400), default=300.0)
 
-    inspect = sub.add_parser("inspect", help="探测未知小说站点并输出配置草案")
+    tasks = sub.add_parser("tasks", help="列出后台任务")
+    tasks.add_argument("--status", action="append", default=None, help="按状态筛选，可重复")
+    tasks.add_argument("--limit", type=int, default=100)
+    task = sub.add_parser("task", help="查看单个任务")
+    task.add_argument("task_id")
+    events = sub.add_parser("task-events", help="查看任务事件")
+    events.add_argument("task_id")
+    for name, help_text in (
+        ("task-pause", "暂停任务"),
+        ("task-resume", "恢复任务"),
+        ("task-cancel", "取消任务"),
+        ("task-continue", "人工验证完成后继续任务"),
+        ("task-retry-cleanup", "重试任务资源清理"),
+    ):
+        command = sub.add_parser(name, help=help_text)
+        command.add_argument("task_id")
+    confirm = sub.add_parser("task-confirm", help="确认自动适配配置")
+    confirm.add_argument("task_id")
+    override = confirm.add_mutually_exclusive_group()
+    override.add_argument("--selector", action="append", default=[], metavar="名称=CSS")
+    override.add_argument("--selectors-json", default=None, metavar="JSON")
+
+    # 保留 0.1 系列命令名，所有书籍操作在分发层映射到 ApplicationService。
+    inspect = sub.add_parser("inspect", help="旧版站点探测命令（已停用）")
     inspect.add_argument("url")
-    inspect.add_argument("--save", type=Path, default=None, help="保存配置草案到 JSON 文件")
-
-    wizard = sub.add_parser("wizard", help="交互式站点配置向导：探测→验证首章→保存")
+    inspect.add_argument("--save", type=Path, default=None)
+    wizard = sub.add_parser("wizard", help="旧版站点配置向导（已停用）")
     wizard.add_argument("url")
-    wizard.add_argument("--save", type=Path, default=None, help="保存配置到文件（默认 configs/<domain>.json）")
-    wizard.add_argument("--sample-url", type=str, default=None, help="用于验证正文解析的章节URL")
-
-    resume = sub.add_parser("resume", help="继续未完成任务")
+    wizard.add_argument("--save", type=Path, default=None)
+    wizard.add_argument("--sample-url", default=None)
+    resume = sub.add_parser("resume", help="旧版书籍续传命令（请使用 task-resume）")
     resume.add_argument("book_id", type=int)
     resume.add_argument("--no-export", action="store_true")
-    resume.add_argument("--concurrency", type=int, default=1, help="并发抓取数（默认1）")
-    resume.add_argument("--max-chapters", type=int, default=None, help="本次最多下载章节数（暂停控制）")
-
-    progress = sub.add_parser("progress", help="查看进度")
+    resume.add_argument("--concurrency", type=int, default=1)
+    resume.add_argument("--max-chapters", type=int, default=None)
+    progress = sub.add_parser("progress", help="查看书籍进度")
     progress.add_argument("book_id", type=int)
-
     validate = sub.add_parser("validate", help="校验抓取质量")
     validate.add_argument("book_id", type=int)
-
     logs = sub.add_parser("logs", help="查看最近任务日志")
     logs.add_argument("--book-id", type=int, default=None)
     logs.add_argument("--limit", type=int, default=30)
-
-    report = sub.add_parser("report", help="生成任务报告")
+    report = sub.add_parser("report", help="生成书籍报告")
     report.add_argument("book_id", type=int)
-
     retry_failed = sub.add_parser("retry-failed", help="重试失败章节")
     retry_failed.add_argument("book_id", type=int)
     retry_failed.add_argument("--no-export", action="store_true")
-    retry_failed.add_argument("--concurrency", type=int, default=1, help="并发抓取数（默认1）")
-
-    export = sub.add_parser("export", help="导出文件")
+    retry_failed.add_argument("--concurrency", type=int, default=1)
+    export = sub.add_parser("export", help="导出书籍")
     export.add_argument("book_id", type=int)
     export.add_argument("--format", choices=["txt", "epub", "md", "jsonl"], default="txt")
-    export.add_argument("--output", type=Path, default=None)
-
-    decode_font = sub.add_parser("decode-font", help="根据系统字体破解混淆字体映射")
+    export.add_argument("--output", type=Path, default=None, help="兼容参数（输出目录由应用统一管理）")
+    decode_font = sub.add_parser("decode-font", help="根据系统字体解码混淆字体")
     decode_font.add_argument("font", type=Path)
     decode_font.add_argument("--output", type=Path, default=Path("font_decode_map.json"))
-
     web = sub.add_parser("web", help="启动 Web UI 管理界面")
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8765)
-
-    fix_titles = sub.add_parser("fix-titles", help="自动修正章节标题编号")
+    fix_titles = sub.add_parser("fix-titles", help="修正章节标题编号")
     fix_titles.add_argument("book_id", type=int)
-
-    dedup = sub.add_parser("dedup", help="检测/去除重复章节")
+    dedup = sub.add_parser("dedup", help="检测或移除重复章节")
     dedup.add_argument("book_id", type=int)
-    dedup.add_argument("--remove", action="store_true", help="将重复章节标记为失败")
-
+    dedup.add_argument("--remove", action="store_true")
     export_all = sub.add_parser("export-all", help="批量导出所有书籍")
     export_all.add_argument("--format", choices=["txt", "epub", "md", "jsonl"], default="txt")
-
     sub.add_parser("retry-all", help="重试所有书籍的失败章节")
-
-    crawl_batch = sub.add_parser("crawl-batch", help="从URL列表文件批量抓取")
-    crawl_batch.add_argument("file", type=Path, help="URL列表文件（每行一个URL，#开头为注释）")
+    crawl_batch = sub.add_parser("crawl-batch", help="从 URL 列表批量创建任务")
+    crawl_batch.add_argument("file", type=Path)
     crawl_batch.add_argument("--concurrency", type=int, default=1)
     crawl_batch.add_argument("--max-chapters", type=int, default=None)
-
     preview = sub.add_parser("preview", help="预览章节内容")
     preview.add_argument("book_id", type=int)
     preview.add_argument("chapter_index", type=int)
-    preview.add_argument("--length", type=int, default=500, help="预览字符数")
-
-    sub.add_parser("stats", help="全局下载统计")
-
+    preview.add_argument("--length", type=int, default=500)
+    sub.add_parser("stats", help="显示全局下载统计")
     validate_config = sub.add_parser("validate-config", help="校验站点配置文件")
     validate_config.add_argument("config", type=Path)
-
     return parser
 
 
-def main(argv: list[str] | None = None, project_dir: Path | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    project_dir: Path | None = None,
+    *,
+    application_factory: ApplicationFactory = build_application,
+) -> int:
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     args = build_parser().parse_args(argv)
     ctx = create_runtime_context((project_dir or Path.cwd()).resolve(), args.data_dir)
     if args.command == "env":
         print(format_runtime_report(ctx))
         return 0
-
-    service = CrawlerService(ctx, proxy_file=getattr(args, "proxy_file", None))
-    if args.command == "books":
-        rows = service.list_books()
-        if not rows:
-            print("暂无书籍记录")
-        else:
-            print(f"{'ID':>4}  {'标题':<24}  {'站点':<10}  {'进度':>12}  URL")
-            print("-" * 90)
-            for row in rows:
-                done = row.get("done") or 0
-                total = row.get("total") or 0
-                pct = f"{done}/{total}" if total else "-"
-                print(f"{row['id']:>4}  {str(row['title'])[:24]:<24}  {str(row['site']):<10}  {pct:>12}  {row['url']}")
-    elif args.command == "delete":
-        service.delete_book(args.book_id)
-        print(f"deleted book_id: {args.book_id}")
-    elif args.command == "crawl":
-        book_id = service.crawl(args.url, start=args.start, count=args.count, export=not args.no_export, concurrency=args.concurrency, max_chapters=args.max_chapters, chase=args.chase)
-        print(f"book_id: {book_id}")
-    elif args.command == "inspect":
-        import json
-        from urllib.parse import urlparse
-
-        from novel_crawler.sites.detector import inspect_html
-        html = service.fetcher.fetch_text(args.url)
-        result = inspect_html(html, args.url)
-        domain = urlparse(args.url).netloc
-        config = result.to_config(domain.replace(".", "_"), domain)
-        print("Title candidates:")
-        for item in result.title_candidates[:5]:
-            print(f"  {item.selector}: {item.sample}")
-        print("Content candidates:")
-        for item in result.content_candidates[:5]:
-            print(f"  {item.selector}: score={int(item.score)} sample={item.sample}")
-        print("Chapter candidates:")
-        for item in result.chapter_candidates[:5]:
-            print(f"  {item.selector}: count={int(item.score)} sample={item.sample}")
-        text = json.dumps(config, ensure_ascii=False, indent=2)
-        print("Config draft:")
-        print(text)
-        if args.save:
-            args.save.write_text(text + "\n", encoding="utf-8")
-            print(f"saved: {args.save}")
-    elif args.command == "wizard":
-        import json
-        from urllib.parse import urlparse
-
-        from novel_crawler.sites.detector import inspect_html
-        from novel_crawler.sites.generic import GenericAdapter
-        html = service.fetcher.fetch_text(args.url)
-        result = inspect_html(html, args.url)
-        domain = urlparse(args.url).netloc
-        site_name = domain.replace(".", "_")
-        config = result.to_config(site_name, domain)
-        print("=== 站点探测结果 ===")
-        print(f"书名选择器: {result.title_selector or '未检测到'}")
-        print(f"正文选择器: {result.content_selector or '未检测到'}")
-        print(f"章节列表选择器: {result.chapter_list_selector or '未检测到'}")
-        print(f"章节链接数: {result.chapter_count}")
-        sample_url = args.sample_url
-        if not sample_url and result.chapter_candidates:
-            from urllib.parse import urljoin
-
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "html.parser")
-            links = soup.select(result.chapter_list_selector)
-            for link in links:
-                href = link.get("href")
-                if href:
-                    sample_url = urljoin(args.url, href)
-                    break
-        if sample_url:
-            print(f"\n=== 验证章节页: {sample_url} ===")
-            try:
-                chapter_html = service.fetcher.fetch_text(sample_url, referer=args.url)
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
-                    json.dump(config, tmp, ensure_ascii=False)
-                    tmp_path = Path(tmp.name)
-                adapter = GenericAdapter(tmp_path)
-                title, body = adapter.parse_chapter(chapter_html, sample_url)
-                print(f"标题: {title}")
-                print(f"正文字数: {len(body)}")
-                print(f"正文预览: {body[:200]}...")
-                if len(body) < 100:
-                    print("\n警告: 正文过短，配置可能需要调整")
-                else:
-                    print("\n验证通过!")
-                tmp_path.unlink(missing_ok=True)
-            except Exception as exc:
-                print(f"验证失败: {exc}")
-        else:
-            print("\n未找到章节链接，跳过验证")
-        save_path = args.save or (Path("novel_crawler/configs") / f"{site_name}.json")
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        save_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        print(f"\n配置已保存: {save_path}")
-        print(f"可使用以下命令测试: python main.py crawl {args.url}")
-    elif args.command == "resume":
-        service.resume(args.book_id, export=not args.no_export, concurrency=args.concurrency, max_chapters=args.max_chapters)
-    elif args.command == "progress":
-        progress = service.progress(args.book_id)
-        total = progress.get("total", 0)
-        done = progress.get("done", 0)
-        percent = (done / total * 100) if total else 0
-        print({**progress, "percent": round(percent, 2)})
-    elif args.command == "validate":
-        print(service.validate(args.book_id).to_text())
-    elif args.command == "fix-titles":
-        title_fix = service.fix_titles(args.book_id, dry_run=False)
-        print(f"total: {title_fix.total}, fixed: {title_fix.fixed}")
-        for detail in title_fix.details[:20]:
-            print(f"  {detail}")
-    elif args.command == "logs":
-        for row in service.logs(args.book_id, args.limit):
-            print(f"{row['created_at']} [{row['level']}] book={row['book_id']} chapter={row['chapter_index']} {row['message']}")
-    elif args.command == "report":
-        print(service.report(args.book_id))
-    elif args.command == "retry-failed":
-        service.retry_failed(args.book_id, export=not args.no_export, concurrency=args.concurrency)
-    elif args.command == "retry-all":
-        count = service.retry_all_failed()
-        print(f"retried {count} books")
-    elif args.command == "dedup":
-        dedup = service.dedup(args.book_id, remove=args.remove)
-        print(f"total: {dedup.total}, exact_dupes: {dedup.exact_dupes}, similar_dupes: {dedup.similar_dupes}")
-        for detail in dedup.details[:20]:
-            print(f"  {detail}")
-    elif args.command == "export":
-        path = service.export(args.book_id, args.format, args.output)
-        print(path)
-    elif args.command == "export-all":
-        paths = service.export_all(args.format)
-        print(f"exported {len(paths)} books")
-        for p in paths:
-            print(f"  {p}")
-    elif args.command == "crawl-batch":
-        kwargs = {"export": False}
-        if args.concurrency:
-            kwargs["concurrency"] = args.concurrency
-        if args.max_chapters:
-            kwargs["max_chapters"] = args.max_chapters
-        book_ids = service.crawl_batch(args.file, **kwargs)
-        print(f"\ncrawled {len(book_ids)} books: {book_ids}")
-    elif args.command == "preview":
-        print(service.preview_chapter(args.book_id, args.chapter_index, args.length))
-    elif args.command == "stats":
-        s = service.stats()
-        print(f"书籍总数: {s['books']}")
-        print(f"章节总数: {s['chapters_total']}")
-        print(f"已完成: {s['chapters_done']}")
-        print(f"失败: {s['chapters_failed']}")
-        print(f"待下载: {s['chapters_pending']}")
-        print(f"完成率: {s['completion_rate']}%")
-        print(f"站点分布: {s['sites']}")
-    elif args.command == "validate-config":
-        validation = service.validate_config(args.config)
-        print(f"配置文件: {args.config}")
-        print(f"有效: {validation['valid']}")
-        if validation.get("site"):
-            print(f"站点: {validation['site']}")
-        if validation.get("domain"):
-            print(f"域名: {validation['domain']}")
-        errors = validation.get("errors", [])
-        if isinstance(errors, list):
-            for err in errors:
-                print(f"  [error] {err}")
-        warnings = validation.get("warnings", [])
-        if isinstance(warnings, list):
-            for warn in warnings:
-                print(f"  [warn] {warn}")
-    elif args.command == "decode-font":
-        from novel_crawler.decoders.font_shape import FontShapeDecoderBuilder
-        if not ctx.chinese_fonts:
-            raise SystemExit("未找到中文参考字体，无法自动破解字体映射")
-        mapping = FontShapeDecoderBuilder(ctx.chinese_fonts).build_map(args.font, args.output)
-        print(f"mapping size: {len(mapping)} -> {args.output}")
-    elif args.command == "web":
+    if args.command == "decode-font":
+        return _decode_font(ctx, args)
+    if args.command == "web":
         from novel_crawler.web import run_web_ui
+
         run_web_ui(ctx, args.host, args.port)
+        return 0
+
+    app: _Application | None = None
+    result = 3
+    try:
+        app = application_factory(ctx)
+        result = _dispatch(app, args)
+    except ApplicationError as exc:
+        result = _application_error(exc)
+    except KeyboardInterrupt:
+        print("操作已中断。", file=sys.stderr)
+        result = 130
+    except Exception:
+        print("操作失败（code=internal_error）。", file=sys.stderr)
+        result = 3
+    finally:
+        if app is not None:
+            try:
+                closed = app.close()
+            except Exception:
+                closed = False
+            if not closed:
+                print("资源未能安全关闭（code=close_incomplete），请稍后重试。", file=sys.stderr)
+                if result == 0:
+                    result = 7
+    return result
+
+
+def _dispatch(app: _Application, args: argparse.Namespace) -> int:
+    command = args.command
+    if command == "crawl":
+        if args.chase:
+            print("当前版本不支持递推抓取（code=chase_unsupported）。", file=sys.stderr)
+            return 2
+        if args.concurrency != 1:
+            print("当前版本不支持并发抓取（code=concurrency_unsupported）。", file=sys.stderr)
+            return 2
+        if args.proxy_file is not None:
+            print("当前版本不支持命令行代理文件（code=proxy_file_unsupported）。", file=sys.stderr)
+            return 2
+        options = CrawlOptions(
+            start=args.start,
+            count=args.count,
+            max_chapters=args.max_chapters,
+            concurrency=args.concurrency,
+            export=not args.no_export,
+            chase=args.chase,
+        )
+        view = _call(app, "create_crawl_task", args.url, options)
+        if not args.wait:
+            _print_view(view)
+            return 0
+        task_id = _view_dict(view).get("task_id")
+        if not isinstance(task_id, str):
+            raise ApplicationError("task_view_failed", retryable=True)
+        return _wait_for_task(app, task_id, args.poll_interval, args.timeout)
+    if command == "tasks":
+        if not 1 <= args.limit <= 1000:
+            print("任务数量必须在 1 到 1000 之间。", file=sys.stderr)
+            return 2
+        try:
+            statuses = {TaskStatus(value) for value in args.status} if args.status else None
+        except ValueError:
+            print("任务状态无效（code=task_status_invalid）。", file=sys.stderr)
+            return 2
+        _print_views(_call(app, "list_tasks", statuses=statuses, limit=args.limit))
+        return 0
+    simple = {
+        "task": "get_task",
+        "task-events": "task_events",
+        "task-pause": "pause_task",
+        "task-resume": "resume_task",
+        "task-cancel": "cancel_task",
+        "task-continue": "continue_interaction",
+        "task-retry-cleanup": "retry_cleanup",
+    }
+    if command in simple:
+        value = _call(app, simple[command], args.task_id)
+        _print_views(value) if isinstance(value, list) else _print_view(value)
+        return 0
+    if command == "task-confirm":
+        try:
+            overrides = _parse_selectors(args.selector, args.selectors_json)
+        except ValueError:
+            print("选择器参数无效（code=selector_overrides_invalid）。", file=sys.stderr)
+            return 2
+        _print_view(_call(app, "confirm_interaction", args.task_id, overrides))
+        return 0
+    if command == "books":
+        _print_json(_call(app, "list_books"))
+        return 0
+    if command == "progress":
+        _print_json(_call(app, "book_progress", args.book_id))
+        return 0
+    if command in {"inspect", "wizard"}:
+        print("该旧版命令已停用；请使用 crawl 自动适配（code=legacy_command_disabled）。", file=sys.stderr)
+        return 2
+    if command == "resume":
+        print("书籍续传已迁移为任务恢复；请使用 task-resume（code=legacy_command_disabled）。", file=sys.stderr)
+        return 2
+    return _dispatch_book_command(app, args)
+
+
+def _dispatch_book_command(app: _Application, args: argparse.Namespace) -> int:
+    command = args.command
+    calls: dict[str, tuple[str, tuple[object, ...]]] = {
+        "delete": ("delete_book", (args.book_id,)) if command == "delete" else ("", ()),
+        "validate": ("validate_book", (args.book_id,)) if command == "validate" else ("", ()),
+        "logs": ("book_logs", (args.book_id, args.limit)) if command == "logs" else ("", ()),
+        "report": ("book_report", (args.book_id,)) if command == "report" else ("", ()),
+        "retry-failed": ("retry_failed_chapters", (args.book_id, not args.no_export, args.concurrency)) if command == "retry-failed" else ("", ()),
+        "export": ("export_book", (args.book_id, args.format)) if command == "export" else ("", ()),
+        "fix-titles": ("fix_book_titles", (args.book_id,)) if command == "fix-titles" else ("", ()),
+        "dedup": ("deduplicate_book", (args.book_id, args.remove)) if command == "dedup" else ("", ()),
+        "export-all": ("export_all_books", (args.format,)) if command == "export-all" else ("", ()),
+        "retry-all": ("retry_all_failed_chapters", ()) if command == "retry-all" else ("", ()),
+        "crawl-batch": ("create_crawl_tasks_from_file", (args.file, args.concurrency, args.max_chapters)) if command == "crawl-batch" else ("", ()),
+        "preview": ("preview_book_chapter", (args.book_id, args.chapter_index, args.length)) if command == "preview" else ("", ()),
+        "stats": ("book_stats", ()) if command == "stats" else ("", ()),
+        "validate-config": ("validate_site_config", (args.config,)) if command == "validate-config" else ("", ()),
+    }
+    method, values = calls.get(command, ("", ()))
+    if not method:
+        raise ApplicationError("command_unsupported")
+    _print_json(_call(app, method, *values))
+    return 0
+
+
+def _wait_for_task(app: _Application, task_id: str, interval: float, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    while True:
+        view = _call(app, "get_task", task_id)
+        payload = _view_dict(view)
+        status = payload.get("status")
+        if status == "waiting_for_user":
+            _print_json(payload)
+            return 10
+        if payload.get("terminal") is True or status in _TERMINAL_EXIT:
+            _print_json(payload)
+            return _TERMINAL_EXIT.get(str(status), 11)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("等待任务超时（code=wait_timeout）。", file=sys.stderr)
+            return 9
+        time.sleep(min(interval, remaining))
+
+
+def _parse_selectors(items: list[str], raw_json: str | None) -> dict[str, str]:
+    if raw_json is not None:
+        try:
+            value = json.loads(raw_json)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("invalid json") from exc
+        if not isinstance(value, dict):
+            raise ValueError("mapping required")
+        pairs = value.items()
+    else:
+        parsed: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, str) or "=" not in item:
+                raise ValueError("key=value required")
+            key, value = item.split("=", 1)
+            if key in parsed:
+                raise ValueError("duplicate key")
+            parsed[key] = value
+        pairs = parsed.items()
+    result: dict[str, str] = {}
+    total = 0
+    for key, value in pairs:
+        if not isinstance(key, str) or not _SELECTOR_NAME.fullmatch(key):
+            raise ValueError("invalid key")
+        if not isinstance(value, str) or not value or len(value) > 512:
+            raise ValueError("invalid selector")
+        if any(ord(char) < 32 for char in value):
+            raise ValueError("invalid selector")
+        total += len(value)
+        if key in result or len(result) >= 20 or total > 4096:
+            raise ValueError("selector limit")
+        result[key] = value
+    return result
+
+
+def _call(app: _Application, name: str, *args: object, **kwargs: object) -> Any:
+    method = getattr(app, name, None)
+    if not callable(method):
+        raise ApplicationError("command_unsupported")
+    return method(*args, **kwargs)
+
+
+def _view_dict(value: object) -> dict[str, object]:
+    serializer = getattr(value, "to_safe_dict", None)
+    if not callable(serializer):
+        raise ApplicationError("unsafe_output_blocked")
+    payload = serializer()
+    if not isinstance(payload, dict):
+        raise ApplicationError("unsafe_output_blocked")
+    return payload
+
+
+def _print_view(value: object) -> None:
+    _print_json(_view_dict(value))
+
+
+def _print_views(values: object) -> None:
+    if not isinstance(values, list):
+        raise ApplicationError("unsafe_output_blocked")
+    _print_json([_view_dict(value) for value in values])
+
+
+def _print_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def _application_error(exc: ApplicationError) -> int:
+    message = _ERROR_MESSAGES.get(exc.code, "操作未完成")
+    print(f"{message}（code={exc.code}）。", file=sys.stderr)
+    if exc.code == "task_not_found":
+        return 4
+    if exc.code.endswith("_invalid") or exc.code.endswith("_unsupported"):
+        return 2
+    return 6 if exc.retryable else 3
+
+
+def _decode_font(ctx: RuntimeContext, args: argparse.Namespace) -> int:
+    from novel_crawler.decoders.font_shape import FontShapeDecoderBuilder
+
+    if not ctx.chinese_fonts:
+        print("未找到中文参考字体，无法自动解码字体映射。", file=sys.stderr)
+        return 3
+    try:
+        mapping = FontShapeDecoderBuilder(ctx.chinese_fonts).build_map(args.font, args.output)
+    except Exception:
+        print("字体解码失败（code=font_decode_failed）。", file=sys.stderr)
+        return 3
+    _print_json({"completed": True, "mapping_size": len(mapping)})
     return 0

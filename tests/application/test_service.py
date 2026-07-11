@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -134,6 +135,44 @@ class FakeCrawler:
     def delete_book(self, book_id: int):
         return BookDeletionResult(3, "pending", "deletion_cleanup_retryable")
 
+    def validate(self, book_id: int):
+        return SimpleNamespace(
+            book_id=book_id,
+            total=3,
+            done=2,
+            failed=1,
+            pending=0,
+            ok=False,
+            issues=[SimpleNamespace(level="error", code="FAILED", message="https://private.test")],
+        )
+
+    def fix_titles(self, book_id: int, dry_run: bool = False):
+        return SimpleNamespace(total=3, fixed=1, details=["C:\\private\\chapter.txt"])
+
+    def dedup(self, book_id: int, remove: bool = False):
+        return SimpleNamespace(total=3, exact_dupes=1, similar_dupes=0, details=["token=private"])
+
+    def logs(self, book_id: int | None = None, limit: int = 50):
+        return [{"created_at": "2026-01-01T00:00:00+00:00", "level": "info", "book_id": book_id, "chapter_index": 1, "message": "https://private.test"}]
+
+    def retry_failed(self, book_id: int, *, export: bool = True, concurrency: int = 1):
+        return None
+
+    def export_all(self, fmt: str = "txt"):
+        return [Path("C:/private/one.txt")]
+
+    def retry_all_failed(self):
+        return 2
+
+    def preview_chapter(self, book_id: int, chapter_index: int, length: int = 500):
+        return "safe preview\nhttps://private.test"
+
+    def stats(self):
+        return {"books": 2, "chapters_total": 3, "chapters_done": 2, "chapters_failed": 1, "chapters_pending": 0, "completion_rate": 66.7, "sites": {"demo": 2}, "private": "token=x"}
+
+    def validate_config(self, config_path: Path):
+        return {"valid": False, "site": "demo", "domain": "private.test", "errors": ["C:\\private"], "warnings": ["safe"]}
+
     def close(self) -> None:
         self.closed = True
 
@@ -164,6 +203,67 @@ def test_create_validates_and_persists_only_bounded_safe_options(app) -> None:
     }
     assert "example.com" not in repr(view)
     assert "secret" not in str(view.to_safe_dict())
+
+
+def test_admin_book_facade_allowlists_and_redacts_legacy_results(app) -> None:
+    service, *_ = app
+
+    validation = service.validate_book(4)
+    assert validation == {
+        "book_id": 4,
+        "total": 3,
+        "done": 2,
+        "failed": 1,
+        "pending": 0,
+        "ok": False,
+        "issues": [{"level": "error", "code": "FAILED", "message": "[redacted]"}],
+    }
+    assert service.fix_book_titles(4) == {"total": 3, "fixed": 1, "details": ["[redacted]"]}
+    assert service.deduplicate_book(4, True) == {
+        "total": 3,
+        "exact_dupes": 1,
+        "similar_dupes": 0,
+        "details": ["[redacted]"],
+    }
+    assert service.book_logs(4, 10)[0]["message"] == "[redacted]"
+    assert service.retry_failed_chapters(4, False, 1) == {"completed": True}
+    assert service.export_all_books("txt") == {"completed": 1, "format": "txt"}
+    assert service.retry_all_failed_chapters() == {"scheduled_books": 2}
+    assert service.preview_book_chapter(4, 1, 100) == "safe preview\n[redacted]"
+    assert service.book_stats() == {
+        "books": 2,
+        "chapters_total": 3,
+        "chapters_done": 2,
+        "chapters_failed": 1,
+        "chapters_pending": 0,
+        "completion_rate": 66.7,
+        "sites": {"demo": 2},
+    }
+    assert service.validate_site_config(Path("config.json")) == {
+        "valid": False,
+        "site": "demo",
+        "domain": "private.test",
+        "errors": ["[redacted]"],
+        "warnings": ["safe"],
+    }
+
+
+def test_batch_facade_reads_bounded_url_file_and_returns_only_safe_task_views(app, tmp_path) -> None:
+    service, repo, executor, *_ = app
+    source = tmp_path / "urls.txt"
+    source.write_text("# comment\nhttps://one.test/book\n\nhttps://two.test/book\n", encoding="utf-8")
+
+    result = service.create_crawl_tasks_from_file(source, concurrency=1, max_chapters=9)
+
+    assert result["created"] == 2
+    assert len(result["tasks"]) == 2
+    assert all(set(item) <= set(TaskView.__dataclass_fields__) for item in result["tasks"])
+    assert len(executor.submitted) == 2
+    assert all(repo.get_task(task_id).metadata["crawl"]["max_chapters"] == 9 for task_id in executor.submitted)
+
+    with pytest.raises(ApplicationError, match="concurrency_unsupported"):
+        service.create_crawl_tasks_from_file(source, concurrency=2)
+    assert len(executor.submitted) == 2
 
 
 @pytest.mark.parametrize(
@@ -760,6 +860,7 @@ def test_interaction_view_strictly_allowlists_kind_and_validates_fields(tmp_path
                 "kind": "https://evil.test/verification",
                 "attempt": 10**30,
                 "expires_at": "tomorrow at C:\\private",
+                "safe_origin": "https://user:secret@evil.test/private?token=x",
                 "verification_required": True,
                 "confirmation_required": False,
                 "cleanup_required": False,
@@ -777,6 +878,23 @@ def test_interaction_view_strictly_allowlists_kind_and_validates_fields(tmp_path
     assert view.interaction.kind == "unknown"
     assert view.interaction.attempt == 2_147_483_647
     assert view.interaction.expires_at is None
+    assert view.interaction.safe_origin is None
+
+
+def test_interaction_view_exposes_only_valid_safe_origin(tmp_path: Path) -> None:
+    class AlwaysSummaryController(FakeController):
+        def interaction(self, task_id: str):
+            return FakeSummary()
+
+    repo = TaskRepository(tmp_path / "safe-origin.db")
+    service = ApplicationService(repo, FakeExecutor(repo), controller=AlwaysSummaryController())
+    task = repo.create_task("https://private.test/path")
+
+    view = service.get_task(task.task_id)
+
+    assert view.interaction is not None
+    assert view.interaction.safe_origin == "example.com"
+    assert "token" not in str(view.interaction.to_safe_dict()).lower()
     assert "evil" not in repr(view)
     service.close()
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import re
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from novel_crawler.application.errors import ApplicationError
 from novel_crawler.application.models import CrawlOptions, InteractionView, TaskEventView, TaskView
@@ -65,6 +66,16 @@ class _Crawler(Protocol):
     def report(self, book_id: int) -> str: ...
     def export(self, book_id: int, fmt: str = "txt", output: Path | None = None) -> Path: ...
     def delete_book(self, book_id: int) -> _SafeSerializable: ...
+    def validate(self, book_id: int) -> object: ...
+    def fix_titles(self, book_id: int, dry_run: bool = False) -> object: ...
+    def dedup(self, book_id: int, remove: bool = False) -> object: ...
+    def logs(self, book_id: int | None = None, limit: int = 50) -> list[dict[str, object]]: ...
+    def retry_failed(self, book_id: int, *, export: bool = True, concurrency: int = 1) -> None: ...
+    def export_all(self, fmt: str = "txt") -> list[Path]: ...
+    def retry_all_failed(self) -> int: ...
+    def preview_chapter(self, book_id: int, chapter_index: int, length: int = 500) -> str: ...
+    def stats(self) -> dict[str, object]: ...
+    def validate_config(self, config_path: Path) -> dict[str, object]: ...
 
 
 class _SafeSerializable(Protocol):
@@ -277,6 +288,218 @@ class ApplicationService:
             except Exception:
                 raise ApplicationError("crawler_operation_failed", retryable=True) from None
 
+    def validate_book(self, book_id: int) -> dict[str, object]:
+        with self._operation():
+            crawler = self._require_crawler()
+            _positive_id(book_id, "book_id_invalid")
+            try:
+                report = crawler.validate(book_id)
+                issues = []
+                for issue in list(getattr(report, "issues", ()))[:100]:
+                    issues.append(
+                        {
+                            "level": _safe_text(getattr(issue, "level", "unknown"), maximum=16),
+                            "code": _safe_text(getattr(issue, "code", "unknown"), maximum=64),
+                            "message": _safe_text(getattr(issue, "message", ""), maximum=500),
+                        }
+                    )
+                return {
+                    "book_id": _safe_count(getattr(report, "book_id", book_id)),
+                    "total": _safe_count(getattr(report, "total", 0)),
+                    "done": _safe_count(getattr(report, "done", 0)),
+                    "failed": _safe_count(getattr(report, "failed", 0)),
+                    "pending": _safe_count(getattr(report, "pending", 0)),
+                    "ok": getattr(report, "ok", False) is True,
+                    "issues": issues,
+                }
+            except ApplicationError:
+                raise
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def fix_book_titles(self, book_id: int) -> dict[str, object]:
+        return self._bounded_result(
+            book_id,
+            lambda crawler: crawler.fix_titles(book_id, dry_run=False),
+            ("total", "fixed"),
+        )
+
+    def deduplicate_book(self, book_id: int, remove: bool = False) -> dict[str, object]:
+        if not isinstance(remove, bool):
+            raise ApplicationError("remove_invalid")
+        return self._bounded_result(
+            book_id,
+            lambda crawler: crawler.dedup(book_id, remove=remove),
+            ("total", "exact_dupes", "similar_dupes"),
+        )
+
+    def book_logs(self, book_id: int | None = None, limit: int = 50) -> list[dict[str, object]]:
+        with self._operation():
+            crawler = self._require_crawler()
+            if book_id is not None:
+                _positive_id(book_id, "book_id_invalid")
+            if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+                raise ApplicationError("limit_invalid")
+            try:
+                rows = crawler.logs(book_id, limit)
+                safe_rows: list[dict[str, object]] = []
+                for row in rows[:limit]:
+                    safe_rows.append(
+                        {
+                            "created_at": _safe_timestamp(row.get("created_at")),
+                            "level": _safe_text(row.get("level", "unknown"), maximum=16),
+                            "book_id": _safe_count(row.get("book_id", 0)),
+                            "chapter_index": _safe_count(row.get("chapter_index", 0)),
+                            "message": _safe_text(row.get("message", ""), maximum=1000),
+                        }
+                    )
+                return safe_rows
+            except ApplicationError:
+                raise
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def retry_failed_chapters(self, book_id: int, export: bool = True, concurrency: int = 1) -> dict[str, bool]:
+        with self._operation():
+            crawler = self._require_crawler()
+            _positive_id(book_id, "book_id_invalid")
+            if not isinstance(export, bool):
+                raise ApplicationError("export_invalid")
+            if concurrency != 1:
+                raise ApplicationError("concurrency_unsupported")
+            try:
+                crawler.retry_failed(book_id, export=export, concurrency=concurrency)
+                return {"completed": True}
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def export_all_books(self, fmt: str = "txt") -> dict[str, object]:
+        with self._operation():
+            crawler = self._require_crawler()
+            if not isinstance(fmt, str) or fmt not in _FORMATS:
+                raise ApplicationError("export_format_invalid")
+            try:
+                paths = crawler.export_all(fmt)
+                return {"completed": min(len(paths), 2_147_483_647), "format": fmt}
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def retry_all_failed_chapters(self) -> dict[str, int]:
+        with self._operation():
+            crawler = self._require_crawler()
+            try:
+                return {"scheduled_books": _safe_count(crawler.retry_all_failed())}
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def preview_book_chapter(self, book_id: int, chapter_index: int, length: int = 500) -> str:
+        with self._operation():
+            crawler = self._require_crawler()
+            _positive_id(book_id, "book_id_invalid")
+            _positive_id(chapter_index, "chapter_index_invalid")
+            if isinstance(length, bool) or not isinstance(length, int) or not 1 <= length <= 10_000:
+                raise ApplicationError("length_invalid")
+            try:
+                value = crawler.preview_chapter(book_id, chapter_index, length)
+                return "\n".join(_safe_line(line) for line in value[:12_000].splitlines())
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def book_stats(self) -> dict[str, object]:
+        with self._operation():
+            crawler = self._require_crawler()
+            try:
+                raw = crawler.stats()
+                sites_raw = raw.get("sites")
+                sites: dict[str, int] = {}
+                if isinstance(sites_raw, Mapping):
+                    for key, value in list(sites_raw.items())[:100]:
+                        safe_key = _safe_text(key, maximum=128)
+                        if safe_key != "[redacted]":
+                            sites[safe_key] = _safe_count(value)
+                result: dict[str, object] = {
+                    key: _safe_count(raw.get(key, 0))
+                    for key in ("books", "chapters_total", "chapters_done", "chapters_failed", "chapters_pending")
+                }
+                rate = raw.get("completion_rate", 0)
+                result["completion_rate"] = float(rate) if isinstance(rate, (int, float)) and not isinstance(rate, bool) and 0 <= rate <= 100 else 0.0
+                result["sites"] = sites
+                return result
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def validate_site_config(self, config_path: Path) -> dict[str, object]:
+        with self._operation():
+            crawler = self._require_crawler()
+            if not isinstance(config_path, Path):
+                raise ApplicationError("config_path_invalid")
+            try:
+                raw = crawler.validate_config(config_path)
+                return {
+                    "valid": raw.get("valid") is True,
+                    "site": _safe_text(raw.get("site", ""), maximum=128),
+                    "domain": _safe_text(raw.get("domain", ""), maximum=253),
+                    "errors": _safe_string_list(raw.get("errors")),
+                    "warnings": _safe_string_list(raw.get("warnings")),
+                }
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def create_crawl_tasks_from_file(
+        self,
+        file_path: Path,
+        concurrency: int = 1,
+        max_chapters: int | None = None,
+    ) -> dict[str, object]:
+        if concurrency != 1:
+            raise ApplicationError("concurrency_unsupported")
+        options = CrawlOptions(max_chapters=max_chapters, concurrency=concurrency, export=False)
+        if not isinstance(file_path, Path):
+            raise ApplicationError("batch_file_invalid")
+        try:
+            if file_path.is_symlink() or not file_path.is_file() or file_path.stat().st_size > 1_048_576:
+                raise ApplicationError("batch_file_invalid")
+            lines = file_path.read_text(encoding="utf-8").splitlines()
+        except ApplicationError:
+            raise
+        except (OSError, UnicodeError):
+            raise ApplicationError("batch_file_invalid") from None
+        urls = [line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+        if not urls or len(urls) > 1000:
+            raise ApplicationError("batch_file_invalid")
+        for url in urls:
+            parsed = urlsplit(url)
+            if (
+                len(url) > 2048
+                or parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                raise ApplicationError("source_url_invalid")
+        views = [self.create_crawl_task(url, options) for url in urls]
+        return {"created": len(views), "tasks": [view.to_safe_dict() for view in views]}
+
+    def _bounded_result(
+        self,
+        book_id: int,
+        operation: Callable[[_Crawler], object],
+        count_fields: tuple[str, ...],
+    ) -> dict[str, object]:
+        with self._operation():
+            self._require_crawler()
+            _positive_id(book_id, "book_id_invalid")
+            try:
+                crawler = self._require_crawler()
+                result = operation(crawler)
+                safe: dict[str, object] = {
+                    field: _safe_count(getattr(result, field, 0)) for field in count_fields
+                }
+                safe["details"] = _safe_string_list(getattr(result, "details", ()), maximum=20)
+                return safe
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
     def close(self) -> bool:
         with self._lock:
             if self._state is _ServiceState.CLOSED:
@@ -384,6 +607,7 @@ class ApplicationService:
                     kind=kind,
                     attempt=_safe_count(safe.get("attempt", 0)),
                     expires_at=_safe_timestamp(safe.get("expires_at")),
+                    safe_origin=_safe_origin(safe.get("safe_origin")),
                     verification_required=safe.get("verification_required") is True,
                     confirmation_required=safe.get("confirmation_required") is True,
                     cleanup_required=safe.get("cleanup_required") is True,
@@ -463,6 +687,34 @@ def _safe_timestamp(value: object) -> str | None:
     return value if parsed.tzinfo is not None else None
 
 
+def _safe_origin(value: object) -> str | None:
+    if not isinstance(value, str) or not value or len(value) > 300 or not value.isascii():
+        return None
+    if re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value, re.I):
+        return value.lower()
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or host is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+        return None
+    default_port = 443 if parsed.scheme == "https" else 80
+    authority = host.lower() if port in {None, default_port} else f"{host.lower()}:{port}"
+    return f"{parsed.scheme}://{authority}/"
+
+
 def _safe_text(value: object, *, maximum: int = 256) -> str:
     if not isinstance(value, str) or _UNSAFE_TEXT.search(value) or any(ord(char) < 32 for char in value):
         return "[redacted]"
@@ -491,3 +743,9 @@ def _progress_from_metadata(metadata: Mapping[str, object]) -> dict[str, int]:
     if not isinstance(value, Mapping):
         return {}
     return {key: _safe_count(value.get(key, 0)) for key in _PROGRESS_KEYS}
+
+
+def _safe_string_list(value: object, *, maximum: int = 100) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [_safe_text(item, maximum=1000) for item in value[:maximum]]
