@@ -1,11 +1,22 @@
+from novel_crawler.task_engine.executor import (
+    BackgroundTaskExecutor,
+    ExecutorClosed,
+    ExecutorQueueFull,
+    TaskControlRequested,
+    TaskExecutionContext,
+    TaskExecutorError,
+    TerminalTaskError,
+)
 from novel_crawler.task_engine.models import (
     ALLOWED_TRANSITIONS,
     TERMINAL_STATUSES,
+    CheckpointRecord,
     TaskEvent,
     TaskRecord,
     TaskStatus,
 )
 from novel_crawler.task_engine.repository import (
+    CheckpointNotFound,
     InvalidTaskTransition,
     TaskInputError,
     TaskNotFound,
@@ -16,9 +27,17 @@ from novel_crawler.task_engine.repository import (
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
+    "BackgroundTaskExecutor",
+    "CheckpointNotFound",
+    "CheckpointRecord",
+    "ExecutorClosed",
+    "ExecutorQueueFull",
     "TERMINAL_STATUSES",
     "InvalidTaskTransition",
     "TaskEvent",
+    "TaskControlRequested",
+    "TaskExecutionContext",
+    "TaskExecutorError",
     "TaskInputError",
     "TaskNotFound",
     "TaskRecord",
@@ -26,4 +45,5 @@ __all__ = [
     "TaskRepositoryError",
     "TaskStatus",
     "TaskVersionConflict",
+    "TerminalTaskError",
 ]

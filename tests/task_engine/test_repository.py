@@ -47,10 +47,7 @@ def test_migration_is_idempotent_and_non_destructive_for_old_storage(tmp_path: P
         assert first.schema_version == 2
     with TaskRepository(path) as second:
         assert second.schema_version == 2
-        tables = {
-            row[0]
-            for row in second.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
+        tables = {row[0] for row in second.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"books", "chapters", "tasks", "task_events", "checkpoints", "task_schema_migrations"} <= tables
         assert second.connection.execute("SELECT title FROM books").fetchone()[0] == "kept"
         assert second.connection.execute("SELECT COUNT(*) FROM task_schema_migrations").fetchone()[0] == 2
@@ -269,9 +266,7 @@ def test_transition_table_covers_every_status_and_active_work_can_pause_and_resu
         (TaskStatus.VALIDATING, TaskStatus.READY),
     ],
 )
-def test_pause_can_only_resume_its_persisted_origin(
-    tmp_path: Path, origin: TaskStatus, blocked: TaskStatus
-) -> None:
+def test_pause_can_only_resume_its_persisted_origin(tmp_path: Path, origin: TaskStatus, blocked: TaskStatus) -> None:
     path = tmp_path / "tasks.db"
     with TaskRepository(path) as repository:
         task = repository.create_task("https://example.test/book")
@@ -304,9 +299,7 @@ def test_recoverable_failure_only_retries_failed_origin_after_restart(tmp_path: 
     with TaskRepository(path) as repository:
         task = repository.create_task("https://example.test/book")
         probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0)
-        failed = repository.transition(
-            task.task_id, TaskStatus.RECOVERABLE_FAILED, expected_version=probing.version
-        )
+        failed = repository.transition(task.task_id, TaskStatus.RECOVERABLE_FAILED, expected_version=probing.version)
         assert failed.resume_status is TaskStatus.PROBING
 
     with TaskRepository(path) as reopened:
@@ -321,15 +314,9 @@ def test_waiting_for_user_recoverable_failure_can_only_return_to_waiting(tmp_pat
     with TaskRepository(tmp_path / "tasks.db") as repository:
         task = repository.create_task("https://example.test/book")
         probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0)
-        waiting = repository.transition(
-            task.task_id, TaskStatus.WAITING_FOR_USER, expected_version=probing.version
-        )
-        failed = repository.transition(
-            task.task_id, TaskStatus.RECOVERABLE_FAILED, expected_version=waiting.version
-        )
-        resumed = repository.transition(
-            task.task_id, TaskStatus.WAITING_FOR_USER, expected_version=failed.version
-        )
+        waiting = repository.transition(task.task_id, TaskStatus.WAITING_FOR_USER, expected_version=probing.version)
+        failed = repository.transition(task.task_id, TaskStatus.RECOVERABLE_FAILED, expected_version=waiting.version)
+        resumed = repository.transition(task.task_id, TaskStatus.WAITING_FOR_USER, expected_version=failed.version)
         assert resumed.resume_status is None
 
 
@@ -372,9 +359,7 @@ def test_lists_tasks_for_restart_with_status_filter_and_bounds(tmp_path: Path) -
 def test_refuses_database_from_unknown_future_task_schema(tmp_path: Path) -> None:
     path = tmp_path / "future.db"
     connection = sqlite3.connect(path)
-    connection.execute(
-        "CREATE TABLE task_schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
-    )
+    connection.execute("CREATE TABLE task_schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
     connection.execute("INSERT INTO task_schema_migrations VALUES(999, 'future')")
     connection.commit()
     connection.close()
@@ -461,9 +446,7 @@ def _create_v1_resume_database(
     )
     task_id = "b" * 32
     destination = TaskStatus(status)
-    origin = origin or (
-        TaskStatus.WAITING_FOR_USER if destination is TaskStatus.PAUSED else TaskStatus.PROBING
-    )
+    origin = origin or (TaskStatus.WAITING_FOR_USER if destination is TaskStatus.PAUSED else TaskStatus.PROBING)
     statuses = [*_V1_PATHS[origin], destination]
     events = [
         (None if version == 0 else statuses[version - 1].value, current.value)
@@ -512,9 +495,10 @@ def test_v1_migration_accepts_every_historical_paused_origin(tmp_path: Path, ori
         if origin is TaskStatus.CREATED:
             with pytest.raises(InvalidTaskTransition):
                 repository.transition(resumed.task_id, TaskStatus.CRAWLING, expected_version=resumed.version)
-            assert repository.transition(
-                resumed.task_id, TaskStatus.PROBING, expected_version=resumed.version
-            ).status is TaskStatus.PROBING
+            assert (
+                repository.transition(resumed.task_id, TaskStatus.PROBING, expected_version=resumed.version).status
+                is TaskStatus.PROBING
+            )
 
 
 @pytest.mark.parametrize(
@@ -526,17 +510,13 @@ def test_v1_migration_accepts_every_historical_paused_origin(tmp_path: Path, ori
         TaskStatus.CRAWLING,
     ],
 )
-def test_v1_migration_accepts_every_historical_recoverable_origin(
-    tmp_path: Path, origin: TaskStatus
-) -> None:
+def test_v1_migration_accepts_every_historical_recoverable_origin(tmp_path: Path, origin: TaskStatus) -> None:
     path = tmp_path / f"recoverable-{origin.value}.db"
     _create_v1_resume_database(path, status=TaskStatus.RECOVERABLE_FAILED.value, origin=origin)
     with TaskRepository(path) as repository:
         failed = repository.get_task("b" * 32)
         assert failed.resume_status is origin
-        assert repository.transition(
-            failed.task_id, origin, expected_version=failed.version
-        ).status is origin
+        assert repository.transition(failed.task_id, origin, expected_version=failed.version).status is origin
 
 
 @pytest.mark.parametrize(
@@ -558,16 +538,12 @@ def test_v1_migration_atomically_backfills_resume_origin_from_event_chain(
         assert task.resume_status is expected_origin
         with pytest.raises(InvalidTaskTransition):
             repository.transition(task.task_id, TaskStatus.CRAWLING, expected_version=task.version)
-        resumed = repository.transition(
-            task.task_id, expected_origin, expected_version=task.version
-        )
+        resumed = repository.transition(task.task_id, expected_origin, expected_version=task.version)
         assert resumed.resume_status is None
 
 
 @pytest.mark.parametrize("broken", ["missing", "illegal"])
-def test_v1_resume_migration_bad_events_roll_back_schema_and_version(
-    tmp_path: Path, broken: str
-) -> None:
+def test_v1_resume_migration_bad_events_roll_back_schema_and_version(tmp_path: Path, broken: str) -> None:
     path = tmp_path / f"broken-{broken}.db"
     _create_v1_resume_database(path, status=TaskStatus.PAUSED.value, broken=broken)
     with pytest.raises(TaskInputError, match="migration_resume"):
@@ -582,9 +558,7 @@ def test_v1_resume_migration_bad_events_roll_back_schema_and_version(
 
 def test_v1_resume_migration_multiple_tasks_one_bad_rolls_everything_back(tmp_path: Path) -> None:
     path = tmp_path / "multiple.db"
-    _create_v1_resume_database(
-        path, status=TaskStatus.PAUSED.value, origin=TaskStatus.CRAWLING
-    )
+    _create_v1_resume_database(path, status=TaskStatus.PAUSED.value, origin=TaskStatus.CRAWLING)
     connection = sqlite3.connect(path)
     bad_id = "c" * 32
     connection.execute(
@@ -632,14 +606,10 @@ def test_rejects_cyclic_and_non_mapping_metadata_with_public_error(tmp_path: Pat
         "https://username:password@example.test/private",
     ],
 )
-def test_rejects_sensitive_string_values_in_task_and_event_nested_metadata(
-    tmp_path: Path, private_value: str
-) -> None:
+def test_rejects_sensitive_string_values_in_task_and_event_nested_metadata(tmp_path: Path, private_value: str) -> None:
     with TaskRepository(tmp_path / "tasks.db") as repository:
         with pytest.raises(TaskInputError, match="metadata"):
-            repository.create_task(
-                "https://example.test/book", metadata={"safe": [{"note": private_value}]}
-            )
+            repository.create_task("https://example.test/book", metadata={"safe": [{"note": private_value}]})
         task = repository.create_task("https://example.test/book")
         with pytest.raises(TaskInputError, match="metadata"):
             repository.transition(
@@ -668,13 +638,9 @@ def test_rejects_sensitive_string_values_in_task_and_event_nested_metadata(
         "Cookie: Chocolate-Chip",
     ],
 )
-def test_allows_normal_book_text_that_contains_credential_words(
-    tmp_path: Path, normal_value: str
-) -> None:
+def test_allows_normal_book_text_that_contains_credential_words(tmp_path: Path, normal_value: str) -> None:
     with TaskRepository(tmp_path / "tasks.db") as repository:
-        task = repository.create_task(
-            "https://example.test/book", metadata={"book_title": normal_value}
-        )
+        task = repository.create_task("https://example.test/book", metadata={"book_title": normal_value})
         probing = repository.transition(
             task.task_id,
             TaskStatus.PROBING,
@@ -695,9 +661,7 @@ def test_allows_normal_book_text_that_contains_credential_words(
         ("name", "api key: aBcdEfghIjkl1234"),
     ],
 )
-def test_display_fields_still_reject_high_confidence_colon_credentials(
-    tmp_path: Path, field: str, value: str
-) -> None:
+def test_display_fields_still_reject_high_confidence_colon_credentials(tmp_path: Path, field: str, value: str) -> None:
     with TaskRepository(tmp_path / "tasks.db") as repository:
         with pytest.raises(TaskInputError, match="metadata"):
             repository.create_task("https://example.test/book", metadata={field: value})
@@ -736,9 +700,7 @@ def test_display_fields_still_reject_high_confidence_colon_credentials(
         "auth-token: trusted",
     ],
 )
-def test_rejects_high_confidence_credential_assignment_matrix(
-    tmp_path: Path, credential: str
-) -> None:
+def test_rejects_high_confidence_credential_assignment_matrix(tmp_path: Path, credential: str) -> None:
     with TaskRepository(tmp_path / "tasks.db") as repository:
         with pytest.raises(TaskInputError, match="metadata"):
             repository.create_task("https://example.test/book", metadata={"note": credential})
@@ -764,9 +726,7 @@ def test_rejects_structured_credential_keys(tmp_path: Path, key: str) -> None:
         "PREFIX_SESSION_ID=session-private",
     ],
 )
-def test_rejects_prefixed_environment_credential_assignments(
-    tmp_path: Path, assignment: str
-) -> None:
+def test_rejects_prefixed_environment_credential_assignments(tmp_path: Path, assignment: str) -> None:
     with TaskRepository(tmp_path / "tasks.db") as repository:
         with pytest.raises(TaskInputError, match="metadata"):
             repository.create_task("https://example.test/book", metadata={"note": assignment})

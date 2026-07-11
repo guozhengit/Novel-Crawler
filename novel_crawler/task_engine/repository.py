@@ -12,7 +12,13 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit
 
-from novel_crawler.task_engine.models import ALLOWED_TRANSITIONS, TaskEvent, TaskRecord, TaskStatus
+from novel_crawler.task_engine.models import (
+    ALLOWED_TRANSITIONS,
+    CheckpointRecord,
+    TaskEvent,
+    TaskRecord,
+    TaskStatus,
+)
 
 SCHEMA_VERSION = 2
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -45,9 +51,7 @@ _CREDENTIAL_EQUALS = re.compile(rf"(?i)(?<![a-z0-9]){_CREDENTIAL_LABEL}\s*=\s*\S
 _CREDENTIAL_COLON_VALUE = re.compile(
     rf"(?i)(?<![a-z0-9_])(?P<label>{_CREDENTIAL_LABEL})\s*:\s*=?\s*(?P<value>[^\s,;]+)"
 )
-_CREDENTIAL_JSON = re.compile(
-    rf'''(?i)["']{_CREDENTIAL_LABEL}["']\s*:\s*["'][^"']+["']'''
-)
+_CREDENTIAL_JSON = re.compile(rf"""(?i)["']{_CREDENTIAL_LABEL}["']\s*:\s*["'][^"']+["']""")
 _COOKIE_HEADER = re.compile(r"(?im)^\s*cookie\s*:\s*[^\s=;]+=[^\s;]+")
 _HTML_STRUCTURE = re.compile(r"(?i)<\s*(?:html|body)(?:\s|>)")
 _PROFILE_PATH_ASSIGNMENT = re.compile(r"(?i)profile(?:_|\s+)path\s*[:=]\s*\S+")
@@ -55,76 +59,79 @@ _STATUS_SQL = ", ".join(f"'{status.value}'" for status in TaskStatus)
 _RESUMABLE_STATUSES = frozenset({TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED})
 _DISPLAY_TEXT_KEYS = frozenset({"book_name", "book_title", "name", "title"})
 _MAX_MIGRATION_EVENTS = 100_000
+_CHECKPOINT_KEY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 
-V1_ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = MappingProxyType({
-    TaskStatus.CREATED: frozenset({TaskStatus.PROBING, TaskStatus.PAUSED, TaskStatus.CANCELLED}),
-    TaskStatus.PROBING: frozenset(
-        {
-            TaskStatus.WAITING_FOR_USER,
-            TaskStatus.VALIDATING,
-            TaskStatus.RECOVERABLE_FAILED,
-            TaskStatus.PAUSED,
-            TaskStatus.TERMINAL_FAILED,
-            TaskStatus.CANCELLED,
-        }
-    ),
-    TaskStatus.WAITING_FOR_USER: frozenset(
-        {
-            TaskStatus.VALIDATING,
-            TaskStatus.RECOVERABLE_FAILED,
-            TaskStatus.TERMINAL_FAILED,
-            TaskStatus.PAUSED,
-            TaskStatus.CANCELLED,
-        }
-    ),
-    TaskStatus.VALIDATING: frozenset(
-        {
-            TaskStatus.WAITING_FOR_USER,
-            TaskStatus.READY,
-            TaskStatus.RECOVERABLE_FAILED,
-            TaskStatus.PAUSED,
-            TaskStatus.TERMINAL_FAILED,
-            TaskStatus.CANCELLED,
-        }
-    ),
-    TaskStatus.READY: frozenset(
-        {TaskStatus.CRAWLING, TaskStatus.PAUSED, TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED}
-    ),
-    TaskStatus.CRAWLING: frozenset(
-        {
-            TaskStatus.COMPLETED,
-            TaskStatus.PAUSED,
-            TaskStatus.WAITING_FOR_USER,
-            TaskStatus.RECOVERABLE_FAILED,
-            TaskStatus.TERMINAL_FAILED,
-            TaskStatus.CANCELLED,
-        }
-    ),
-    TaskStatus.PAUSED: frozenset(
-        {
-            TaskStatus.PROBING,
-            TaskStatus.WAITING_FOR_USER,
-            TaskStatus.VALIDATING,
-            TaskStatus.READY,
-            TaskStatus.CRAWLING,
-            TaskStatus.CANCELLED,
-        }
-    ),
-    TaskStatus.RECOVERABLE_FAILED: frozenset(
-        {
-            TaskStatus.PROBING,
-            TaskStatus.VALIDATING,
-            TaskStatus.READY,
-            TaskStatus.CRAWLING,
-            TaskStatus.TERMINAL_FAILED,
-            TaskStatus.CANCELLED,
-        }
-    ),
-    TaskStatus.COMPLETED: frozenset(),
-    TaskStatus.TERMINAL_FAILED: frozenset(),
-    TaskStatus.CANCELLED: frozenset(),
-})
+V1_ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = MappingProxyType(
+    {
+        TaskStatus.CREATED: frozenset({TaskStatus.PROBING, TaskStatus.PAUSED, TaskStatus.CANCELLED}),
+        TaskStatus.PROBING: frozenset(
+            {
+                TaskStatus.WAITING_FOR_USER,
+                TaskStatus.VALIDATING,
+                TaskStatus.RECOVERABLE_FAILED,
+                TaskStatus.PAUSED,
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.CANCELLED,
+            }
+        ),
+        TaskStatus.WAITING_FOR_USER: frozenset(
+            {
+                TaskStatus.VALIDATING,
+                TaskStatus.RECOVERABLE_FAILED,
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.PAUSED,
+                TaskStatus.CANCELLED,
+            }
+        ),
+        TaskStatus.VALIDATING: frozenset(
+            {
+                TaskStatus.WAITING_FOR_USER,
+                TaskStatus.READY,
+                TaskStatus.RECOVERABLE_FAILED,
+                TaskStatus.PAUSED,
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.CANCELLED,
+            }
+        ),
+        TaskStatus.READY: frozenset(
+            {TaskStatus.CRAWLING, TaskStatus.PAUSED, TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED}
+        ),
+        TaskStatus.CRAWLING: frozenset(
+            {
+                TaskStatus.COMPLETED,
+                TaskStatus.PAUSED,
+                TaskStatus.WAITING_FOR_USER,
+                TaskStatus.RECOVERABLE_FAILED,
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.CANCELLED,
+            }
+        ),
+        TaskStatus.PAUSED: frozenset(
+            {
+                TaskStatus.PROBING,
+                TaskStatus.WAITING_FOR_USER,
+                TaskStatus.VALIDATING,
+                TaskStatus.READY,
+                TaskStatus.CRAWLING,
+                TaskStatus.CANCELLED,
+            }
+        ),
+        TaskStatus.RECOVERABLE_FAILED: frozenset(
+            {
+                TaskStatus.PROBING,
+                TaskStatus.VALIDATING,
+                TaskStatus.READY,
+                TaskStatus.CRAWLING,
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.CANCELLED,
+            }
+        ),
+        TaskStatus.COMPLETED: frozenset(),
+        TaskStatus.TERMINAL_FAILED: frozenset(),
+        TaskStatus.CANCELLED: frozenset(),
+    }
+)
 
 
 class TaskRepositoryError(RuntimeError):
@@ -140,6 +147,10 @@ class TaskNotFound(TaskRepositoryError, KeyError):
 
 
 class TaskVersionConflict(TaskRepositoryError):
+    pass
+
+
+class CheckpointNotFound(TaskRepositoryError, KeyError):
     pass
 
 
@@ -270,9 +281,7 @@ class TaskRepository:
             )
         if self.schema_version < 2:
             with self._transaction():
-                columns = {
-                    str(row[1]) for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()
-                }
+                columns = {str(row[1]) for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()}
                 if "resume_status" not in columns:
                     self._connection.execute(
                         f"ALTER TABLE tasks ADD COLUMN resume_status TEXT "
@@ -431,17 +440,13 @@ class TaskRepository:
             if current.version != expected_version:
                 raise TaskVersionConflict("task_version_conflict")
             if to_status not in ALLOWED_TRANSITIONS[current.status]:
-                raise InvalidTaskTransition(
-                    f"transition_not_allowed:{current.status.value}:{to_status.value}"
-                )
+                raise InvalidTaskTransition(f"transition_not_allowed:{current.status.value}:{to_status.value}")
             if current.status in _RESUMABLE_STATUSES and to_status not in {
                 TaskStatus.TERMINAL_FAILED,
                 TaskStatus.CANCELLED,
             }:
                 if current.resume_status is None or to_status is not current.resume_status:
-                    raise InvalidTaskTransition(
-                        f"resume_not_allowed:{current.status.value}:{to_status.value}"
-                    )
+                    raise InvalidTaskTransition(f"resume_not_allowed:{current.status.value}:{to_status.value}")
             if to_status in _RESUMABLE_STATUSES:
                 resume_status = current.status
             else:
@@ -498,9 +503,88 @@ class TaskRepository:
             updated_at=timestamp,
         )
 
-    def _validate_metadata(
-        self, metadata: Mapping[str, Any] | None
-    ) -> tuple[dict[str, Any], str]:
+    def save_checkpoint(
+        self,
+        task_id: str,
+        key: str,
+        payload: Mapping[str, Any],
+        *,
+        expected_version: int | None,
+    ) -> CheckpointRecord:
+        key = _validate_checkpoint_key(key)
+        if expected_version is not None and (
+            isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0
+        ):
+            raise TaskInputError("checkpoint_expected_version_invalid")
+        payload_value, payload_json = self._validate_metadata(payload)
+        timestamp = _now()
+        with self._lock, self._transaction():
+            if self._connection.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone() is None:
+                raise TaskNotFound("task_not_found")
+            if expected_version is None:
+                try:
+                    self._connection.execute(
+                        """
+                        INSERT INTO checkpoints(task_id, checkpoint_key, payload_json, version, updated_at)
+                        VALUES(?, ?, ?, 0, ?)
+                        """,
+                        (task_id, key, payload_json, timestamp),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise TaskVersionConflict("checkpoint_version_conflict") from exc
+                version = 0
+            else:
+                version = expected_version + 1
+                updated = self._connection.execute(
+                    """
+                    UPDATE checkpoints SET payload_json=?, version=?, updated_at=?
+                    WHERE task_id=? AND checkpoint_key=? AND version=?
+                    """,
+                    (payload_json, version, timestamp, task_id, key, expected_version),
+                )
+                if updated.rowcount != 1:
+                    raise TaskVersionConflict("checkpoint_version_conflict")
+        return CheckpointRecord(task_id, key, version, timestamp, payload_value)
+
+    def load_checkpoint(self, task_id: str, key: str) -> CheckpointRecord:
+        key = _validate_checkpoint_key(key)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM checkpoints WHERE task_id=? AND checkpoint_key=?",
+                (task_id, key),
+            ).fetchone()
+        if row is None:
+            raise CheckpointNotFound("checkpoint_not_found")
+        return _checkpoint_from_row(row)
+
+    def list_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
+        with self._lock:
+            if self._connection.execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone() is None:
+                raise TaskNotFound("task_not_found")
+            rows = self._connection.execute(
+                "SELECT * FROM checkpoints WHERE task_id=? ORDER BY checkpoint_key", (task_id,)
+            ).fetchall()
+        return [_checkpoint_from_row(row) for row in rows]
+
+    def delete_checkpoint(self, task_id: str, key: str, *, expected_version: int) -> None:
+        key = _validate_checkpoint_key(key)
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
+            raise TaskInputError("checkpoint_expected_version_invalid")
+        with self._lock, self._transaction():
+            deleted = self._connection.execute(
+                "DELETE FROM checkpoints WHERE task_id=? AND checkpoint_key=? AND version=?",
+                (task_id, key, expected_version),
+            )
+            if deleted.rowcount != 1:
+                exists = self._connection.execute(
+                    "SELECT 1 FROM checkpoints WHERE task_id=? AND checkpoint_key=?",
+                    (task_id, key),
+                ).fetchone()
+                if exists is None:
+                    raise CheckpointNotFound("checkpoint_not_found")
+                raise TaskVersionConflict("checkpoint_version_conflict")
+
+    def _validate_metadata(self, metadata: Mapping[str, Any] | None) -> tuple[dict[str, Any], str]:
         if metadata is not None and not isinstance(metadata, Mapping):
             raise TaskInputError("metadata_invalid")
         value = dict(metadata or {})
@@ -541,6 +625,12 @@ def _validate_source_url(value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise TaskInputError("source_url_invalid")
+    return value
+
+
+def _validate_checkpoint_key(value: str) -> str:
+    if not isinstance(value, str) or _CHECKPOINT_KEY.fullmatch(value) is None:
+        raise TaskInputError("checkpoint_key_invalid")
     return value
 
 
@@ -630,9 +720,7 @@ def _looks_like_display_credential(label: str, value: str) -> bool:
     return len(candidate) >= 16 and not candidate.istitle()
 
 
-def _validated_resume_origin(
-    events: list[sqlite3.Row], task_status: TaskStatus, task_version: int
-) -> TaskStatus:
+def _validated_resume_origin(events: list[sqlite3.Row], task_status: TaskStatus, task_version: int) -> TaskStatus:
     if len(events) != task_version + 1:
         raise ValueError
     previous: TaskStatus | None = None
@@ -685,4 +773,14 @@ def _event_from_row(row: sqlite3.Row) -> TaskEvent:
         error_code=row["error_code"],
         error_message=row["error_message"],
         created_at=str(row["created_at"]),
+    )
+
+
+def _checkpoint_from_row(row: sqlite3.Row) -> CheckpointRecord:
+    return CheckpointRecord(
+        task_id=str(row["task_id"]),
+        key=str(row["checkpoint_key"]),
+        payload=json.loads(row["payload_json"]),
+        version=int(row["version"]),
+        updated_at=str(row["updated_at"]),
     )

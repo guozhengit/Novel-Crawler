@@ -20,9 +20,7 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-TERMINAL_STATUSES = frozenset(
-    {TaskStatus.COMPLETED, TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED}
-)
+TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED})
 
 
 _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
@@ -151,4 +149,21 @@ class TaskEvent:
             "task_version": self.task_version,
             "created_at": self.created_at,
             "error_code": self.error_code,
+        }
+
+
+@dataclass(frozen=True)
+class CheckpointRecord:
+    task_id: str
+    key: str
+    version: int
+    updated_at: str
+    payload: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_safe_dict(self) -> dict[str, str | int]:
+        return {
+            "task_id": self.task_id,
+            "key": self.key,
+            "version": self.version,
+            "updated_at": self.updated_at,
         }
