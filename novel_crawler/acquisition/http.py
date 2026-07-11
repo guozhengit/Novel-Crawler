@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -139,12 +140,14 @@ class HttpPageAcquirer:
         max_body_bytes: int | None = None,
         locked_origin: str | None = None,
         classifiable_statuses: frozenset[int] = frozenset(),
+        timeout: float | None = None,
     ) -> PageSnapshot:
         return self.fetch_page(
             url,
             max_body_bytes=max_body_bytes,
             locked_origin=locked_origin,
             classifiable_statuses=classifiable_statuses,
+            timeout=timeout,
         ).snapshot
 
     def fetch_page(
@@ -154,10 +157,19 @@ class HttpPageAcquirer:
         max_body_bytes: int | None = None,
         locked_origin: str | None = None,
         classifiable_statuses: frozenset[int] = frozenset(),
+        timeout: float | None = None,
     ) -> AcquiredPage:
         effective_max = self.max_body_bytes if max_body_bytes is None else min(self.max_body_bytes, max_body_bytes)
         if effective_max <= 0:
             raise ValueError("max_body_bytes must be positive")
+        effective_timeout = self.timeout if timeout is None else timeout
+        if (
+            isinstance(effective_timeout, bool)
+            or not isinstance(effective_timeout, int | float)
+            or not math.isfinite(effective_timeout)
+            or effective_timeout <= 0
+        ):
+            raise ValueError("timeout must be positive and finite")
         origin_lock = self._origin_key(locked_origin) if locked_origin is not None else None
         if origin_lock is not None and self._origin_key(url) != origin_lock:
             raise AcquisitionError("cross_origin", redact_url(url), False)
@@ -166,7 +178,7 @@ class HttpPageAcquirer:
         seen = {current_url}
         redirects: list[RedirectHop] = []
         target: ResolvedTarget | None = None
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + float(effective_timeout)
 
         while True:
             try:

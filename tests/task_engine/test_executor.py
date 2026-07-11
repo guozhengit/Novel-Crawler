@@ -743,3 +743,29 @@ def test_handler_can_report_a_stable_recoverable_failure_code(tmp_path: Path) ->
             executor.submit(task.task_id)
             _wait_for_status(repository, task.task_id, TaskStatus.RECOVERABLE_FAILED)
             assert repository.get_task(task.task_id).error_code == "verification_required"
+
+
+@pytest.mark.parametrize(("count", "queue_size"), [(4, 1), (1005, 8)])
+def test_startup_reconciler_eventually_schedules_all_deferred_tasks(
+    tmp_path: Path, count: int, queue_size: int
+) -> None:
+    with TaskRepository(tmp_path / f"deferred-{count}.db") as repository:
+        task_ids = [
+            repository.create_task(f"https://example.test/book/{index}").task_id
+            for index in range(count)
+        ]
+        executor = BackgroundTaskExecutor(
+            repository,
+            {TaskStatus.PROBING: lambda _context, _task: TaskStatus.TERMINAL_FAILED},
+            max_workers=4,
+            max_queue_size=queue_size,
+            recover_on_start=False,
+        )
+        executor.recover_and_schedule()
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if all(repository.get_task(task_id).status is TaskStatus.TERMINAL_FAILED for task_id in task_ids):
+                break
+            time.sleep(0.02)
+        assert all(repository.get_task(task_id).status is TaskStatus.TERMINAL_FAILED for task_id in task_ids)
+        assert executor.shutdown(timeout=5)

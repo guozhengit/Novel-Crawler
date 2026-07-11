@@ -122,6 +122,7 @@ class BackgroundTaskExecutor:
         self._startup_deferred_count = 0
         self._startup_recovered = False
         self._closing = threading.Event()
+        self._reconciler: threading.Thread | None = None
         self._threads = [
             threading.Thread(
                 target=self._worker,
@@ -261,7 +262,12 @@ class BackgroundTaskExecutor:
             if self._startup_recovered:
                 return 0
             self._startup_recovered = True
-        self.recover_startup()
+        try:
+            self.recover_startup()
+        except Exception:
+            with self._lock:
+                self._startup_recovered = False
+            raise
         safe_tasks = self._repository.list_tasks(statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000)
         scheduled = 0
         for index, task in enumerate(safe_tasks):
@@ -271,7 +277,32 @@ class BackgroundTaskExecutor:
             except ExecutorQueueFull:
                 self._startup_deferred_count = len(safe_tasks) - index
                 break
+        self._reconciler = threading.Thread(
+            target=self._reconcile_deferred,
+            name="novel-task-reconciler",
+            daemon=True,
+        )
+        self._reconciler.start()
         return scheduled
+
+    def _reconcile_deferred(self) -> None:
+        while not self._closing.is_set():
+            safe_tasks = self._repository.list_tasks(
+                statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000
+            )
+            deferred = 0
+            for index, task in enumerate(safe_tasks):
+                if self._closing.is_set():
+                    return
+                try:
+                    self.submit(task.task_id)
+                except ExecutorQueueFull:
+                    deferred = len(safe_tasks) - index
+                    break
+                except ExecutorClosed:
+                    return
+            self._startup_deferred_count = deferred
+            self._closing.wait(0.02)
 
     def shutdown(self, *, wait: bool = True, timeout: float | None = None) -> bool:
         if timeout is not None and timeout < 0:
@@ -281,6 +312,9 @@ class BackgroundTaskExecutor:
         if not wait:
             return not any(thread.is_alive() for thread in self._threads)
         deadline = None if timeout is None else time.monotonic() + timeout
+        if self._reconciler is not None:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._reconciler.join(remaining)
         for thread in self._threads:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(remaining)

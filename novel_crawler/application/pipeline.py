@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Protocol
 
+from novel_crawler.acquisition.http import AcquisitionError
 from novel_crawler.acquisition.models import PageSnapshot
 from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.application.models import CrawlOptions
@@ -14,7 +17,7 @@ from novel_crawler.browser import BrowserCleanupRequired, VerificationRequired
 from novel_crawler.core.models import Chapter
 from novel_crawler.core.storage import Storage
 from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
-from novel_crawler.task_engine.executor import RecoverableTaskError, TaskExecutionContext
+from novel_crawler.task_engine.executor import RecoverableTaskError, TaskControlRequested, TaskExecutionContext
 from novel_crawler.task_engine.models import TaskRecord, TaskStatus
 from novel_crawler.task_engine.repository import CheckpointNotFound, TaskRepository
 
@@ -24,7 +27,13 @@ class _Registry(Protocol):
 
 
 class _Acquirer(Protocol):
-    def fetch(self, url: str, *, task_key: str | None = None) -> PageSnapshot: ...
+    def fetch(
+        self,
+        url: str,
+        *,
+        task_key: str | None = None,
+        timeout: float | None = None,
+    ) -> PageSnapshot: ...
 
 
 class CrawlTaskPipeline:
@@ -39,7 +48,14 @@ class CrawlTaskPipeline:
         *,
         exporter: Callable[[int, str], object] | None = None,
         legacy_adapter: Callable[[str], SiteConfigAdapter] | None = None,
+        interaction_handler: Callable[
+            [TaskRecord, str, BrowserCleanupRequired | VerificationRequired], object
+        ]
+        | None = None,
+        access_preparer: Callable[[str, str], object] | None = None,
         batch_size: int = 20,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._repository = repository
         self._storage = storage
@@ -47,7 +63,13 @@ class CrawlTaskPipeline:
         self._acquirer = acquirer
         self._exporter = exporter
         self._legacy_adapter = legacy_adapter
+        self._interaction_handler = interaction_handler
+        self._access_preparer = access_preparer
         self._batch_size = batch_size
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._rate_lock = threading.Lock()
+        self._last_request_at: float | None = None
 
     @property
     def handlers(self) -> Mapping[TaskStatus, Callable[[TaskExecutionContext, TaskRecord], TaskStatus]]:
@@ -65,7 +87,7 @@ class CrawlTaskPipeline:
         if not adapter.match(task.source_url):
             raise ValueError("active_config_mismatch")
         context.check_control(force=True)
-        html = self._fetch_html(task.source_url, task.task_id)
+        html = self._fetch_html(task.source_url, task, adapter)
         book = adapter.get_book_info(html, task.source_url)
         chapters = adapter.get_chapter_list(html, task.source_url, start=options.start, count=options.count)
         if options.max_chapters is not None:
@@ -100,7 +122,7 @@ class CrawlTaskPipeline:
 
         def process(chapter: Chapter) -> str:
             context.check_control(force=True)
-            html = self._fetch_html(chapter.url, task.task_id)
+            html = self._fetch_html(chapter.url, task, adapter)
             title, body = adapter.parse_chapter(html, chapter.url)
             if title:
                 chapter.title = title
@@ -133,15 +155,44 @@ class CrawlTaskPipeline:
             raise ValueError("concurrency_unsupported")
         return options
 
-    def _fetch_html(self, url: str, task_id: str) -> str:
-        try:
-            return self._acquirer.fetch(url, task_key=task_id).html
-        except BrowserCleanupRequired:
-            raise RecoverableTaskError("browser_cleanup_required") from None
-        except VerificationRequired:
-            # Interactive verification is owned by the PROBING controller. A
-            # late challenge cannot safely manufacture a persistent handle.
-            raise RecoverableTaskError("verification_required") from None
+    def _fetch_html(self, url: str, task: TaskRecord, adapter: SiteConfigAdapter) -> str:
+        options = adapter.fetch_options
+        for attempt in range(options.retries):
+            self._wait_rate_limit(task, options.delay_min)
+            if self._access_preparer is not None:
+                self._access_preparer(url, task.task_id)
+            try:
+                return self._acquirer.fetch(
+                    url, task_key=task.task_id, timeout=options.timeout
+                ).html
+            except BrowserCleanupRequired as signal:
+                if self._interaction_handler is not None:
+                    self._interaction_handler(task, url, signal)
+                    raise TaskControlRequested("late_browser_interaction") from None
+                raise RecoverableTaskError("browser_cleanup_required") from None
+            except VerificationRequired as signal:
+                if self._interaction_handler is not None:
+                    self._interaction_handler(task, url, signal)
+                    raise TaskControlRequested("late_browser_interaction") from None
+                raise RecoverableTaskError("verification_required") from None
+            except AcquisitionError as exc:
+                if not exc.recoverable or attempt + 1 >= options.retries:
+                    raise
+        raise RecoverableTaskError("source_fetch_failed")  # pragma: no cover
+
+    def _wait_rate_limit(self, task: TaskRecord, interval: float) -> None:
+        with self._rate_lock:
+            if self._last_request_at is not None:
+                remaining = interval - (self._monotonic() - self._last_request_at)
+                while remaining > 0:
+                    task_context = TaskExecutionContext(
+                        self._repository, task.task_id, task.version
+                    )
+                    task_context.check_control(force=True)
+                    delay = min(remaining, 0.05)
+                    self._sleep(delay)
+                    remaining = interval - (self._monotonic() - self._last_request_at)
+            self._last_request_at = self._monotonic()
 
 
 __all__ = ["CrawlTaskPipeline"]

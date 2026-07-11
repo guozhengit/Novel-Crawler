@@ -89,6 +89,17 @@ def probing(repo: TaskRepository, url: str = "https://example.test/book") -> Any
     return repo.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
 
 
+def validating(repo: TaskRepository) -> Any:
+    task = probing(repo)
+    return repo.transition(task.task_id, TaskStatus.VALIDATING, expected_version=task.version)
+
+
+def crawling(repo: TaskRepository) -> Any:
+    task = validating(repo)
+    ready = repo.transition(task.task_id, TaskStatus.READY, expected_version=task.version)
+    return repo.transition(task.task_id, TaskStatus.CRAWLING, expected_version=ready.version)
+
+
 @pytest.mark.parametrize(
     ("kind", "expected", "error"),
     [
@@ -138,6 +149,39 @@ def test_waiting_handles_are_private_and_summary_is_safe(
         assert secret not in json.dumps([event.to_safe_dict() for event in repo.list_events(task.task_id)])
     raw = db.read_bytes()
     assert secret.encode() not in raw
+
+
+def test_late_verification_handle_is_adopted_and_continuable(tmp_path: Path) -> None:
+    secret = "late-private-ticket"
+    adaptive = FakeAdaptive(result(ResolutionKind.REUSED))
+    with TaskRepository(tmp_path / "late-waiting.db") as repo:
+        task = crawling(repo)
+        controller = AdaptiveTaskController(repo, adaptive)
+        waiting = result(ResolutionKind.WAITING_FOR_USER, token=secret)
+        adopted = controller.adopt_acquisition_result(task.task_id, waiting)
+        assert adopted.status is TaskStatus.WAITING_FOR_USER
+        assert controller.interaction(task.task_id).kind is InteractionKind.VERIFICATION  # type: ignore[union-attr]
+        continued = controller.continue_verification(task.task_id)
+        assert continued.status is TaskStatus.CRAWLING
+        assert adaptive.continued == [secret]
+        assert secret.encode() not in (tmp_path / "late-waiting.db").read_bytes()
+
+
+def test_late_cleanup_handle_sets_gate_and_is_retryable(tmp_path: Path) -> None:
+    secret = "late-private-cleanup"
+    adaptive = FakeAdaptive(result(ResolutionKind.REUSED))
+    with TaskRepository(tmp_path / "late-cleanup.db") as repo:
+        task = crawling(repo)
+        controller = AdaptiveTaskController(repo, adaptive)
+        cleanup = result(ResolutionKind.CLEANUP_REQUIRED, token=secret, source="headless")
+        adopted = controller.adopt_acquisition_result(task.task_id, cleanup)
+        assert adopted.status is TaskStatus.RECOVERABLE_FAILED
+        assert adopted.cleanup_required is True
+        retried = controller.retry_cleanup(task.task_id)
+        assert retried.status is TaskStatus.CRAWLING
+        assert retried.cleanup_required is False
+        assert adaptive.cleaned == [secret]
+        assert secret.encode() not in (tmp_path / "late-cleanup.db").read_bytes()
 
 
 def test_continue_verification_is_concurrently_idempotent(tmp_path: Path) -> None:

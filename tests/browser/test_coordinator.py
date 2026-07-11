@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from novel_crawler.acquisition.classifier import PageClassifier
+from novel_crawler.acquisition.classifier import PageClassifier, PageKind
 from novel_crawler.acquisition.http import AcquisitionError
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.acquisition.security import UrlSafetyPolicy
@@ -95,6 +95,25 @@ def test_browser_acquirer_uses_http_for_classified_content_without_browser(tmp_p
     acquirer = BrowserAcquirer(http=http, classifier=PageClassifier(), driver=driver, sessions=BrowserSessionStore(tmp_path), safety_policy=PUBLIC_POLICY)
     assert acquirer.fetch_page("https://example.test/private?q=secret").snapshot.method == "GET"
     assert driver.calls == []
+
+
+def test_browser_acquirer_forwards_timeout_and_rejects_invalid_override(tmp_path: Path) -> None:
+    class KnownClassifier:
+        def classify(self, _snapshot):
+            return type("Classification", (), {"kind": PageKind.BOOK_INDEX})()
+
+    http = FakeHttp("<title>绗?绔?/title><article id='content'>姝ｆ枃</article>")
+    acquirer = BrowserAcquirer(
+        http=http,
+        classifier=KnownClassifier(),  # type: ignore[arg-type]
+        driver=FakeDriver([]),
+        sessions=BrowserSessionStore(tmp_path),
+        safety_policy=PUBLIC_POLICY,
+    )
+    acquirer.fetch_page("https://example.test/chapter", timeout=3.5)
+    assert http.options[0]["timeout"] == 3.5
+    with pytest.raises(ValueError, match="timeout"):
+        acquirer.fetch_page("https://example.test/chapter", timeout=0)
 
 
 def test_browser_acquirer_falls_back_headless_for_unknown_and_uses_persistent_profile(tmp_path: Path) -> None:

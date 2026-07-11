@@ -85,3 +85,55 @@ def test_close_crawler_supports_close_method_and_storage_fallback() -> None:
     _close_crawler(WithClose())  # type: ignore[arg-type]
     _close_crawler(StorageOnly())  # type: ignore[arg-type]
     assert calls == ["close", "storage"]
+
+
+def test_constructor_failure_never_closes_worker_dependencies_when_shutdown_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from novel_crawler.core.crawler import CrawlerService
+    from novel_crawler.task_engine import TaskRepository
+
+    class TrackingRepository(TaskRepository):
+        instance = None
+
+        def __init__(self, path):
+            super().__init__(path)
+            self.close_calls = 0
+            TrackingRepository.instance = self
+
+        def close(self):
+            self.close_calls += 1
+            super().close()
+
+    class TrackingCrawler(CrawlerService):
+        instance = None
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.close_calls = 0
+            TrackingCrawler.instance = self
+
+        def close(self):
+            self.close_calls += 1
+            self.storage.close()
+
+    class NonStoppingExecutor:
+        def __init__(self, *_args, **_kwargs): pass
+        def schedule_active(self, _task_id): return False
+        def recover_and_schedule(self): return 0
+        def shutdown(self, *, wait, timeout): return False
+
+    monkeypatch.setattr("novel_crawler.application.composition.TaskRepository", TrackingRepository)
+    monkeypatch.setattr("novel_crawler.application.composition.CrawlerService", TrackingCrawler)
+    monkeypatch.setattr("novel_crawler.application.composition.BackgroundTaskExecutor", NonStoppingExecutor)
+    monkeypatch.setattr(
+        "novel_crawler.application.composition.ApplicationService",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("final failed")),
+    )
+    ctx = create_runtime_context(tmp_path / "project", tmp_path / "non-stopping")
+    with pytest.raises(RuntimeError, match="final failed"):
+        build_application(ctx, driver=NeverLaunchDriver(), http_acquirer=FailingAcquirer())
+    assert TrackingRepository.instance.close_calls == 0
+    assert TrackingCrawler.instance.close_calls == 0
+    TrackingRepository.instance.close()
+    TrackingCrawler.instance.close()

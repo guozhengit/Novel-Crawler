@@ -104,6 +104,16 @@ def test_per_call_body_limit_is_forwarded_and_cannot_exceed_instance_cap() -> No
     assert [call["max_body_bytes"] for call in transport.calls] == [5, 10]
 
 
+def test_per_call_timeout_overrides_instance_budget_and_is_validated() -> None:
+    policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
+    transport = FakeTransport([response()])
+    acquirer = HttpPageAcquirer(transport, policy, timeout=25)
+    acquirer.fetch("https://example.test/", timeout=3.5)
+    assert 0 < transport.calls[0]["timeout"] <= 3.5
+    with pytest.raises(ValueError, match="timeout"):
+        acquirer.fetch("https://example.test/", timeout=float("nan"))
+
+
 def test_fetch_page_retains_private_navigation_url_while_snapshot_stays_redacted() -> None:
     policy, _ = policy_with_calls({"example.test": "93.184.216.34"})
     page = HttpPageAcquirer(FakeTransport([response()]), policy).fetch_page("https://example.test/nested/c1?q=kept#fragment")

@@ -163,6 +163,47 @@ def test_nested_challenge_resumes_original_request_url() -> None:
     assert acquirer.activations == [(challenge_url, "download", 3)]
 
 
+def test_late_verification_signal_is_adopted_and_can_continue() -> None:
+    url = "https://example.test/chapter/2?token=secret"
+    terminal = ConfigResolution(ResolutionKind.REUSED, config=object())  # type: ignore[arg-type]
+    manager = FakeManager([terminal])
+    acquirer = FakeAcquirer()
+    coordinator = FakeCoordinator(
+        [VerificationOutcome(VerificationStatus.COMPLETED, "https://example.test")]
+    )
+    service = AdaptiveBrowserService(manager, acquirer, coordinator)
+
+    waiting = service.capture_acquisition_signal(url, "task-key", required(url))
+    assert waiting.kind is ResolutionKind.WAITING_FOR_USER
+    assert service.continue_verification(waiting.ticket).kind is ResolutionKind.REUSED
+    assert manager.calls == [url]
+    assert acquirer.activations == [(url, "task-key", 3)]
+    for index in range(5):
+        assert service.prepare_task_access(
+            f"https://example.test/chapter/{index}", "task-key"
+        )
+    assert acquirer.activations[-5:] == [
+        (f"https://example.test/chapter/{index}", "task-key", 1)
+        for index in range(5)
+    ]
+    assert not service.prepare_task_access(url, "other-task")
+
+
+def test_late_headless_cleanup_signal_is_adopted_and_retryable() -> None:
+    service = AdaptiveBrowserService(
+        FakeManager([ConfigResolution(ResolutionKind.REJECTED)]),
+        FakeAcquirer(),
+        FakeCoordinator([]),
+    )
+    cleanup = service.capture_acquisition_signal(
+        "https://example.test/chapter/2",
+        "task-key",
+        BrowserCleanupRequired("private-cleanup", "https://example.test"),
+    )
+    assert cleanup.kind is ResolutionKind.CLEANUP_REQUIRED
+    assert service.retry_cleanup(cleanup.cleanup_ticket).kind is ResolutionKind.REJECTED
+
+
 def test_begin_failure_is_mapped_instead_of_escaping() -> None:
     class FailingBegin(FakeCoordinator):
         def begin(self, url: str, *, task_key: str) -> VerificationTicket:

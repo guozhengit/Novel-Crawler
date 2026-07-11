@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from novel_crawler.acquisition.classifier import PageKind
+from novel_crawler.acquisition.http import AcquisitionError
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.application.errors import ApplicationError
@@ -15,7 +16,13 @@ from novel_crawler.application.pipeline import CrawlTaskPipeline
 from novel_crawler.application.site_adapter import SiteConfigAdapter
 from novel_crawler.browser import BrowserAcquirer, BrowserSessionStore, VerificationRequired
 from novel_crawler.core.storage import Storage
-from novel_crawler.task_engine import BackgroundTaskExecutor, TaskExecutionContext, TaskRepository, TaskStatus
+from novel_crawler.task_engine import (
+    BackgroundTaskExecutor,
+    TaskControlRequested,
+    TaskExecutionContext,
+    TaskRepository,
+    TaskStatus,
+)
 from novel_crawler.task_engine.executor import RecoverableTaskError
 
 
@@ -37,7 +44,9 @@ class Acquirer:
         self.pages = pages
         self.task_keys: list[str | None] = []
 
-    def fetch(self, url: str, *, task_key: str | None = None) -> Page:
+    def fetch(
+        self, url: str, *, task_key: str | None = None, timeout: float | None = None
+    ) -> Page:
         self.task_keys.append(task_key)
         return Page(self.pages[url])
 
@@ -212,7 +221,13 @@ def test_pipeline_explicit_legacy_fallback_and_mismatch(tmp_path: Path) -> None:
 
 def test_protected_page_after_probe_fails_closed_with_stable_recoverable_code(tmp_path: Path) -> None:
     class Protected:
-        def fetch(self, _url: str, *, task_key: str | None = None):
+        def fetch(
+            self,
+            _url: str,
+            *,
+            task_key: str | None = None,
+            timeout: float | None = None,
+        ):
             raise VerificationRequired(
                 "verification_required", original_url="https://private.test/path?token=hidden"
             )
@@ -225,6 +240,84 @@ def test_protected_page_after_probe_fails_closed_with_stable_recoverable_code(tm
         pipeline.validating(context(repo, task), task)
     assert caught.value.error_code == "verification_required"
     assert "private" not in repr(caught.value)
+    repo.close()
+    storage.close()
+
+
+def test_request_policy_controls_timeout_retry_count_and_rate_limit(tmp_path: Path) -> None:
+    url = "https://example.test/books/index"
+    html = "<h1 class=book>Book</h1><div id=list><a href='1'>One</a></div>"
+    raw = site_config().to_sensitive_dict()
+    raw["request_policy"] = {
+        "timeout_seconds": 7,
+        "max_retries": 2,
+        "rate_limit_seconds": 1,
+    }
+    configured = SiteConfig.from_dict(raw)
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    class Flaky:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str | None, float | None]] = []
+
+        def fetch(self, _url: str, *, task_key=None, timeout=None):
+            self.calls.append((task_key, timeout))
+            if len(self.calls) < 3:
+                raise AcquisitionError("transport_error", "https://example.test", True)
+            return Page(html)
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    repo = TaskRepository(tmp_path / "policy-tasks.db")
+    storage = Storage(tmp_path / "policy-crawl.db", tmp_path / "policy-data")
+    acquirer = Flaky()
+    pipeline = CrawlTaskPipeline(
+        repo,
+        storage,
+        Registry(configured),
+        acquirer,
+        monotonic=lambda: clock[0],
+        sleep=sleep,
+    )
+    task = active_task(repo, url, {"crawl": {"concurrency": 1, "export": False}})
+    assert pipeline.validating(context(repo, task), task) is TaskStatus.READY
+    assert acquirer.calls == [(task.task_id, 7.0)] * 3
+    assert sum(sleeps) == pytest.approx(2.0)
+    assert sleeps and max(sleeps) <= 0.05
+    repo.close()
+    storage.close()
+
+
+def test_late_interaction_is_handed_to_runtime_broker_before_worker_stops(tmp_path: Path) -> None:
+    url = "https://example.test/books/index"
+    prepared: list[tuple[str, str]] = []
+    adopted: list[tuple[str, str, str]] = []
+
+    class Protected:
+        def fetch(self, requested, *, task_key=None, timeout=None):
+            raise VerificationRequired(original_url=requested)
+
+    def adopt(task, requested, signal):
+        adopted.append((task.task_id, requested, signal.code))
+
+    repo = TaskRepository(tmp_path / "broker-tasks.db")
+    storage = Storage(tmp_path / "broker-crawl.db", tmp_path / "broker-data")
+    pipeline = CrawlTaskPipeline(
+        repo,
+        storage,
+        Registry(site_config()),
+        Protected(),
+        interaction_handler=adopt,
+        access_preparer=lambda requested, task_id: prepared.append((requested, task_id)),
+    )
+    task = active_task(repo, url, {"crawl": {"concurrency": 1}})
+    with pytest.raises(TaskControlRequested):
+        pipeline.validating(context(repo, task), task)
+    assert prepared == [(url, task.task_id)]
+    assert adopted == [(task.task_id, url, "verification_required")]
     repo.close()
     storage.close()
 

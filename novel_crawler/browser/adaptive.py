@@ -154,6 +154,9 @@ class AdaptiveBrowserService:
         self._terminal: OrderedDict[str, tuple[datetime, AdaptiveResult]] = OrderedDict()
         self._terminal_ttl = timedelta(minutes=10)
         self._max_terminal = 1024
+        self._verified_access: OrderedDict[tuple[str, str], datetime] = OrderedDict()
+        self._verified_access_ttl = timedelta(minutes=10)
+        self._max_verified_access = 1024
         self._wire_acquirer(config_manager, browser_acquirer)
         if isinstance(browser_acquirer, BrowserAcquirer):
             browser_acquirer.coordinator = None
@@ -189,28 +192,40 @@ class AdaptiveBrowserService:
     def _resolve_once(self, url: str, task_key: str, key: tuple[str, str]) -> AdaptiveResult:
         try:
             return AdaptiveResult(self._resolve_manager(url, task_key))
-        except BrowserCleanupRequired as cleanup:
+        except (BrowserCleanupRequired, VerificationRequired) as signal:
+            return self.capture_acquisition_signal(url, task_key, signal)
+
+    def capture_acquisition_signal(
+        self,
+        request_url: str,
+        task_key: str,
+        signal: BrowserCleanupRequired | VerificationRequired,
+    ) -> AdaptiveResult:
+        """Adopt a late browser signal so its private handle remains actionable."""
+        key = (redact_url(request_url), task_key)
+        if isinstance(signal, BrowserCleanupRequired):
             with self._guard:
-                self._cleanup_contexts[cleanup.token] = _CleanupContext("headless", "headless", url, task_key, key)
-                self._cleanup_requests[key] = cleanup.token
-            return self._cleanup_required(cleanup.token, "headless")
-        except VerificationRequired as required:
-            original = required.original_url or url
-            try:
-                ticket = required.ticket or self.verification_coordinator.begin(original, task_key=task_key)
-            except VerificationRequired as exc:
-                if exc.ticket is not None and exc.ticket.status is VerificationStatus.FAILED:
-                    return self._hold_start_cleanup(exc.ticket, key)
-                return self._failure(exc.code)
-            if ticket.status is not VerificationStatus.WAITING:
-                return self._hold_start_cleanup(ticket, key)
-            context = _ResumeContext(ticket, url, original, task_key, key)
-            result = self._waiting(ticket)
-            context.last_result = result
-            with self._guard:
-                self._contexts[ticket.token] = context
-                self._requests[key] = ticket.token
-            return result
+                self._cleanup_contexts[signal.token] = _CleanupContext(
+                    "headless", "headless", request_url, task_key, key
+                )
+                self._cleanup_requests[key] = signal.token
+            return self._cleanup_required(signal.token, "headless")
+        original = signal.original_url or request_url
+        try:
+            ticket = signal.ticket or self.verification_coordinator.begin(original, task_key=task_key)
+        except VerificationRequired as exc:
+            if exc.ticket is not None and exc.ticket.status is VerificationStatus.FAILED:
+                return self._hold_start_cleanup(exc.ticket, key)
+            return self._failure(exc.code)
+        if ticket.status is not VerificationStatus.WAITING:
+            return self._hold_start_cleanup(ticket, key)
+        context = _ResumeContext(ticket, request_url, original, task_key, key)
+        result = self._waiting(ticket)
+        context.last_result = result
+        with self._guard:
+            self._contexts[ticket.token] = context
+            self._requests[key] = ticket.token
+        return result
 
     def continue_verification(self, ticket: VerificationTicket | str) -> AdaptiveResult:
         token = self._token(ticket)
@@ -256,10 +271,37 @@ class AdaptiveBrowserService:
                 return context.last_result
             if outcome.status is VerificationStatus.COMPLETED:
                 result = self._resume_verified(context)
+                if result.kind in {
+                    ResolutionKind.REUSED,
+                    ResolutionKind.REGISTERED,
+                    ResolutionKind.CONFIRMATION_REQUIRED,
+                }:
+                    with self._guard:
+                        now = datetime.now(UTC)
+                        self._purge_verified_access(now)
+                        while len(self._verified_access) >= self._max_verified_access:
+                            self._verified_access.popitem(last=False)
+                        self._verified_access[
+                            (redact_url(context.challenge_url), context.task_key)
+                        ] = now + self._verified_access_ttl
                 return result if result.kind is ResolutionKind.CLEANUP_REQUIRED else self._finish(context, result)
             return self._finish(context, self._from_status(outcome.status))
 
     resume = continue_verification
+
+    def prepare_task_access(self, url: str, task_key: str) -> bool:
+        """Grant one bounded persistent-profile read after successful verification."""
+        key = (redact_url(url), task_key)
+        now = datetime.now(UTC)
+        with self._guard:
+            self._purge_verified_access(now)
+            expiry = self._verified_access.get(key)
+            if expiry is None or expiry <= now:
+                self._verified_access.pop(key, None)
+                return False
+            self._verified_access.move_to_end(key)
+        self.browser_acquirer.activate_persistent_profile(url, task_key=task_key, pages=1)
+        return True
 
     def cancel(self, ticket: VerificationTicket | str) -> AdaptiveResult:
         token = self._token(ticket)
@@ -292,6 +334,7 @@ class AdaptiveBrowserService:
         now = datetime.now(UTC)
         with self._guard:
             self._purge_terminal()
+            self._purge_verified_access(now)
             expired = [context for context in self._contexts.values() if context.ticket.expires_at is not None and context.ticket.expires_at <= now]
         count = 0
         for context in expired:
@@ -468,6 +511,11 @@ class AdaptiveBrowserService:
         for token, (expires_at, _) in tuple(self._terminal.items()):
             if expires_at <= now:
                 self._terminal.pop(token, None)
+
+    def _purge_verified_access(self, now: datetime) -> None:
+        for key in tuple(self._verified_access):
+            if self._verified_access[key] <= now:
+                self._verified_access.pop(key, None)
 
     def _resolve_manager(self, url: str, task_key: str) -> ConfigResolution:
         scope = getattr(self.browser_acquirer, "resolution_scope", None)

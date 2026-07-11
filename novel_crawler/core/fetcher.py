@@ -20,7 +20,7 @@ class PageAcquirer(Protocol):
 
 @dataclass
 class FetchOptions:
-    timeout: int = 25
+    timeout: float = 25
     retries: int = 4
     delay_min: float = 2.0
     delay_max: float = 6.0

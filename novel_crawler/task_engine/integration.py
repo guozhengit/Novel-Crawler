@@ -134,6 +134,7 @@ class AdaptiveTaskController:
         self._owner_epoch = time.time_ns()
         self._lock = threading.RLock()
         self._interactions: OrderedDict[str, _PrivateInteraction] = OrderedDict()
+        self._late_resume_status: dict[str, TaskStatus] = {}
         self._probe_flights: dict[str, _ProbeFlight] = {}
         self.recovered_orphans = self._recover_orphaned_waiting()
 
@@ -142,6 +143,21 @@ class AdaptiveTaskController:
             raise TypeError("scheduler must be callable")
         with self._lock:
             self._scheduler = scheduler
+
+    def adopt_acquisition_result(self, task_id: str, outcome: AdaptiveResult) -> TaskRecord:
+        """Adopt a late browser handle without persisting the private token."""
+        if outcome.kind not in {
+            ResolutionKind.WAITING_FOR_USER,
+            ResolutionKind.CLEANUP_REQUIRED,
+            ResolutionKind.VERIFICATION_FAILED,
+        }:
+            raise ValueError("late acquisition result is invalid")
+        current = self._repository.get_task(task_id)
+        if current.status not in {TaskStatus.VALIDATING, TaskStatus.CRAWLING}:
+            return current
+        with self._lock:
+            self._late_resume_status[task_id] = current.status
+        return self._apply_result(current, outcome)
 
     def __repr__(self) -> str:
         with self._lock:
@@ -517,7 +533,11 @@ class AdaptiveTaskController:
     ) -> TaskRecord:
         kind = outcome.kind
         if kind in {ResolutionKind.REUSED, ResolutionKind.REGISTERED}:
-            result = self._transition(task, TaskStatus.VALIDATING, None)
+            with self._lock:
+                target = self._late_resume_status.pop(
+                    task.task_id, TaskStatus.VALIDATING
+                )
+            result = task if task.status is target else self._transition(task, target, None)
             self._release_lease(task.task_id)
             self._drop(task.task_id)
             return self._schedule_or_fail(result)
@@ -561,11 +581,15 @@ class AdaptiveTaskController:
             self._store_result_handle(task.task_id, outcome)
             return transitioned
         if kind is ResolutionKind.REJECTED:
+            with self._lock:
+                self._late_resume_status.pop(task.task_id, None)
             result = self._transition(task, TaskStatus.TERMINAL_FAILED, "adaptation_rejected")
             self._release_lease(task.task_id)
             self._drop(task.task_id)
             return result
         if kind is ResolutionKind.CANCELLED:
+            with self._lock:
+                self._late_resume_status.pop(task.task_id, None)
             result = self._transition(task, TaskStatus.CANCELLED, "interaction_cancelled")
             self._release_lease(task.task_id)
             self._drop(task.task_id)
@@ -596,6 +620,8 @@ class AdaptiveTaskController:
                 )
             except (TaskVersionConflict, InvalidTaskTransition):
                 return self._repository.get_task(task.task_id)
+        with self._lock:
+            self._late_resume_status.pop(task.task_id, None)
         return self._transition(task, TaskStatus.RECOVERABLE_FAILED, error)
 
     def _schedule_or_fail(self, task: TaskRecord) -> TaskRecord:

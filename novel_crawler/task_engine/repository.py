@@ -585,6 +585,11 @@ class TaskRepository:
             if current.status not in allowed_sources:
                 raise InvalidTaskTransition(f"cleanup_gate_not_allowed:{current.status.value}")
             next_version = current.version + 1
+            resume_status = (
+                TaskStatus.PROBING
+                if current.status is TaskStatus.WAITING_FOR_USER
+                else current.status
+            )
             updated = self._connection.execute(
                 """
                 UPDATE tasks SET status=?, version=?, resume_status=?, resume_gate=?,
@@ -594,7 +599,7 @@ class TaskRepository:
                 (
                     TaskStatus.RECOVERABLE_FAILED.value,
                     next_version,
-                    TaskStatus.PROBING.value,
+                    resume_status.value,
                     ResumeGate.CLEANUP.value,
                     error_code,
                     timestamp,
@@ -628,7 +633,7 @@ class TaskRepository:
             version=next_version,
             metadata=current.metadata,
             error_code=error_code,
-            resume_status=TaskStatus.PROBING,
+            resume_status=resume_status,
             resume_gate=ResumeGate.CLEANUP,
             created_at=current.created_at,
             updated_at=timestamp,
@@ -648,6 +653,7 @@ class TaskRepository:
                 or current.resume_gate is not ResumeGate.CLEANUP
             ):
                 raise InvalidTaskTransition("cleanup_gate_not_active")
+            target = current.resume_status or TaskStatus.PROBING
             next_version = current.version + 1
             updated = self._connection.execute(
                 """
@@ -656,7 +662,7 @@ class TaskRepository:
                 WHERE task_id=? AND version=?
                 """,
                 (
-                    TaskStatus.PROBING.value,
+                    target.value,
                     next_version,
                     ResumeGate.NONE.value,
                     timestamp,
@@ -675,7 +681,7 @@ class TaskRepository:
                 (
                     task_id,
                     TaskStatus.RECOVERABLE_FAILED.value,
-                    TaskStatus.PROBING.value,
+                    target.value,
                     next_version,
                     timestamp,
                 ),
@@ -683,7 +689,7 @@ class TaskRepository:
         return TaskRecord(
             task_id=task_id,
             source_url=current.source_url,
-            status=TaskStatus.PROBING,
+            status=target,
             version=next_version,
             metadata=current.metadata,
             resume_gate=ResumeGate.NONE,

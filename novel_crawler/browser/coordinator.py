@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -750,7 +751,16 @@ class BrowserAcquirer:
         task_key: str | None = None,
         max_body_bytes: int | None = None,
         locked_origin: str | None = None,
+        timeout: float | None = None,
     ) -> AcquiredPage:
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int | float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be positive and finite")
+        effective_ttl = self.browser_ttl if timeout is None else min(self.browser_ttl, float(timeout))
         limit = self.max_body_bytes if max_body_bytes is None else min(self.max_body_bytes, max_body_bytes)
         if limit <= 0:
             raise AcquisitionError("response_too_large", redact_url(url), False)
@@ -759,18 +769,35 @@ class BrowserAcquirer:
         scoped_task_key = getattr(self._resolution_local, "task_key", None)
         effective_task_key = task_key or (scoped_task_key if isinstance(scoped_task_key, str) else "browser-acquisition")
         if locked_origin is not None:
-            page = self.http.fetch_page(
-                url,
-                max_body_bytes=limit,
-                locked_origin=locked_origin,
-                classifiable_statuses=frozenset({401, 403, 429, 503}),
-            )
+            if timeout is None:
+                page = self.http.fetch_page(
+                    url,
+                    max_body_bytes=limit,
+                    locked_origin=locked_origin,
+                    classifiable_statuses=frozenset({401, 403, 429, 503}),
+                )
+            else:
+                page = self.http.fetch_page(
+                    url,
+                    max_body_bytes=limit,
+                    locked_origin=locked_origin,
+                    classifiable_statuses=frozenset({401, 403, 429, 503}),
+                    timeout=timeout,
+                )
         else:
-            page = self.http.fetch_page(
-                url,
-                max_body_bytes=limit,
-                classifiable_statuses=frozenset({401, 403, 429, 503}),
-            )
+            if timeout is None:
+                page = self.http.fetch_page(
+                    url,
+                    max_body_bytes=limit,
+                    classifiable_statuses=frozenset({401, 403, 429, 503}),
+                )
+            else:
+                page = self.http.fetch_page(
+                    url,
+                    max_body_bytes=limit,
+                    classifiable_statuses=frozenset({401, 403, 429, 503}),
+                    timeout=timeout,
+                )
         kind = self.classifier.classify(page.snapshot).kind
         profile_granted = self._consume_profile_grant(url, effective_task_key) if kind is PageKind.AUTH_OR_CHALLENGE else False
         if kind is PageKind.AUTH_OR_CHALLENGE and not profile_granted:
@@ -792,7 +819,7 @@ class BrowserAcquirer:
                 user_data_dir=lease.profile_path,
                 headless=True,
                 policy=policy,
-                ttl=self.browser_ttl,
+                ttl=effective_ttl,
             )
             worker.start()
             browser_page = worker.navigate(url).to_acquired_page(max_body_bytes=limit)
@@ -836,8 +863,14 @@ class BrowserAcquirer:
             if cleanup_error is not None:
                 raise cleanup_error from None
 
-    def fetch(self, url: str, *, task_key: str | None = None) -> PageSnapshot:
-        return self.fetch_page(url, task_key=task_key).snapshot
+    def fetch(
+        self,
+        url: str,
+        *,
+        task_key: str | None = None,
+        timeout: float | None = None,
+    ) -> PageSnapshot:
+        return self.fetch_page(url, task_key=task_key, timeout=timeout).snapshot
 
     def _require_verification(self, url: str, task_key: str) -> None:
         ticket = self.coordinator.begin(url, task_key=task_key) if self.coordinator is not None else None

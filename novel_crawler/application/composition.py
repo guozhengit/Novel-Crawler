@@ -59,12 +59,19 @@ def build_application(
         repository = TaskRepository(ctx.data_dir / "tasks.db")
         controller = AdaptiveTaskController(repository, cast(Any, adaptive))
         crawler = CrawlerService(ctx)
+
+        def adopt_late_interaction(task, url, signal):
+            outcome = adaptive.capture_acquisition_signal(url, task.task_id, signal)
+            return controller.adopt_acquisition_result(task.task_id, outcome)
+
         pipeline = CrawlTaskPipeline(
             repository,
             crawler.storage,
             registry,
             browser_acquirer,
             exporter=lambda book_id, fmt: crawler.export(book_id, fmt),
+            interaction_handler=adopt_late_interaction,
+            access_preparer=adaptive.prepare_task_access,
         )
         handlers = {
             TaskStatus.PROBING: controller.probe_handler,
@@ -78,27 +85,37 @@ def build_application(
             recover_on_start=False,
         )
         controller.bind_scheduler(executor.schedule_active)
+        service = ApplicationService(
+            repository, executor, controller=controller, crawler=cast(Any, crawler)
+        )
         if recover_on_start:
-            executor.recover_and_schedule()
-        return ApplicationService(repository, executor, controller=controller, crawler=cast(Any, crawler))
-    except BaseException:
-        if executor is not None:
             try:
-                executor.shutdown(wait=True, timeout=5)
+                executor.recover_and_schedule()
             except Exception:
                 pass
-        if controller is not None:
+        return service
+    except BaseException:
+        executor_stopped = executor is None
+        if executor is not None:
+            try:
+                executor_stopped = executor.shutdown(wait=True, timeout=5)
+            except Exception:
+                executor_stopped = False
+        if executor_stopped and controller is not None:
             try:
                 controller.close()
             except Exception:
                 pass
-        if repository is not None:
+        if executor_stopped and repository is not None:
             try:
                 repository.close()
             except Exception:
                 pass
-        if crawler is not None:
-            _close_crawler(crawler)
+        if executor_stopped and crawler is not None:
+            try:
+                _close_crawler(crawler)
+            except Exception:
+                pass
         raise
 
 

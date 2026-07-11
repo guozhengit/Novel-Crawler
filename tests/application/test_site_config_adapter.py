@@ -43,7 +43,10 @@ def test_adapter_parses_book_list_and_joins_only_same_origin_urls() -> None:
     html = """
       <h1 class=book>Fixture Book</h1><div class=author>By Writer</div>
       <div id=list><a href='chapters/1.html'>One</a><a href='/books/chapters/2.html'>Two</a>
-      <a href='https://evil.test/3'>Bad</a><a href='javascript:alert(1)'>Script</a></div>
+      <a href='https://evil.test/3'>Bad</a><a href='javascript:alert(1)'>Script</a>
+      <a href='http://example.test/books/downgrade'>Downgrade</a>
+      <a href='https://example.test:444/books/admin'>Other port</a>
+      <a href='/logout'>Out of scope</a></div>
     """
     adapter = SiteConfigAdapter(config())
     book = adapter.get_book_info(html, "https://example.test/books/index.html")

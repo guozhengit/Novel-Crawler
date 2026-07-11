@@ -644,6 +644,20 @@ class Storage:
                 self.conn.rollback()
                 raise
 
+    def release_chapter_claim(self, book_id: int, chapter_index: int, *, claim: ClaimLease) -> None:
+        """Release only the exact fenced claim generation owned by the caller."""
+        with self._lock:
+            updated = self.conn.execute(
+                """UPDATE chapters SET claim_owner=NULL, claim_until=NULL, claim_token=NULL,
+                   updated_at=CURRENT_TIMESTAMP
+                   WHERE book_id=? AND chapter_index=? AND status!='done'
+                   AND claim_owner=? AND claim_generation=? AND claim_token=?""",
+                (book_id, chapter_index, claim.owner, claim.generation, claim.token),
+            )
+            self.conn.commit()
+        if updated.rowcount != 1:
+            raise ChapterClaimConflict("chapter_claim_conflict")
+
     @staticmethod
     def _validate_claim(
         row: sqlite3.Row,

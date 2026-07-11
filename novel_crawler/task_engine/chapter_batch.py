@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 from novel_crawler.core.models import Chapter, ChapterStatus
 from novel_crawler.core.storage import ChapterClaimConflict, Storage
-from novel_crawler.task_engine.executor import TaskExecutionContext
+from novel_crawler.task_engine.executor import RecoverableTaskError, TaskControlRequested, TaskExecutionContext
 from novel_crawler.task_engine.models import TaskRecord, TaskStatus
 from novel_crawler.task_engine.repository import CheckpointNotFound
 
@@ -73,6 +73,9 @@ class ChapterBatchRunner:
                     if not isinstance(content, str):
                         raise TypeError("chapter_processor_content_invalid")
                     self._storage.mark_done(book_id, chapter, content, claim=lease)
+                except (TaskControlRequested, RecoverableTaskError):
+                    self._storage.release_chapter_claim(book_id, chapter.index, claim=lease)
+                    raise
                 except Exception:
                     try:
                         self._storage.mark_failed(

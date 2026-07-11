@@ -45,6 +45,7 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.WAITING_FOR_USER: frozenset(
         {
             TaskStatus.VALIDATING,
+            TaskStatus.CRAWLING,
             TaskStatus.RECOVERABLE_FAILED,
             TaskStatus.TERMINAL_FAILED,
             TaskStatus.PAUSED,

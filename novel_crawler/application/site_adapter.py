@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Tag
 
@@ -26,7 +26,7 @@ class SiteConfigAdapter(SiteAdapter):
         self._config = config
         self.name = config.site
         policy = config.request_policy
-        timeout = max(1, int(float(policy["timeout_seconds"])))
+        timeout = float(policy["timeout_seconds"])
         retries = int(policy["max_retries"]) + 1
         rate = float(policy["rate_limit_seconds"])
         self.fetch_options = FetchOptions(
@@ -123,14 +123,24 @@ class SiteConfigAdapter(SiteAdapter):
         if not href:
             return None
         try:
+            source = urlsplit(base)
             target = urlsplit(urljoin(base, href))
-            if target.scheme not in {"http", "https"} or canonical_domain(target.hostname or "") != self._config.domain:
+            if self._origin(source) != self._origin(target):
                 return None
             if target.username or target.password:
                 return None
-            return urlunsplit((target.scheme, target.netloc, target.path or "/", target.query, ""))
+            normalized = urlunsplit((target.scheme, target.netloc, target.path or "/", target.query, ""))
+            return normalized if self.match(normalized) else None
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _origin(parts: SplitResult) -> tuple[str, str, int]:
+        scheme = parts.scheme.casefold()
+        if scheme not in {"http", "https"} or not parts.hostname:
+            raise ValueError("invalid URL")
+        port = parts.port or (443 if scheme == "https" else 80)
+        return scheme, canonical_domain(parts.hostname), port
 
     def _selector_group(self, name: str) -> Mapping[str, str]:
         value = self._config.selectors[name]

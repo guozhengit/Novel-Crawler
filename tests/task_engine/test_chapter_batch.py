@@ -7,7 +7,13 @@ import pytest
 
 from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.storage import Storage
-from novel_crawler.task_engine import TaskExecutionContext, TaskRepository, TaskStatus
+from novel_crawler.task_engine import (
+    RecoverableTaskError,
+    TaskControlRequested,
+    TaskExecutionContext,
+    TaskRepository,
+    TaskStatus,
+)
 from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
 
 
@@ -79,6 +85,20 @@ def test_checkpoint_failure_after_file_commit_is_recoverable_and_skips_done(tmp_
     assert storage.progress(task.metadata["book_id"])["done"] == 1
     assert runner(TaskExecutionContext(repository, task.task_id, task.version), task) is TaskStatus.COMPLETED
     assert calls == [1, 2]
+    repository.close()
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [TaskControlRequested("late_interaction"), RecoverableTaskError("verification_required")],
+)
+def test_runtime_control_signals_are_never_marked_as_chapter_failures(tmp_path: Path, signal: Exception) -> None:
+    storage, repository, task, context = _setup(tmp_path, count=1)
+    runner = ChapterBatchRunner(storage, lambda _chapter: (_ for _ in ()).throw(signal))
+    with pytest.raises(type(signal)):
+        runner(context, task)
+    assert storage.progress(task.metadata["book_id"]) == {"total": 1, "pending": 1}
     repository.close()
     storage.close()
 
