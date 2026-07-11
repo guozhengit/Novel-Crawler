@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,8 +40,12 @@ def test_context_requires_real_snapshot_and_results_do_not_retain_derived_conten
     assert "Private Book Title" not in repr(scored)
     assert "Private Book Title" not in repr(context)
     assert "Private Book Title" not in str(context)
-    with pytest.raises(FrozenInstanceError):
+    with pytest.raises(AttributeError):
         context.page_kind = PageKind.CHAPTER  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        context.snapshot = snapshot("<p>replacement secret</p>")  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        asdict(context)  # type: ignore[arg-type]
     assert scored.calibration_id == "heuristic-v1"
     with pytest.raises(TypeError):
         ScoringContext(PageKind.CHAPTER, {})  # type: ignore[arg-type]

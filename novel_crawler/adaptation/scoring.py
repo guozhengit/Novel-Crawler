@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol, TypeAlias, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
@@ -35,16 +35,32 @@ _NAV_TEXT = {
 _UNSAFE_SELECTOR = re.compile(r"(?:https?://|[?&]|token|secret|session|password)", re.I)
 
 
-@dataclass(frozen=True, repr=False, slots=True)
 class ScoringContext:
     """Ephemeral scoring input whose representation never includes response data."""
 
-    page_kind: PageKind
-    snapshot: PageSnapshot = field(repr=False)
+    __slots__ = ("_locked", "_page_kind", "_snapshot")
+    _locked: bool
+    _page_kind: PageKind
+    _snapshot: PageSnapshot
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.page_kind, PageKind) or not isinstance(self.snapshot, PageSnapshot):
+    def __init__(self, page_kind: PageKind, snapshot: PageSnapshot) -> None:
+        if not isinstance(page_kind, PageKind) or not isinstance(snapshot, PageSnapshot):
             raise TypeError("ScoringContext requires PageKind and PageSnapshot")
+        object.__setattr__(self, "_page_kind", page_kind)
+        object.__setattr__(self, "_snapshot", snapshot)
+        object.__setattr__(self, "_locked", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("ScoringContext is immutable")
+
+    @property
+    def page_kind(self) -> PageKind:
+        return self._page_kind
+
+    @property
+    def snapshot(self) -> PageSnapshot:
+        return self._snapshot
 
     def __repr__(self) -> str:
         snapshot = self.snapshot
