@@ -24,7 +24,9 @@ TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.TERMINAL_FAILED,
 
 
 _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.CREATED: frozenset({TaskStatus.PROBING, TaskStatus.CANCELLED}),
+    TaskStatus.CREATED: frozenset(
+        {TaskStatus.PROBING, TaskStatus.PAUSED, TaskStatus.CANCELLED}
+    ),
     TaskStatus.PROBING: frozenset(
         {
             TaskStatus.WAITING_FOR_USER,
@@ -55,7 +57,13 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         }
     ),
     TaskStatus.READY: frozenset(
-        {TaskStatus.CRAWLING, TaskStatus.PAUSED, TaskStatus.TERMINAL_FAILED, TaskStatus.CANCELLED}
+        {
+            TaskStatus.CRAWLING,
+            TaskStatus.PAUSED,
+            TaskStatus.RECOVERABLE_FAILED,
+            TaskStatus.TERMINAL_FAILED,
+            TaskStatus.CANCELLED,
+        }
     ),
     TaskStatus.CRAWLING: frozenset(
         {

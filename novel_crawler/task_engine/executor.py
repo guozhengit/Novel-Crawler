@@ -110,7 +110,7 @@ class BackgroundTaskExecutor:
         self._control_poll_interval = control_poll_interval
         self._lock = threading.Lock()
         self._scheduled: set[str] = set()
-        self._pending_claimed: set[str] = set()
+        self._pending_resumes: dict[str, tuple[bool, TaskStatus]] = {}
         self._startup_deferred_count = 0
         self._closing = threading.Event()
         self._threads = [
@@ -147,23 +147,22 @@ class BackgroundTaskExecutor:
         self.shutdown(wait=True, timeout=10.0)
 
     def submit(self, task_id: str) -> bool:
-        if self._closing.is_set():
-            raise ExecutorClosed("executor_closed")
         task = self._repository.get_task(task_id)
-        if task.is_terminal:
-            return False
-        if task.status not in _SUBMITTABLE:
-            return False
         with self._lock:
+            if self._closing.is_set():
+                raise ExecutorClosed("executor_closed")
+            if task.is_terminal:
+                return False
+            if task.status not in _SUBMITTABLE:
+                return False
             if task_id in self._scheduled:
                 return False
             self._scheduled.add(task_id)
-        try:
-            self._queue.put_nowait((task_id, False))
-        except queue.Full as exc:
-            with self._lock:
+            try:
+                self._queue.put_nowait((task_id, False))
+            except queue.Full as exc:
                 self._scheduled.discard(task_id)
-            raise ExecutorQueueFull("executor_queue_full") from exc
+                raise ExecutorQueueFull("executor_queue_full") from exc
         return True
 
     def pause(self, task_id: str) -> TaskRecord:
@@ -190,24 +189,17 @@ class BackgroundTaskExecutor:
                 )
             except TaskVersionConflict:
                 continue
+            if resumed.status is TaskStatus.WAITING_FOR_USER:
+                return resumed
+            preclaimed = resumed.status in _INTERRUPTED
             try:
-                self._schedule_claimed(task_id)
-            except (ExecutorClosed, ExecutorQueueFull):
-                rollback = (
-                    TaskStatus.PAUSED
-                    if resumed.status is TaskStatus.READY
-                    else TaskStatus.RECOVERABLE_FAILED
+                self._schedule_resumed(
+                    task_id,
+                    preclaimed=preclaimed,
+                    rollback_status=task.status,
                 )
-                try:
-                    self._repository.transition(
-                        task_id,
-                        rollback,
-                        expected_version=resumed.version,
-                        reason="executor_resume_backpressure",
-                        error_code="executor_queue_full",
-                    )
-                except (TaskVersionConflict, InvalidTaskTransition):
-                    pass
+            except (ExecutorClosed, ExecutorQueueFull):
+                self._rollback_resume(task_id, resumed, task.status)
                 raise
             return resumed
 
@@ -237,31 +229,37 @@ class BackgroundTaskExecutor:
         return recovered
 
     def shutdown(self, *, wait: bool = True, timeout: float | None = None) -> bool:
-        self._closing.set()
-        if not wait:
-            return not any(thread.is_alive() for thread in self._threads)
         if timeout is not None and timeout < 0:
             raise ValueError("timeout must not be negative")
+        with self._lock:
+            self._closing.set()
+        if not wait:
+            return not any(thread.is_alive() for thread in self._threads)
         deadline = None if timeout is None else time.monotonic() + timeout
         for thread in self._threads:
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             thread.join(remaining)
         return not any(thread.is_alive() for thread in self._threads)
 
-    def _schedule_claimed(self, task_id: str) -> None:
-        if self._closing.is_set():
-            raise ExecutorClosed("executor_closed")
+    def _schedule_resumed(
+        self,
+        task_id: str,
+        *,
+        preclaimed: bool,
+        rollback_status: TaskStatus,
+    ) -> None:
         with self._lock:
+            if self._closing.is_set():
+                raise ExecutorClosed("executor_closed")
             if task_id in self._scheduled:
-                self._pending_claimed.add(task_id)
+                self._pending_resumes[task_id] = (preclaimed, rollback_status)
                 return
             self._scheduled.add(task_id)
-        try:
-            self._queue.put_nowait((task_id, True))
-        except queue.Full as exc:
-            with self._lock:
+            try:
+                self._queue.put_nowait((task_id, preclaimed))
+            except queue.Full as exc:
                 self._scheduled.discard(task_id)
-            raise ExecutorQueueFull("executor_queue_full") from exc
+                raise ExecutorQueueFull("executor_queue_full") from exc
 
     def _request_status(self, task_id: str, status: TaskStatus) -> TaskRecord:
         while True:
@@ -282,8 +280,9 @@ class BackgroundTaskExecutor:
 
     def _worker(self) -> None:
         while True:
-            if self._closing.is_set() and self._queue.empty():
-                return
+            with self._lock:
+                if self._closing.is_set() and self._queue.empty():
+                    return
             try:
                 task_id, preclaimed = self._queue.get(timeout=0.05)
             except queue.Empty:
@@ -295,21 +294,24 @@ class BackgroundTaskExecutor:
             except (TaskNotFound, TaskVersionConflict, InvalidTaskTransition):
                 pass
             finally:
-                resubmit = False
+                pending: tuple[bool, TaskStatus] | None = None
+                rollback = False
                 with self._lock:
                     self._scheduled.discard(task_id)
-                    if task_id in self._pending_claimed:
-                        self._pending_claimed.discard(task_id)
+                    pending = self._pending_resumes.pop(task_id, None)
+                    if pending is not None and not self._closing.is_set():
                         self._scheduled.add(task_id)
-                        resubmit = True
-                self._queue.task_done()
-                if resubmit:
-                    try:
-                        self._queue.put_nowait((task_id, True))
-                    except queue.Full:
-                        with self._lock:
+                        try:
+                            self._queue.put_nowait((task_id, pending[0]))
+                        except queue.Full:
                             self._scheduled.discard(task_id)
-                        self._record_failure(task_id, terminal=False, error_code="executor_queue_full")
+                            rollback = True
+                    elif pending is not None:
+                        rollback = True
+                self._queue.task_done()
+                if rollback and pending is not None:
+                    latest = self._repository.get_task(task_id)
+                    self._rollback_resume(task_id, latest, pending[1])
 
     def _claim(self, task_id: str) -> TaskRecord | None:
         task = self._repository.get_task(task_id)
@@ -375,3 +377,31 @@ class BackgroundTaskExecutor:
                 return
             except (TaskVersionConflict, InvalidTaskTransition):
                 continue
+
+    def _rollback_resume(
+        self,
+        task_id: str,
+        resumed: TaskRecord,
+        rollback_status: TaskStatus,
+    ) -> None:
+        current = resumed
+        for _attempt in range(8):
+            if current.status in TERMINAL_STATUSES or current.status in {
+                TaskStatus.PAUSED,
+                TaskStatus.RECOVERABLE_FAILED,
+            }:
+                return
+            try:
+                self._repository.transition(
+                    task_id,
+                    rollback_status,
+                    expected_version=current.version,
+                    reason="executor_resume_backpressure",
+                    error_code="executor_unavailable",
+                )
+                return
+            except TaskVersionConflict:
+                current = self._repository.get_task(task_id)
+            except InvalidTaskTransition as exc:
+                raise TaskExecutorError("resume_rollback_failed") from exc
+        raise TaskExecutorError("resume_rollback_failed")

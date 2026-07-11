@@ -286,6 +286,86 @@ def test_resume_reenters_handler_after_paused_worker_observes_control(tmp_path: 
         assert calls == 2
 
 
+def test_ready_pause_resume_claims_crawling_before_handler(tmp_path: Path) -> None:
+    seen: list[TaskStatus] = []
+
+    def crawl(context, task):  # type: ignore[no-untyped-def]
+        seen.append(task.status)
+        return TaskStatus.COMPLETED
+
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test/book")
+        for status in (TaskStatus.PROBING, TaskStatus.VALIDATING, TaskStatus.READY):
+            task = repository.transition(task.task_id, status, expected_version=task.version)
+        task = repository.transition(task.task_id, TaskStatus.PAUSED, expected_version=task.version)
+        with BackgroundTaskExecutor(repository, {TaskStatus.CRAWLING: crawl}) as executor:
+            resumed = executor.resume(task.task_id)
+            assert resumed.status is TaskStatus.READY
+            _wait_for_status(repository, task.task_id, TaskStatus.COMPLETED)
+        assert seen == [TaskStatus.CRAWLING]
+
+
+def test_historical_created_pause_resume_claims_probing(tmp_path: Path) -> None:
+    seen: list[TaskStatus] = []
+
+    def probe(context, task):  # type: ignore[no-untyped-def]
+        seen.append(task.status)
+        return TaskStatus.VALIDATING
+
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test/book")
+        repository.connection.execute(
+            "UPDATE tasks SET status='paused', version=1, resume_status='created' WHERE task_id=?",
+            (task.task_id,),
+        )
+        repository.connection.execute(
+            """
+            INSERT INTO task_events(
+                task_id, from_status, to_status, task_version, metadata_json, created_at
+            ) VALUES(?, 'created', 'paused', 1, '{}', 'historical')
+            """,
+            (task.task_id,),
+        )
+        with BackgroundTaskExecutor(repository, {TaskStatus.PROBING: probe}) as executor:
+            assert executor.resume(task.task_id).status is TaskStatus.CREATED
+            _wait_for_status(repository, task.task_id, TaskStatus.VALIDATING)
+        assert seen == [TaskStatus.PROBING]
+
+
+def test_queued_pause_is_consumed_before_resume_requeues_normal_claim(tmp_path: Path) -> None:
+    release = threading.Event()
+    crawling = threading.Event()
+
+    def crawl(context, task):  # type: ignore[no-untyped-def]
+        if task.source_url.endswith("block"):
+            release.wait(2)
+        else:
+            crawling.set()
+        return TaskStatus.COMPLETED
+
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        prepared = []
+        for suffix in ("block", "queued"):
+            task = repository.create_task(f"https://example.test/{suffix}")
+            for status in (TaskStatus.PROBING, TaskStatus.VALIDATING, TaskStatus.READY):
+                task = repository.transition(task.task_id, status, expected_version=task.version)
+            prepared.append(task)
+        with BackgroundTaskExecutor(
+            repository, {TaskStatus.CRAWLING: crawl}, max_workers=1
+        ) as executor:
+            executor.submit(prepared[0].task_id)
+            _wait_for_status(repository, prepared[0].task_id, TaskStatus.CRAWLING)
+            executor.submit(prepared[1].task_id)
+            executor.pause(prepared[1].task_id)
+            release.set()
+            _wait_for_status(repository, prepared[0].task_id, TaskStatus.COMPLETED)
+            time.sleep(0.05)
+            assert repository.get_task(prepared[1].task_id).status is TaskStatus.PAUSED
+            executor.resume(prepared[1].task_id)
+            assert crawling.wait(2)
+            _wait_for_status(repository, prepared[1].task_id, TaskStatus.COMPLETED)
+
+
 def test_startup_recovery_marks_interrupted_and_requeues_safe_states(tmp_path: Path) -> None:
     path = tmp_path / "tasks.db"
     with TaskRepository(path) as repository:
@@ -462,6 +542,81 @@ def test_shutdown_timeout_is_bounded_and_eventually_releases_workers(tmp_path: P
         assert time.monotonic() - started < 0.2
         release.set()
         assert executor.shutdown(wait=True, timeout=2)
+
+
+def test_submit_linearizes_before_shutdown_or_fails_closed(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test/book")
+        executor = BackgroundTaskExecutor(repository, {})
+        entered = threading.Event()
+        release = threading.Event()
+        original_get = repository.get_task
+
+        def blocked_get(task_id: str):  # type: ignore[no-untyped-def]
+            entered.set()
+            release.wait(2)
+            return original_get(task_id)
+
+        repository.get_task = blocked_get  # type: ignore[method-assign]
+        outcomes: list[object] = []
+
+        def submit() -> None:
+            try:
+                outcomes.append(executor.submit(task.task_id))
+            except Exception as exc:
+                outcomes.append(exc)
+
+        thread = threading.Thread(target=submit)
+        thread.start()
+        assert entered.wait(2)
+        assert executor.shutdown(timeout=2)
+        release.set()
+        thread.join(2)
+        repository.get_task = original_get  # type: ignore[method-assign]
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], ExecutorClosed)
+        assert repository.get_task(task.task_id).status is TaskStatus.CREATED
+
+
+def test_resume_transition_racing_shutdown_rolls_back_exact_origin(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test/book")
+        for status in (TaskStatus.PROBING, TaskStatus.VALIDATING, TaskStatus.READY):
+            task = repository.transition(task.task_id, status, expected_version=task.version)
+        task = repository.transition(task.task_id, TaskStatus.PAUSED, expected_version=task.version)
+        executor = BackgroundTaskExecutor(repository, {})
+        transitioned = threading.Event()
+        release = threading.Event()
+        original_transition = repository.transition
+
+        def blocked_transition(task_id, to_status, **kwargs):  # type: ignore[no-untyped-def]
+            result = original_transition(task_id, to_status, **kwargs)
+            if kwargs.get("reason") == "executor_resume":
+                transitioned.set()
+                release.wait(2)
+            return result
+
+        repository.transition = blocked_transition  # type: ignore[method-assign]
+        outcomes: list[object] = []
+
+        def resume() -> None:
+            try:
+                outcomes.append(executor.resume(task.task_id))
+            except Exception as exc:
+                outcomes.append(exc)
+
+        thread = threading.Thread(target=resume)
+        thread.start()
+        assert transitioned.wait(2)
+        assert executor.shutdown(timeout=2)
+        release.set()
+        thread.join(2)
+        repository.transition = original_transition  # type: ignore[method-assign]
+        assert len(outcomes) == 1
+        assert isinstance(outcomes[0], ExecutorClosed)
+        rolled_back = repository.get_task(task.task_id)
+        assert rolled_back.status is TaskStatus.PAUSED
+        assert rolled_back.resume_status is TaskStatus.READY
 
 
 def test_executor_processes_more_than_one_hundred_tasks(tmp_path: Path) -> None:
