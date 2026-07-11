@@ -151,7 +151,13 @@ def test_missing_task_and_stale_versions_are_distinct(tmp_path: Path) -> None:
     with TaskRepository(tmp_path / "tasks.db") as repository:
         with pytest.raises(TaskNotFound):
             repository.get_task("a" * 32)
+        with pytest.raises(TaskNotFound):
+            repository.list_events("a" * 32)
+        with pytest.raises(TaskNotFound):
+            repository.transition("a" * 32, TaskStatus.PROBING, expected_version=0)
         task = repository.create_task("https://example.test/book")
+        with pytest.raises(TaskInputError, match="status"):
+            repository.transition(task.task_id, "probing", expected_version=0)  # type: ignore[arg-type]
         repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0)
         with pytest.raises(TaskVersionConflict):
             repository.transition(task.task_id, TaskStatus.CANCELLED, expected_version=0)
@@ -358,6 +364,9 @@ def test_lists_tasks_for_restart_with_status_filter_and_bounds(tmp_path: Path) -
         assert repository.list_tasks(limit=1) == [created]
         with pytest.raises(TaskInputError, match="limit"):
             repository.list_tasks(limit=0)
+        assert repository.list_tasks(statuses=set()) == []
+        with pytest.raises(TaskInputError, match="statuses"):
+            repository.list_tasks(statuses={"probing"})  # type: ignore[arg-type]
 
 
 def test_refuses_database_from_unknown_future_task_schema(tmp_path: Path) -> None:
@@ -407,6 +416,94 @@ def test_upgrades_existing_v1_task_rows_with_empty_resume_origin(tmp_path: Path)
         assert repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0).version == 1
 
 
+def _create_v1_resume_database(path: Path, *, status: str, broken: str | None = None) -> None:
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE task_schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        INSERT INTO task_schema_migrations VALUES(1, 'v1');
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, source_url TEXT NOT NULL, status TEXT NOT NULL,
+            version INTEGER NOT NULL, metadata_json TEXT NOT NULL, error_code TEXT,
+            error_message TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE task_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+            from_status TEXT, to_status TEXT NOT NULL, task_version INTEGER NOT NULL,
+            reason TEXT, metadata_json TEXT NOT NULL DEFAULT '{}', error_code TEXT,
+            error_message TEXT, created_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id), UNIQUE(task_id, task_version)
+        );
+        """
+    )
+    task_id = "b" * 32
+    if status == "paused":
+        events = [(None, "created"), ("created", "probing"), ("probing", "waiting_for_user"), ("waiting_for_user", "paused")]
+    else:
+        events = [(None, "created"), ("created", "probing"), ("probing", "recoverable_failed")]
+    connection.execute(
+        "INSERT INTO tasks VALUES(?, ?, ?, ?, '{}', NULL, NULL, 'v1', 'v1')",
+        (task_id, "https://example.test/v1-resume", status, len(events) - 1),
+    )
+    for version, (from_status, to_status) in enumerate(events):
+        if broken == "missing" and version == len(events) - 1:
+            continue
+        if broken == "illegal" and version == len(events) - 1:
+            from_status = "completed"
+        connection.execute(
+            """
+            INSERT INTO task_events(
+                task_id, from_status, to_status, task_version, metadata_json, created_at
+            ) VALUES(?, ?, ?, ?, '{}', 'v1')
+            """,
+            (task_id, from_status, to_status, version),
+        )
+    connection.commit()
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    ("status, expected_origin"),
+    [(TaskStatus.PAUSED, TaskStatus.WAITING_FOR_USER), (TaskStatus.RECOVERABLE_FAILED, TaskStatus.PROBING)],
+)
+def test_v1_migration_atomically_backfills_resume_origin_from_event_chain(
+    tmp_path: Path, status: TaskStatus, expected_origin: TaskStatus
+) -> None:
+    path = tmp_path / f"v1-{status.value}.db"
+    _create_v1_resume_database(path, status=status.value)
+    with TaskRepository(path) as repository:
+        task = repository.get_task("b" * 32)
+        assert repository.schema_version == 2
+        assert task.resume_status is expected_origin
+
+    with TaskRepository(path) as repository:
+        task = repository.get_task("b" * 32)
+        assert task.resume_status is expected_origin
+        with pytest.raises(InvalidTaskTransition):
+            repository.transition(task.task_id, TaskStatus.CRAWLING, expected_version=task.version)
+        resumed = repository.transition(
+            task.task_id, expected_origin, expected_version=task.version
+        )
+        assert resumed.resume_status is None
+
+
+@pytest.mark.parametrize("broken", ["missing", "illegal"])
+def test_v1_resume_migration_bad_events_roll_back_schema_and_version(
+    tmp_path: Path, broken: str
+) -> None:
+    path = tmp_path / f"broken-{broken}.db"
+    _create_v1_resume_database(path, status=TaskStatus.PAUSED.value, broken=broken)
+    with pytest.raises(TaskInputError, match="migration_resume"):
+        TaskRepository(path)
+
+    connection = sqlite3.connect(path)
+    assert connection.execute("SELECT MAX(version) FROM task_schema_migrations").fetchone()[0] == 1
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+    assert "resume_status" not in columns
+    connection.close()
+
+
 def test_rejects_cyclic_and_non_mapping_metadata_with_public_error(tmp_path: Path) -> None:
     cyclic: dict[str, object] = {}
     cyclic["child"] = cyclic
@@ -446,6 +543,26 @@ def test_rejects_sensitive_string_values_in_task_and_event_nested_metadata(
                 expected_version=0,
                 metadata={"safe": [[private_value]]},
             )
+
+
+@pytest.mark.parametrize(
+    "normal_value",
+    ["The Secret: A Novel", "Bearer of the Curse", "Cookie: A Novel", "Password: A Novel"],
+)
+def test_allows_normal_book_text_that_contains_credential_words(
+    tmp_path: Path, normal_value: str
+) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task(
+            "https://example.test/book", metadata={"book_title": normal_value}
+        )
+        probing = repository.transition(
+            task.task_id,
+            TaskStatus.PROBING,
+            expected_version=0,
+            metadata={"diagnostic": [normal_value]},
+        )
+        assert probing.status is TaskStatus.PROBING
 
 
 def test_rejects_sensitive_error_details_and_boolean_version(tmp_path: Path) -> None:

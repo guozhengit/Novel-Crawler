@@ -29,24 +29,17 @@ _SENSITIVE_KEYS = (
     "secret",
     "token",
 )
-_SENSITIVE_TEXT_MARKERS = (
-    "authorization:",
-    "bearer ",
-    "browser_token",
-    "cookie=",
-    "<body",
-    "<html",
-    "page_body",
-    "password=",
-    "password:",
-    "profile_path",
-    "profile path",
-    "secret=",
-    "secret:",
-    "token=",
-    "token:",
+_AUTHORIZATION_HEADER = re.compile(r"(?im)^\s*authorization\s*:\s*(?:bearer\s+)?\S+")
+_BEARER_VALUE = re.compile(r"(?i)(?:^|\s)bearer\s+([a-z0-9._~+/=-]+)(?=$|[\s,;])")
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)(?:^|[\s;,&?])(?:cookie|token|password|secret)\s*=\s*\S+"
 )
+_COOKIE_HEADER = re.compile(r"(?im)^\s*cookie\s*:\s*[^\s=;]+=[^\s;]+")
+_HTML_STRUCTURE = re.compile(r"(?i)<\s*(?:html|body)(?:\s|>)")
+_PROFILE_PATH_ASSIGNMENT = re.compile(r"(?i)profile(?:_|\s+)path\s*[:=]\s*\S+")
 _STATUS_SQL = ", ".join(f"'{status.value}'" for status in TaskStatus)
+_RESUMABLE_STATUSES = frozenset({TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED})
+_MAX_MIGRATION_EVENTS = 100_000
 
 
 class TaskRepositoryError(RuntimeError):
@@ -200,12 +193,54 @@ class TaskRepository:
                         f"ALTER TABLE tasks ADD COLUMN resume_status TEXT "
                         f"CHECK(resume_status IS NULL OR resume_status IN ({_STATUS_SQL}))"
                     )
+                self._backfill_resume_statuses()
                 self._connection.execute(
                     "INSERT INTO task_schema_migrations(version, applied_at) VALUES(2, ?)", (_now(),)
                 )
         columns = {str(row[1]) for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()}
         if "resume_status" not in columns:
             raise TaskInputError("task_schema_corrupt")
+
+    def _backfill_resume_statuses(self) -> None:
+        try:
+            self._backfill_resume_statuses_unchecked()
+        except TaskInputError:
+            raise
+        except (KeyError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise TaskInputError("task_schema_migration_resume_invalid") from exc
+
+    def _backfill_resume_statuses_unchecked(self) -> None:
+        rows = self._connection.execute(
+            "SELECT task_id, status, version FROM tasks WHERE status IN (?, ?)",
+            (TaskStatus.PAUSED.value, TaskStatus.RECOVERABLE_FAILED.value),
+        ).fetchall()
+        for task in rows:
+            try:
+                task_id = str(task["task_id"])
+                status = TaskStatus(task["status"])
+                version = int(task["version"])
+                if version < 1 or version > _MAX_MIGRATION_EVENTS:
+                    raise ValueError
+                events = self._connection.execute(
+                    """
+                    SELECT from_status, to_status, task_version
+                    FROM task_events WHERE task_id=? ORDER BY task_version
+                    """,
+                    (task_id,),
+                ).fetchall()
+                origin = _validated_resume_origin(events, status, version)
+                updated = self._connection.execute(
+                    """
+                    UPDATE tasks SET resume_status=?
+                    WHERE task_id=? AND status=? AND version=?
+                      AND (resume_status IS NULL OR resume_status=?)
+                    """,
+                    (origin.value, task_id, status.value, version, origin.value),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError
+            except (KeyError, TypeError, ValueError) as exc:
+                raise TaskInputError("task_schema_migration_resume_invalid") from exc
 
     def create_task(self, source_url: str, *, metadata: Mapping[str, Any] | None = None) -> TaskRecord:
         source_url = _validate_source_url(source_url)
@@ -314,7 +349,7 @@ class TaskRepository:
                 raise InvalidTaskTransition(
                     f"transition_not_allowed:{current.status.value}:{to_status.value}"
                 )
-            if current.status in {TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED} and to_status not in {
+            if current.status in _RESUMABLE_STATUSES and to_status not in {
                 TaskStatus.TERMINAL_FAILED,
                 TaskStatus.CANCELLED,
             }:
@@ -322,7 +357,7 @@ class TaskRepository:
                     raise InvalidTaskTransition(
                         f"resume_not_allowed:{current.status.value}:{to_status.value}"
                     )
-            if to_status in {TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED}:
+            if to_status in _RESUMABLE_STATUSES:
                 resume_status = current.status
             else:
                 resume_status = None
@@ -431,7 +466,7 @@ def _validate_optional_text(
         return None
     if not isinstance(value, str) or len(value) > maximum or "\x00" in value:
         raise TaskInputError(f"{name}_invalid")
-    if reject_sensitive and any(marker in value.casefold() for marker in _SENSITIVE_TEXT_MARKERS):
+    if reject_sensitive and _contains_sensitive_text(value):
         raise TaskInputError(f"{name}_sensitive")
     return value
 
@@ -455,8 +490,7 @@ def _reject_sensitive_metadata(value: Any) -> None:
         for child in value:
             _reject_sensitive_metadata(child)
     elif isinstance(value, str):
-        normalized = value.casefold()
-        if any(marker in normalized for marker in _SENSITIVE_TEXT_MARKERS):
+        if _contains_sensitive_text(value):
             raise TaskInputError("metadata_sensitive")
         try:
             parsed = urlsplit(value)
@@ -464,6 +498,65 @@ def _reject_sensitive_metadata(value: Any) -> None:
             raise TaskInputError("metadata_invalid") from exc
         if parsed.scheme.casefold() in {"http", "https"} and (parsed.username or parsed.password):
             raise TaskInputError("metadata_sensitive")
+
+
+def _contains_sensitive_text(value: str) -> bool:
+    if (
+        _AUTHORIZATION_HEADER.search(value)
+        or _CREDENTIAL_ASSIGNMENT.search(value)
+        or _COOKIE_HEADER.search(value)
+        or _HTML_STRUCTURE.search(value)
+        or _PROFILE_PATH_ASSIGNMENT.search(value)
+    ):
+        return True
+    for match in _BEARER_VALUE.finditer(value):
+        credential = match.group(1)
+        if len(credential) >= 6 and (
+            len(credential) >= 16
+            or any(character.isdigit() for character in credential)
+            or any(character in "._~+/=-" for character in credential)
+        ):
+            return True
+    return False
+
+
+def _validated_resume_origin(
+    events: list[sqlite3.Row], task_status: TaskStatus, task_version: int
+) -> TaskStatus:
+    if len(events) != task_version + 1:
+        raise ValueError
+    previous: TaskStatus | None = None
+    pending_origin: TaskStatus | None = None
+    for expected_version, event in enumerate(events):
+        if int(event["task_version"]) != expected_version:
+            raise ValueError
+        to_status = TaskStatus(event["to_status"])
+        raw_from = event["from_status"]
+        from_status = TaskStatus(raw_from) if raw_from is not None else None
+        if expected_version == 0:
+            if from_status is not None or to_status is not TaskStatus.CREATED:
+                raise ValueError
+        else:
+            if from_status is not previous or from_status is None:
+                raise ValueError
+            if to_status not in ALLOWED_TRANSITIONS[from_status]:
+                raise ValueError
+            if from_status in _RESUMABLE_STATUSES and to_status not in {
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                if pending_origin is None or to_status is not pending_origin:
+                    raise ValueError
+        if to_status in _RESUMABLE_STATUSES:
+            if from_status is None:
+                raise ValueError
+            pending_origin = from_status
+        else:
+            pending_origin = None
+        previous = to_status
+    if previous is not task_status or pending_origin is None:
+        raise ValueError
+    return pending_origin
 
 
 def _task_from_row(row: sqlite3.Row) -> TaskRecord:
