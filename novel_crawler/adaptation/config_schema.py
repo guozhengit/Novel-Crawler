@@ -21,7 +21,7 @@ _FIELDS = _V1_FIELDS
 _CONFIG_ID = re.compile(r"cfg_[A-Za-z0-9_-]{16,80}")
 _SCORE_KEY = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 _SECRET = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|session|authorization)", re.I)
-_SAMPLE_FIELDS = frozenset({"page_kind", "matched_fields", "node_count_bucket", "selector_match_counts", "success"})
+_SAMPLE_FIELDS = frozenset({"page_kind", "matched_fields", "node_count_bucket", "selector_match_counts", "success", "fingerprint"})
 _LDH_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _PATH_LITERAL = re.compile(r"[A-Za-z0-9._~%-]*")
 _PERCENT = re.compile(r"%(?:[0-9A-Fa-f]{2})")
@@ -191,6 +191,8 @@ def _samples(value: object) -> tuple[Mapping[str, object], ...]:
                 if not isinstance(item, Mapping) or not all(isinstance(k, str) and _SCORE_KEY.fullmatch(k) and isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 1_000_000 for k, v in item.items()):
                     raise ValueError("invalid selector match summary")
                 clean[key] = MappingProxyType(dict(item))
+            elif key == "fingerprint" and (not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)):
+                raise ValueError("invalid structural fingerprint")
             elif key == "matched_fields" and (not isinstance(item, int) or isinstance(item, bool) or item < 0):
                 raise ValueError("invalid matched_fields")
             elif key == "node_count_bucket" and (not isinstance(item, str) or not re.fullmatch(r"(?:0|[0-9]+-[0-9]+|[0-9]+\+)", item)):

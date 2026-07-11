@@ -71,6 +71,7 @@ class _Record:
     entry: RegistryEntry
     path: Path
     digest: str
+    identity_digest: str
 
 
 def _hash(value: str) -> str:
@@ -79,6 +80,12 @@ def _hash(value: str) -> str:
 
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _config_identity_digest(value: dict[str, object]) -> str:
+    stable = dict(value)
+    stable.pop("last_validated", None)
+    return hashlib.sha256(_canonical_json(stable)).hexdigest()
 
 
 def _thread_lock(name: str) -> threading.RLock:
@@ -300,22 +307,40 @@ class ConfigRegistry:
             entries = [entry for entry in entries if entry.status is status]
         return tuple(sorted(entries, key=lambda item: (item.config_id, item.version)))
 
-    def mark_stale(self, config_id: str) -> RegistryEntry:
-        return self._transition(config_id, ConfigStatus.STALE, ())
+    def mark_stale(self, config_id: str, *, expected_version: int | None = None) -> RegistryEntry:
+        return self._transition(config_id, ConfigStatus.STALE, (), expected_version=expected_version)
 
-    def mark_invalid(self, config_id: str, invalid_reason_ids: Sequence[str]) -> RegistryEntry:
+    def mark_invalid(
+        self, config_id: str, invalid_reason_ids: Sequence[str], *, expected_version: int | None = None
+    ) -> RegistryEntry:
         reasons = tuple(sorted(set(invalid_reason_ids)))
         if len(reasons) > 64:
             raise ValueError("at most 64 invalid reason ids are allowed")
         if not reasons or any(not isinstance(reason, str) or not _REASON_ID.fullmatch(reason) for reason in reasons):
             raise ValueError("invalid reason ids must be non-empty safe identifiers")
-        return self._transition(config_id, ConfigStatus.INVALID, reasons)
+        return self._transition(config_id, ConfigStatus.INVALID, reasons, expected_version=expected_version)
 
-    def mark_revoked(self, config_id: str) -> RegistryEntry:
-        return self._transition(config_id, ConfigStatus.REVOKED, ())
+    def mark_revoked(self, config_id: str, *, expected_version: int | None = None) -> RegistryEntry:
+        return self._transition(config_id, ConfigStatus.REVOKED, (), expected_version=expected_version)
+
+    def mark_validated(self, config_id: str, validated: str, *, expected_version: int | None = None) -> RegistryEntry:
+        """Append an active revision whose only config-content change is validation time."""
+        return self._transition(
+            config_id,
+            ConfigStatus.ACTIVE,
+            (),
+            expected_version=expected_version,
+            validated=validated,
+        )
 
     def _transition(
-        self, config_id: str, status: ConfigStatus, invalid_reason_ids: tuple[str, ...]
+        self,
+        config_id: str,
+        status: ConfigStatus,
+        invalid_reason_ids: tuple[str, ...],
+        *,
+        expected_version: int | None = None,
+        validated: str | None = None,
     ) -> RegistryEntry:
         with self._config_lock(config_id):
             with self._global_lock():
@@ -324,18 +349,33 @@ class ConfigRegistry:
                 if not records:
                     raise KeyError(config_id)
                 current = records[-1]
+                if expected_version is not None and current.entry.version != expected_version:
+                    raise ConfigConflictError("config revision changed concurrently")
                 if sum(len(items) for items in self._history.values()) >= self._max_files:
                     raise RegistryLimitError("registry exceeds maximum files")
                 config = self._read_envelope(current.path).get("config")
                 if not isinstance(config, dict):
                     raise RegistryError("stored config revision is unavailable")
+                digest = current.digest
+                identity_digest = current.identity_digest
+                if validated is not None:
+                    config = dict(config)
+                    config["last_validated"] = validated
+                    parsed = SiteConfig.from_dict(config)
+                    if parsed.config_id != current.entry.config_id or parsed.domain != current.entry.domain:
+                        raise RegistryError("validated revision changed config identity")
+                    digest = hashlib.sha256(_canonical_json(config)).hexdigest()
+                    identity_digest = _config_identity_digest(config)
                 entry = replace(
                     current.entry,
                     status=status,
                     version=current.entry.version + 1,
+                    validated=validated or current.entry.validated,
                     invalid_reason_ids=invalid_reason_ids,
                 )
-                record = self._write_revision(entry, config, current.digest)
+                record = self._write_revision(entry, config, digest)
+                if record.identity_digest != identity_digest:
+                    raise RegistryError("config identity changed unexpectedly")
                 records.append(record)
                 self._write_manifest()
                 return entry
@@ -365,7 +405,7 @@ class ConfigRegistry:
                 raise ConfigConflictError("config revision conflicts with existing content") from exc
             if existing != payload:
                 raise ConfigConflictError("config revision conflicts with existing content") from exc
-        return _Record(entry, path, digest)
+        return _Record(entry, path, digest, _config_identity_digest(config))
 
     @staticmethod
     def _entry_dict(entry: RegistryEntry) -> dict[str, object]:
@@ -488,7 +528,9 @@ class ConfigRegistry:
                     or parsed.last_validated != entry.validated
                 ):
                     raise ValueError("entry and config mismatch")
-                history.setdefault(entry.config_id, []).append(_Record(entry, path, digest))
+                history.setdefault(entry.config_id, []).append(
+                    _Record(entry, path, digest, _config_identity_digest(config_payload))
+                )
             except RegistryLimitError:
                 raise
             except (OSError, RegistryIOError, TypeError, ValueError, json.JSONDecodeError):
@@ -498,7 +540,7 @@ class ConfigRegistry:
         for config_id, records in list(history.items()):
             records.sort(key=lambda item: item.entry.version)
             versions_are_contiguous = [record.entry.version for record in records] == list(range(1, len(records) + 1))
-            content_is_consistent = len({record.digest for record in records}) == 1
+            content_is_consistent = len({record.identity_digest for record in records}) == 1
             rolled_back = manifest_highwater.get(config_id, 0) > records[-1].entry.version
             if (
                 not versions_are_contiguous

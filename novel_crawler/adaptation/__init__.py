@@ -13,6 +13,7 @@ from .registry import (
     RegistryLimitError,
     RegistryLockTimeout,
 )
+from .revalidation import ConfigRevalidator, RevalidationResult, RevalidationStatus
 from .scoring import (
     CandidateIdentity,
     CandidateScorer,
@@ -56,6 +57,7 @@ __all__ = [
     "ConfigDraft",
     "ConfigConflictError",
     "ConfigRegistry",
+    "ConfigRevalidator",
     "ConfigStatus",
     "MultiPageValidator",
     "PageValidation",
@@ -63,5 +65,7 @@ __all__ = [
     "RegistryError",
     "RegistryLimitError",
     "RegistryLockTimeout",
+    "RevalidationResult",
+    "RevalidationStatus",
     "ValidationResult",
 ]
