@@ -11,22 +11,31 @@ import stat
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from novel_crawler.adaptation.registry_io import RegistryIO, RegistryIOError, default_registry_io
+from novel_crawler.adaptation.registry_io import RegistryIO, RegistryIOError, RegistryIOSizeError, default_registry_io
+from novel_crawler.domains import canonical_domain
 
 _SCHEMA_VERSION = 1
 _HASH_NAME = re.compile(r"[0-9a-f]{64}")
-_PROCESS_LOCKS: dict[str, threading.Lock] = {}
+_PROCESS_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = weakref.WeakValueDictionary()
 _PROCESS_LOCKS_GUARD = threading.Lock()
 
 
 class BrowserSessionError(RuntimeError):
     """Base class with messages safe to expose to callers."""
+
+    def __init__(self, code: str, domain: str | None = None) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            raise ValueError("browser session error code is invalid")
+        self.code = code
+        self.domain = domain
+        super().__init__(code if domain is None else f"{code} ({domain})")
 
 
 class SessionLockTimeout(BrowserSessionError):
@@ -64,28 +73,12 @@ class BrowserSessionInfo:
     size_bucket: str
 
 
-def _canonical_domain(domain: str) -> str:
-    if not isinstance(domain, str):
-        raise TypeError("domain must be a string")
-    value = domain.rstrip(".")
-    if not value or any(character in value for character in "/@?#:\\"):
-        raise ValueError("domain is invalid")
-    try:
-        canonical = value.encode("idna").decode("ascii").lower()
-    except UnicodeError:
-        raise ValueError("domain is invalid") from None
-    if len(canonical) > 253:
-        raise ValueError("domain is invalid")
-    labels = canonical.split(".")
-    if any(not label or len(label) > 63 or label[0] == "-" or label[-1] == "-" for label in labels):
-        raise ValueError("domain is invalid")
-    if any(not re.fullmatch(r"[a-z0-9-]+", label) for label in labels):
-        raise ValueError("domain is invalid")
-    return canonical
-
-
 def _domain_key(domain: str) -> str:
     return hashlib.sha256(domain.encode("ascii")).hexdigest()
+
+
+def _binding(session_id: str, profile_key: str) -> str:
+    return hashlib.sha256(f"{session_id}:{profile_key}".encode("ascii")).hexdigest()
 
 
 def _now() -> str:
@@ -110,7 +103,7 @@ class _DomainLock:
     def acquire(self) -> None:
         deadline = time.monotonic() + self._timeout
         if not self._thread_lock.acquire(timeout=self._timeout):
-            raise SessionLockTimeout("browser session lock acquisition timed out")
+            raise SessionLockTimeout("lock_timeout")
         self._thread_locked = True
         try:
             self._stream = self._io.open_lock(self._path)
@@ -126,7 +119,7 @@ class _DomainLock:
                     return
                 except (BlockingIOError, OSError):
                     if time.monotonic() >= deadline:
-                        raise SessionLockTimeout("browser session lock acquisition timed out") from None
+                        raise SessionLockTimeout("lock_timeout") from None
                     time.sleep(min(0.025, max(0.001, deadline - time.monotonic())))
         except Exception:
             self.release()
@@ -139,7 +132,7 @@ class _DomainLock:
             import msvcrt
 
             msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
+        else:  # pragma: no cover - exercised by POSIX CI
             fcntl: Any = importlib.import_module("fcntl")
             fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -152,7 +145,7 @@ class _DomainLock:
                         import msvcrt
 
                         msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
+                    else:  # pragma: no cover - exercised by POSIX CI
                         fcntl: Any = importlib.import_module("fcntl")
                         fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
             finally:
@@ -192,7 +185,7 @@ class BrowserSessionLease:
 
     def __enter__(self) -> BrowserSessionLease:
         if self._closed:
-            raise BrowserSessionError("browser session lease is closed")
+            raise BrowserSessionError("lease_closed", self.info.domain)
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -240,22 +233,41 @@ class BrowserSessionStore:
         self._metadata = self.root / "metadata"
         self._locks = self.root / "locks"
         self._quarantine = self.root / "quarantine"
-        for path in (self.root, self._profiles, self._metadata, self._locks, self._quarantine):
+        self._trash = self.root / "trash"
+        self._tombstones = self.root / "tombstones"
+        for path in (
+            self.root, self._profiles, self._metadata, self._locks, self._quarantine,
+            self._trash, self._tombstones,
+        ):
             self._io.ensure_directory(path)
             self._io.verify_private(path)
+        recovery = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
+        try:
+            recovery.acquire()
+            self._recover_deletions()
+        except (RegistryIOError, OSError):
+            raise BrowserSessionError("recovery_io") from None
+        finally:
+            recovery.release()
 
     def _paths(self, domain: str) -> tuple[str, Path, Path, Path]:
         key = _domain_key(domain)
-        return key, self._profiles / key, self._metadata / f"{key}.json", self._locks / f"{key}.lock"
+        shard = int(key[:2], 16) % 64
+        return key, self._profiles / key, self._metadata / f"{key}.json", self._locks / f"shard-{shard:02d}.lock"
 
     def _lock(self, domain: str, timeout: float | None = None) -> _DomainLock:
         _, _, _, path = self._paths(domain)
         lock = _DomainLock(path, self._lock_timeout if timeout is None else timeout, self._io)
-        lock.acquire()
+        try:
+            lock.acquire()
+        except BrowserSessionError as exc:
+            raise type(exc)(exc.code, domain) from None
+        except (RegistryIOError, OSError):
+            raise BrowserSessionError("lock_io", domain) from None
         return lock
 
     def acquire(self, domain: str, timeout: float | None = None) -> BrowserSessionLease:
-        canonical = _canonical_domain(domain)
+        canonical = canonical_domain(domain)
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
         lock = self._lock(canonical, timeout)
@@ -267,13 +279,19 @@ class BrowserSessionStore:
                 self._quarantine_metadata(metadata)
                 info = None
             if info is not None and info.status is BrowserSessionStatus.REVOKED:
-                raise SessionConflictError("browser session is revoked")
+                raise SessionConflictError("revoked", canonical)
             if info is not None and info.status is BrowserSessionStatus.STALE:
                 self._safe_delete_profile(profile)
                 info = None
             if info is None:
                 allocation = _DomainLock(self._locks / "allocation.lock", self._lock_timeout, self._io)
-                allocation.acquire()
+                try:
+                    allocation.acquire()
+                except BrowserSessionError as exc:
+                    raise type(exc)(exc.code, canonical) from None
+                except (RegistryIOError, OSError):
+                    raise BrowserSessionError("allocation_io", canonical) from None
+                self._recover_deletions()
                 self._enforce_session_limit(excluding=metadata)
                 if profile.exists():
                     self._safe_delete_profile(profile)
@@ -303,6 +321,11 @@ class BrowserSessionStore:
             finally:
                 if allocation is not None:
                     allocation.release()
+        except (RegistryIOError, OSError):
+            if allocation is not None:
+                allocation.release()
+            lock.release()
+            raise BrowserSessionError("storage_io", canonical) from None
         except Exception:
             if allocation is not None:
                 allocation.release()
@@ -319,24 +342,29 @@ class BrowserSessionStore:
             self._write_info(metadata, replace(current, status=BrowserSessionStatus.AVAILABLE, size_bucket=self._size_bucket(size)))
 
     def get(self, domain: str) -> BrowserSessionInfo | None:
-        canonical = _canonical_domain(domain)
+        canonical = canonical_domain(domain)
         lock = self._lock(canonical)
         try:
             _, _, metadata, _ = self._paths(canonical)
             return self._read_info(metadata, quarantine=True)
+        except (RegistryIOError, OSError):
+            raise BrowserSessionError("storage_io", canonical) from None
         finally:
             lock.release()
 
     def list_sessions(self) -> tuple[BrowserSessionInfo, ...]:
         results: list[BrowserSessionInfo] = []
-        for count, path in enumerate(self._metadata.iterdir(), start=1):
-            if count > self._max_scan_entries:
-                raise SessionLimitError("browser session metadata scan limit exceeded")
-            if not path.is_file() or not _HASH_NAME.fullmatch(path.stem) or path.suffix != ".json":
-                continue
-            info = self._read_info(path, quarantine=True)
-            if info is not None:
-                results.append(info)
+        try:
+            for count, path in enumerate(self._metadata.iterdir(), start=1):
+                if count > self._max_scan_entries:
+                    raise SessionLimitError("metadata_scan_limit")
+                if not path.is_file() or not _HASH_NAME.fullmatch(path.stem) or path.suffix != ".json":
+                    continue
+                info = self._read_info(path, quarantine=True)
+                if info is not None:
+                    results.append(info)
+        except (RegistryIOError, OSError):
+            raise BrowserSessionError("storage_io") from None
         return tuple(sorted(results, key=lambda item: item.domain))
 
     def mark_stale(self, domain: str) -> BrowserSessionInfo:
@@ -346,23 +374,25 @@ class BrowserSessionStore:
         return self._set_status(domain, BrowserSessionStatus.REVOKED)
 
     def _set_status(self, domain: str, status: BrowserSessionStatus) -> BrowserSessionInfo:
-        canonical = _canonical_domain(domain)
+        canonical = canonical_domain(domain)
         lock = self._lock(canonical)
         try:
             _, _, metadata, _ = self._paths(canonical)
             info = self._read_info(metadata, quarantine=True)
             if info is None:
-                raise SessionConflictError("browser session does not exist")
+                raise SessionConflictError("not_found", canonical)
             updated = replace(info, status=status)
             self._write_info(metadata, updated)
             return updated
+        except (RegistryIOError, OSError):
+            raise BrowserSessionError("storage_io", canonical) from None
         finally:
             lock.release()
 
-    def clear(self, domain: str, expected_session_id: str, confirmation: bool = True) -> bool:
+    def clear(self, domain: str, expected_session_id: str, *, confirmation: bool = False) -> bool:
+        canonical = canonical_domain(domain)
         if confirmation is not True:
-            raise SessionConfirmationError("browser session deletion requires confirmation")
-        canonical = _canonical_domain(domain)
+            raise SessionConfirmationError("confirmation_required", canonical)
         lock = self._lock(canonical)
         try:
             _, profile, metadata, _ = self._paths(canonical)
@@ -370,14 +400,21 @@ class BrowserSessionStore:
             if info is None:
                 return False
             if info.session_id != expected_session_id:
-                raise SessionConflictError("browser session identity does not match")
-            self._safe_delete_profile(profile)
-            self._delete_metadata(metadata)
+                raise SessionConflictError("identity_mismatch", canonical)
+            tombstone_id = uuid.uuid4().hex
+            self._write_deleting(metadata, info, tombstone_id)
+            self._write_tombstone(info, tombstone_id)
+            self._complete_deletion(metadata, info, tombstone_id)
             return True
+        except RegistryIOSizeError:
+            raise SessionLimitError("profile_delete_limit", canonical) from None
+        except (RegistryIOError, OSError):
+            raise BrowserSessionError("deletion_io", canonical) from None
         finally:
             lock.release()
 
     def _write_info(self, path: Path, info: BrowserSessionInfo) -> None:
+        profile_key = _domain_key(info.domain)
         payload = {
             "schema_version": _SCHEMA_VERSION,
             "session_id": info.session_id,
@@ -386,31 +423,69 @@ class BrowserSessionStore:
             "last_used": info.last_used,
             "status": info.status.value,
             "size_bucket": info.size_bucket,
+            "profile_key": profile_key,
+            "binding": _binding(info.session_id, profile_key),
         }
         self._io.atomic_write(path, json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii"))
+
+    def _deleting_payload(self, info: BrowserSessionInfo, tombstone_id: str) -> dict[str, object]:
+        profile_key = _domain_key(info.domain)
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "session_id": info.session_id,
+            "domain": info.domain,
+            "created": info.created,
+            "last_used": info.last_used,
+            "status": "deleting",
+            "size_bucket": info.size_bucket,
+            "profile_key": profile_key,
+            "binding": _binding(info.session_id, profile_key),
+            "tombstone_id": tombstone_id,
+        }
+
+    def _write_deleting(self, path: Path, info: BrowserSessionInfo, tombstone_id: str) -> None:
+        payload = self._deleting_payload(info, tombstone_id)
+        self._io.atomic_write(path, json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii"))
+
+    def _write_tombstone(self, info: BrowserSessionInfo, tombstone_id: str) -> None:
+        payload = self._deleting_payload(info, tombstone_id)
+        self._io.atomic_write(
+            self._tombstones / f"{tombstone_id}.json",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("ascii"),
+        )
 
     def _read_info(self, path: Path, *, quarantine: bool) -> BrowserSessionInfo | None:
         try:
             payload = self._io.read_bounded(path, 4096)
         except FileNotFoundError:
             return None
-        except RegistryIOError as exc:
+        except RegistryIOError:
             if not path.exists():
                 return None
             if quarantine:
                 self._quarantine_metadata(path)
                 return None
-            raise BrowserSessionError("browser session metadata cannot be read safely") from exc
+            raise BrowserSessionError("metadata_io") from None
         try:
             value = json.loads(payload)
             if not isinstance(value, dict) or value.get("schema_version") != _SCHEMA_VERSION:
                 raise ValueError
+            if value.get("status") == "deleting":
+                info, tombstone_id = self._validate_deleting(path, value)
+                if quarantine:
+                    self._complete_deletion(path, info, tombstone_id)
+                return None
             info = BrowserSessionInfo(
-                session_id=value["session_id"], domain=_canonical_domain(value["domain"]),
+                session_id=value["session_id"], domain=canonical_domain(value["domain"]),
                 created=value["created"], last_used=value["last_used"],
                 status=BrowserSessionStatus(value["status"]), size_bucket=value["size_bucket"],
             )
             if not re.fullmatch(r"[0-9a-f]{32}", info.session_id):
+                raise ValueError
+            profile_key = _domain_key(info.domain)
+            if path.stem != profile_key or value.get("profile_key") != profile_key:
+                raise ValueError
+            if value.get("binding") != _binding(info.session_id, profile_key):
                 raise ValueError
             if info.size_bucket not in {"empty", "small", "medium", "large"}:
                 raise ValueError
@@ -421,7 +496,85 @@ class BrowserSessionStore:
             if quarantine:
                 self._quarantine_metadata(path)
                 return None
-            raise BrowserSessionError("browser session metadata is corrupt") from None
+            raise BrowserSessionError("metadata_corrupt") from None
+
+    def _validate_deleting(self, path: Path, value: dict[str, object]) -> tuple[BrowserSessionInfo, str]:
+        info = BrowserSessionInfo(
+            session_id=str(value["session_id"]),
+            domain=canonical_domain(str(value["domain"])),
+            created=str(value["created"]),
+            last_used=str(value["last_used"]),
+            status=BrowserSessionStatus.REVOKED,
+            size_bucket=str(value["size_bucket"]),
+        )
+        tombstone_id = str(value["tombstone_id"])
+        profile_key = _domain_key(info.domain)
+        if (
+            path.stem != profile_key
+            or value.get("profile_key") != profile_key
+            or value.get("binding") != _binding(info.session_id, profile_key)
+            or not re.fullmatch(r"[0-9a-f]{32}", info.session_id)
+            or not re.fullmatch(r"[0-9a-f]{32}", tombstone_id)
+        ):
+            raise ValueError("invalid deletion metadata")
+        return info, tombstone_id
+
+    def _complete_deletion(self, metadata: Path, info: BrowserSessionInfo, tombstone_id: str) -> None:
+        _, profile, _, _ = self._paths(info.domain)
+        trash = self._trash / tombstone_id
+        if profile.exists() and not trash.exists():
+            self._io.reject_link(profile)
+            self._verify_profile(profile)
+            self._io.durable_move(profile, trash)
+        if trash.exists():
+            self._io.secure_remove_tree(trash, self._max_delete_entries)
+        self._delete_metadata(metadata)
+        self._delete_metadata(self._tombstones / f"{tombstone_id}.json")
+
+    def _recover_deletions(self) -> None:
+        seen = 0
+        for path in self._metadata.iterdir():
+            seen += 1
+            if seen > self._max_scan_entries:
+                raise SessionLimitError("metadata_scan_limit")
+            try:
+                value = json.loads(self._io.read_bounded(path, 4096))
+                if isinstance(value, dict) and value.get("status") == "deleting":
+                    info, tombstone_id = self._validate_deleting(path, value)
+                    self._complete_deletion(path, info, tombstone_id)
+            except (RegistryIOError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+        for tombstone in self._tombstones.glob("*.json"):
+            seen += 1
+            if seen > self._max_scan_entries:
+                raise SessionLimitError("recovery_scan_limit")
+            try:
+                value = json.loads(self._io.read_bounded(tombstone, 4096))
+                if not isinstance(value, dict) or value.get("status") != "deleting":
+                    raise ValueError
+                domain = canonical_domain(str(value["domain"]))
+                _, _, metadata, _ = self._paths(domain)
+                info, tombstone_id = self._validate_deleting(metadata, value)
+                if tombstone.stem != tombstone_id:
+                    raise ValueError
+                self._complete_deletion(metadata, info, tombstone_id)
+            except (RegistryIOError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                self._quarantine_metadata(tombstone)
+        metadata_keys = {path.stem for path in self._metadata.glob("*.json")}
+        for profile in self._profiles.iterdir():
+            seen += 1
+            if seen > self._max_scan_entries:
+                raise SessionLimitError("recovery_scan_limit")
+            if profile.name not in metadata_keys:
+                tombstone_id = uuid.uuid4().hex
+                trash = self._trash / tombstone_id
+                self._io.durable_move(profile, trash)
+                self._io.secure_remove_tree(trash, self._max_delete_entries)
+        for trash in self._trash.iterdir():
+            seen += 1
+            if seen > self._max_scan_entries:
+                raise SessionLimitError("recovery_scan_limit")
+            self._io.secure_remove_tree(trash, self._max_delete_entries)
 
     def _quarantine_metadata(self, path: Path) -> None:
         if not path.exists():
@@ -443,39 +596,22 @@ class BrowserSessionStore:
         self._sync_directory(tombstone.parent)
 
     def _verify_profile(self, profile: Path) -> None:
-        self._io.reject_link(profile)
-        self._io.verify_private(profile)
-        if not profile.is_dir():
-            raise BrowserSessionError("browser profile is not a private directory")
         try:
             profile.relative_to(self._profiles)
         except ValueError:
-            raise BrowserSessionError("browser profile escapes the session root") from None
+            raise BrowserSessionError("profile_escape") from None
+        self._io.reject_link(profile)
+        self._io.verify_private(profile)
+        if not profile.is_dir():
+            raise BrowserSessionError("profile_not_private")
 
     def _profile_size(self, profile: Path) -> int:
-        total = 0
-        count = 0
-        stack = [profile]
-        while stack:
-            directory = stack.pop()
-            self._io.reject_link(directory)
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    count += 1
-                    if count > self._max_scan_entries:
-                        raise SessionLimitError("browser profile scan limit exceeded")
-                    metadata = entry.stat(follow_symlinks=False)
-                    if stat.S_ISLNK(metadata.st_mode) or self._is_reparse(metadata):
-                        raise BrowserSessionError("browser profile contains a link or reparse point")
-                    if stat.S_ISDIR(metadata.st_mode):
-                        stack.append(Path(entry.path))
-                    elif stat.S_ISREG(metadata.st_mode):
-                        total += metadata.st_size
-                        if total > self._max_profile_bytes:
-                            raise SessionLimitError("browser profile exceeds maximum bytes")
-                    else:
-                        raise BrowserSessionError("browser profile contains an unsafe filesystem object")
-        return total
+        try:
+            return self._io.secure_tree_size(profile, self._max_scan_entries, self._max_profile_bytes)
+        except RegistryIOError as exc:
+            if "limit" in str(exc):
+                raise SessionLimitError("profile_size_limit") from None
+            raise BrowserSessionError("profile_measure_unsafe") from None
 
     def _safe_delete_profile(self, profile: Path) -> None:
         if not profile.exists():
@@ -484,36 +620,12 @@ class BrowserSessionStore:
         self._verify_profile(profile)
         tombstone = self._quarantine / f"profile.{uuid.uuid4().hex}.trash"
         self._io.durable_move(profile, tombstone)
-        count = 0
-        stack: list[tuple[Path, bool]] = [(tombstone, False)]
-        while stack:
-            directory, visited = stack.pop()
-            self._io.reject_link(directory)
-            if visited:
-                directory.rmdir()
-                continue
-            stack.append((directory, True))
-            with os.scandir(directory) as entries:
-                children: list[Path] = []
-                for entry in entries:
-                    count += 1
-                    if count > self._max_delete_entries:
-                        raise SessionLimitError("browser profile deletion limit exceeded")
-                    child = directory / entry.name
-                    renamed = directory / f".delete.{uuid.uuid4().hex}"
-                    os.replace(child, renamed)
-                    children.append(renamed)
-            for child in children:
-                metadata = child.stat(follow_symlinks=False)
-                if stat.S_ISLNK(metadata.st_mode) or self._is_reparse(metadata):
-                    raise BrowserSessionError("browser profile deletion rejected a link or reparse point")
-                if stat.S_ISDIR(metadata.st_mode):
-                    stack.append((child, False))
-                elif stat.S_ISREG(metadata.st_mode):
-                    child.unlink()
-                else:
-                    raise BrowserSessionError("browser profile deletion rejected an unsafe object")
-        self._sync_directory(tombstone.parent)
+        try:
+            self._io.secure_remove_tree(tombstone, self._max_delete_entries)
+        except RegistryIOError as exc:
+            if "limit" in str(exc):
+                raise SessionLimitError("profile_delete_limit") from None
+            raise BrowserSessionError("profile_remove_unsafe") from None
 
     @staticmethod
     def _is_reparse(metadata: os.stat_result) -> bool:
@@ -523,21 +635,30 @@ class BrowserSessionStore:
     def _sync_directory(path: Path) -> None:
         if os.name == "nt":
             return
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))  # pragma: no cover - POSIX
+        try:  # pragma: no cover - POSIX
             os.fsync(descriptor)
-        finally:
+        finally:  # pragma: no cover - POSIX
             os.close(descriptor)
 
     def _enforce_session_limit(self, *, excluding: Path) -> None:
-        sessions = 0
-        for count, path in enumerate(self._metadata.iterdir(), start=1):
-            if count > self._max_scan_entries:
-                raise SessionLimitError("browser session metadata scan limit exceeded")
-            if path != excluding and path.suffix == ".json":
-                sessions += 1
-                if sessions >= self._max_sessions:
-                    raise SessionLimitError("maximum browser session count reached")
+        reservations: set[str] = set()
+        count = 0
+        for directory, prefix in (
+            (self._metadata, "domain:"),
+            (self._profiles, "domain:"),
+            (self._tombstones, "tombstone:"),
+            (self._trash, "trash:"),
+        ):
+            for path in directory.iterdir():
+                count += 1
+                if count > self._max_scan_entries:
+                    raise SessionLimitError("metadata_scan_limit")
+                key = path.stem if directory in {self._metadata, self._tombstones} else path.name
+                reservations.add(prefix + key)
+        reservations.discard("domain:" + excluding.stem)
+        if len(reservations) >= self._max_sessions:
+            raise SessionLimitError("session_count_limit")
 
     @staticmethod
     def _size_bucket(size: int) -> str:

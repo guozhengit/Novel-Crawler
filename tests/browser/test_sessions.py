@@ -9,10 +9,13 @@ import threading
 import time
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from novel_crawler.adaptation.registry_io import RegistryIOError
 from novel_crawler.browser.sessions import (
+    BrowserSessionError,
     BrowserSessionStatus,
     BrowserSessionStore,
     SessionConfirmationError,
@@ -36,6 +39,17 @@ def _hold_process_lease(
     with store.acquire("held.example"):
         ready.set()
         release.wait(10)
+
+
+def _allocate_limited_session(root: str, domain: str, start: object, results: object) -> None:
+    start.wait(10)  # type: ignore[attr-defined]
+    try:
+        store = BrowserSessionStore(root, max_sessions=1)
+        with store.acquire(domain):
+            pass
+        results.put("ok")  # type: ignore[attr-defined]
+    except SessionLimitError:
+        results.put("limit")  # type: ignore[attr-defined]
 
 
 def test_session_lifecycle_is_private_and_idna_canonical(tmp_path: Path) -> None:
@@ -63,7 +77,7 @@ def test_clear_requires_confirmation_and_matching_identity(tmp_path: Path) -> No
         session_id = lease.info.session_id
 
     with pytest.raises(SessionConfirmationError):
-        store.clear("example.com", session_id, confirmation=False)
+        store.clear("example.com", session_id)
     with pytest.raises(SessionConflictError):
         store.clear("example.com", "wrong-id", confirmation=True)
     assert store.clear("example.com", session_id, confirmation=True)
@@ -92,6 +106,18 @@ def test_invalid_domains_are_rejected(tmp_path: Path, domain: str) -> None:
     store = BrowserSessionStore(tmp_path / "sessions")
     with pytest.raises(ValueError, match="domain"):
         store.acquire(domain)
+
+
+def test_uts46_nontransitional_domains_do_not_alias_and_invalid_labels_fail(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    with store.acquire("faß.de") as sharp_s:
+        sharp_id = sharp_s.info.session_id
+        assert sharp_s.info.domain == "xn--fa-hia.de"
+    with store.acquire("fass.de") as ascii_s:
+        assert ascii_s.info.session_id != sharp_id
+    for invalid in ("a\u200db.example", "xn--invalid-.example", "xn--a.example"):
+        with pytest.raises(ValueError, match="domain"):
+            store.acquire(invalid)
 
 
 def test_same_domain_is_exclusive_but_different_domains_are_concurrent(tmp_path: Path) -> None:
@@ -150,6 +176,24 @@ def test_cross_process_contention_times_out(tmp_path: Path) -> None:
     assert process.exitcode == 0
 
 
+def test_multiprocess_global_allocation_limit_is_strict(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    root = str(tmp_path / "sessions")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(target=_allocate_limited_session, args=(root, f"{index}.example", start, results))
+        for index in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(15)
+        assert process.exitcode == 0
+    assert sorted(results.get(timeout=2) for _ in range(2)) == ["limit", "ok"]
+
+
 def test_corrupt_metadata_is_quarantined_and_recreated(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "sessions")
     with store.acquire("broken.example") as lease:
@@ -170,7 +214,7 @@ def test_metadata_serializer_contains_only_safe_fields(tmp_path: Path) -> None:
         pass
     payload = json.loads(next((store.root / "metadata").glob("*.json")).read_bytes())
     assert set(payload) == {
-        "schema_version", "session_id", "domain", "created", "last_used", "status", "size_bucket"
+        "binding", "created", "domain", "last_used", "profile_key", "schema_version", "session_id", "size_bucket", "status"
     }
     assert "cookie" not in repr(store.list_sessions()).lower()
     assert str(store.root) not in repr(store.list_sessions())
@@ -180,9 +224,9 @@ def test_session_count_and_profile_size_are_bounded(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "sessions", max_sessions=1, max_profile_bytes=3)
     with store.acquire("one.example") as lease:
         (lease.profile_path / "data").write_bytes(b"1234")
-        with pytest.raises(SessionLimitError, match="bytes"):
+        with pytest.raises(SessionLimitError, match="profile_size_limit"):
             lease.close()
-    with pytest.raises(SessionLimitError, match="count"):
+    with pytest.raises(SessionLimitError, match="session_count_limit"):
         store.acquire("two.example")
 
 
@@ -197,7 +241,7 @@ def test_symlink_in_profile_is_never_followed_or_deleted(tmp_path: Path) -> None
     except OSError:
         lease.close()
         pytest.skip("symlink creation unavailable")
-    with pytest.raises(Exception, match="link|reparse"):
+    with pytest.raises(Exception, match="profile_measure_unsafe"):
         lease.close()
     assert outside.read_text(encoding="utf-8") == "keep"
 
@@ -209,6 +253,23 @@ def test_posix_profile_and_metadata_permissions_are_private(tmp_path: Path) -> N
         assert stat.S_IMODE(lease.profile_path.stat().st_mode) == 0o700
     metadata = next((store.root / "metadata").glob("*.json"))
     assert stat.S_IMODE(metadata.stat().st_mode) == 0o600
+    for name in ("profiles", "metadata", "locks", "trash", "tombstones", "quarantine"):
+        assert stat.S_IMODE((store.root / name).stat().st_mode) == 0o700
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in (store.root / "locks").iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL verification")
+def test_windows_all_session_directories_and_files_have_private_acls(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    with store.acquire("private.example"):
+        pass
+    for name in ("profiles", "metadata", "locks", "trash", "tombstones", "quarantine"):
+        store._io.verify_private(store.root / name)
+    metadata = next((store.root / "metadata").glob("*.json"))
+    assert store._io.read_bounded(metadata, 4096)
+    for lock in (store.root / "locks").iterdir():
+        stream = store._io.open_lock(lock)
+        stream.close()
 
 
 def test_validation_missing_states_and_closed_lease(tmp_path: Path) -> None:
@@ -223,13 +284,13 @@ def test_validation_missing_states_and_closed_lease(tmp_path: Path) -> None:
         store.acquire("a" * 64 + ".example")
     with pytest.raises(ValueError):
         store.acquire("example.com", timeout=0)
-    assert store.clear("absent.example", "id") is False
-    with pytest.raises(SessionConflictError, match="does not exist"):
+    assert store.clear("absent.example", "id", confirmation=True) is False
+    with pytest.raises(SessionConflictError, match="not_found"):
         store.mark_stale("absent.example")
     lease = store.acquire("closed.example")
     lease.close()
     lease.close()
-    with pytest.raises(Exception, match="closed"):
+    with pytest.raises(Exception, match="lease_closed"):
         lease.__enter__()
 
 
@@ -242,7 +303,7 @@ def test_nested_profile_is_deleted_and_size_buckets_are_coarse(tmp_path: Path) -
         session_id = lease.info.session_id
     info = store.get("nested.example")
     assert info is not None and info.size_bucket == "small"
-    assert store.clear("nested.example", session_id)
+    assert store.clear("nested.example", session_id, confirmation=True)
     assert store._size_bucket(10 * 1024 * 1024) == "medium"
     assert store._size_bucket(100 * 1024 * 1024) == "large"
 
@@ -251,7 +312,7 @@ def test_scan_and_delete_entry_limits_fail_closed(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "sessions", max_scan_entries=1)
     (store.root / "metadata" / "ignored").write_text("x", encoding="utf-8")
     (store.root / "metadata" / "also-ignored").write_text("x", encoding="utf-8")
-    with pytest.raises(SessionLimitError, match="scan"):
+    with pytest.raises(SessionLimitError, match="metadata_scan_limit"):
         store.list_sessions()
 
     deleting = BrowserSessionStore(tmp_path / "deleting", max_delete_entries=1)
@@ -259,8 +320,8 @@ def test_scan_and_delete_entry_limits_fail_closed(tmp_path: Path) -> None:
         (lease.profile_path / "one").write_text("1", encoding="utf-8")
         (lease.profile_path / "two").write_text("2", encoding="utf-8")
         session_id = lease.info.session_id
-    with pytest.raises(SessionLimitError, match="deletion"):
-        deleting.clear("delete.example", session_id)
+    with pytest.raises(SessionLimitError, match="profile_delete_limit"):
+        deleting.clear("delete.example", session_id, confirmation=True)
 
 
 def test_unknown_metadata_files_are_not_deserialized(tmp_path: Path) -> None:
@@ -299,18 +360,32 @@ def test_domain_mismatch_is_quarantined_before_profile_reuse(tmp_path: Path) -> 
     assert list((store.root / "quarantine").glob("*.bad"))
 
 
+def test_complete_metadata_swap_is_quarantined_by_filename_binding(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    for domain in ("one.example", "two.example"):
+        with store.acquire(domain):
+            pass
+    metadata = sorted((store.root / "metadata").glob("*.json"))
+    first = metadata[0].read_bytes()
+    second = metadata[1].read_bytes()
+    metadata[0].write_bytes(second)
+    metadata[1].write_bytes(first)
+    assert store.list_sessions() == ()
+    assert len(list((store.root / "quarantine").glob("*.bad"))) == 2
+
+
 def test_profile_and_metadata_scan_limits_are_independent(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "profiles", max_scan_entries=1)
     lease = store.acquire("scan.example")
     (lease.profile_path / "one").write_text("1", encoding="utf-8")
     (lease.profile_path / "two").write_text("2", encoding="utf-8")
-    with pytest.raises(SessionLimitError, match="profile scan"):
+    with pytest.raises(SessionLimitError, match="profile_size_limit"):
         lease.close()
 
     metadata_store = BrowserSessionStore(tmp_path / "metadata", max_sessions=100, max_scan_entries=1)
     for name in ("a.json", "b.json"):
         (metadata_store.root / "metadata" / name).write_text("{}", encoding="ascii")
-    with pytest.raises(SessionLimitError, match="metadata scan"):
+    with pytest.raises(SessionLimitError, match="metadata_scan_limit"):
         metadata_store.acquire("new.example")
 
 
@@ -325,7 +400,7 @@ def test_deep_profile_deletion_is_iterative(tmp_path: Path) -> None:
     previous = sys.getrecursionlimit()
     try:
         sys.setrecursionlimit(50)
-        assert store.clear("deep.example", session_id)
+        assert store.clear("deep.example", session_id, confirmation=True)
     finally:
         sys.setrecursionlimit(previous)
 
@@ -345,7 +420,7 @@ def test_directory_swap_during_deletion_cannot_escape_profile(
     original_scandir = os.scandir
     swapped = False
 
-    def scandir(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
+    def scandir(path: str | os.PathLike[str]) -> Any:
         nonlocal swapped
         candidate = Path(path)
         if candidate == child and not swapped:
@@ -358,7 +433,7 @@ def test_directory_swap_during_deletion_cannot_escape_profile(
         return original_scandir(path)
 
     monkeypatch.setattr(os, "scandir", scandir)
-    assert store.clear("swap.example", session_id)
+    assert store.clear("swap.example", session_id, confirmation=True)
     assert sentinel.read_text(encoding="utf-8") == "keep"
 
 
@@ -405,3 +480,190 @@ def test_global_session_limit_includes_unpublished_concurrent_creation(
     assert not first.is_alive() and not second.is_alive()
     assert sum(isinstance(item, str) for item in outcomes) == 1
     assert sum(isinstance(item, SessionLimitError) for item in outcomes) == 1
+
+
+def test_domain_locks_use_a_fixed_64_shard_set(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions", max_sessions=100)
+    for index in range(70):
+        with store.acquire(f"domain-{index}.example"):
+            pass
+    lock_names = {path.name for path in (store.root / "locks").iterdir()}
+    assert len(lock_names - {"allocation.lock"}) <= 64
+    assert all(name == "allocation.lock" or name.startswith("shard-") for name in lock_names)
+
+
+def test_interrupted_transactional_clear_is_completed_on_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    store = BrowserSessionStore(root)
+    with store.acquire("recover.example") as lease:
+        session_id = lease.info.session_id
+    original_remove = store._io.secure_remove_tree
+    failed = False
+
+    def fail_once(path: Path, max_entries: int) -> None:
+        nonlocal failed
+        if not failed and path.parent.name == "trash":
+            failed = True
+            raise RegistryIOError("injected deletion crash")
+        original_remove(path, max_entries)
+
+    monkeypatch.setattr(store._io, "secure_remove_tree", fail_once)
+    with pytest.raises(BrowserSessionError) as caught:
+        store.clear("recover.example", session_id, confirmation=True)
+    assert caught.value.code == "deletion_io"
+    assert str(root) not in str(caught.value)
+    assert caught.value.__suppress_context__
+    assert list((root / "trash").iterdir())
+    assert list((root / "tombstones").iterdir())
+
+    recovered = BrowserSessionStore(root)
+    assert recovered.get("recover.example") is None
+    assert not list((root / "trash").iterdir())
+    assert not list((root / "tombstones").iterdir())
+
+
+def test_orphan_profile_from_crash_before_metadata_is_recovered(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    store = BrowserSessionStore(root)
+    orphan = store.root / "profiles" / ("a" * 64)
+    store._io.ensure_directory(orphan)
+    (orphan / "state").write_bytes(b"private")
+    BrowserSessionStore(root)
+    assert not orphan.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle swap defense")
+def test_windows_child_swap_attack_executes_but_cannot_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("keep", encoding="utf-8")
+    lease = store.acquire("attack.example")
+    child = lease.profile_path / "child"
+    child.mkdir()
+    lease.close()
+    api = store._io._api
+    original_open = api.open_tree_handle
+    attacked = False
+
+    def attack(path: Path, *, directory: bool) -> object:
+        nonlocal attacked
+        if path == child and not attacked:
+            child.rmdir()
+            try:
+                child.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                pytest.skip("directory symlink creation unavailable")
+            attacked = True
+        return original_open(path, directory=directory)
+
+    monkeypatch.setattr(api, "open_tree_handle", attack)
+    with pytest.raises(RegistryIOError):
+        store._io.secure_remove_tree(lease.profile_path, 100)
+    assert attacked
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_public_storage_errors_have_only_safe_code_and_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    with pytest.raises(ValueError):
+        BrowserSessionError("bad code")
+
+    def unsafe_failure(path: Path) -> object:
+        raise RegistryIOError(f"cookie=C:/private/{path.name}")
+
+    monkeypatch.setattr(store._io, "open_lock", unsafe_failure)
+    with pytest.raises(BrowserSessionError) as caught:
+        store.acquire("safe.example")
+    assert caught.value.code == "lock_io"
+    assert caught.value.domain == "safe.example"
+    assert "cookie" not in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)
+    assert caught.value.__suppress_context__
+
+
+def test_invalid_deletion_binding_is_quarantined(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    with store.acquire("deleting.example"):
+        pass
+    metadata = next((store.root / "metadata").glob("*.json"))
+    value = json.loads(metadata.read_bytes())
+    value["status"] = "deleting"
+    value["tombstone_id"] = "not-an-id"
+    metadata.write_text(json.dumps(value), encoding="ascii")
+    assert store.get("deleting.example") is None
+    assert list((store.root / "quarantine").glob("*.bad"))
+
+
+def test_nonquarantining_read_and_profile_escape_fail_safely(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    with store.acquire("corrupt.example") as lease:
+        metadata = next((store.root / "metadata").glob("*.json"))
+        metadata.write_text("{}", encoding="ascii")
+        with pytest.raises(BrowserSessionError, match="metadata_corrupt"):
+            lease.close()
+    store._safe_delete_profile(store.root / "profiles" / ("f" * 64))
+    with pytest.raises(BrowserSessionError, match="profile_escape"):
+        store._verify_profile(store.root)
+
+
+def test_recovery_scan_is_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    store = BrowserSessionStore(root)
+    for name in ("one", "two"):
+        (store.root / "metadata" / name).write_text("{}", encoding="ascii")
+    with pytest.raises(SessionLimitError, match="metadata_scan_limit"):
+        BrowserSessionStore(root, max_scan_entries=1)
+
+
+def test_tombstone_only_and_orphan_trash_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "sessions"
+    store = BrowserSessionStore(root)
+    with store.acquire("tombstone.example") as lease:
+        session_id = lease.info.session_id
+    original_remove = store._io.secure_remove_tree
+
+    def fail(path: Path, max_entries: int) -> None:
+        raise RegistryIOError("injected")
+
+    monkeypatch.setattr(store._io, "secure_remove_tree", fail)
+    with pytest.raises(BrowserSessionError):
+        store.clear("tombstone.example", session_id, confirmation=True)
+    next((root / "metadata").glob("*.json")).unlink()
+    monkeypatch.setattr(store._io, "secure_remove_tree", original_remove)
+    recovered = BrowserSessionStore(root)
+    assert not list((root / "tombstones").iterdir())
+    assert not list((root / "trash").iterdir())
+
+    orphan = root / "trash" / ("f" * 32)
+    recovered._io.ensure_directory(orphan)
+    (orphan / "state").write_text("x", encoding="ascii")
+    BrowserSessionStore(root)
+    assert not orphan.exists()
+
+
+def test_invalid_orphan_tombstone_is_quarantined(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    store = BrowserSessionStore(root)
+    invalid = root / "tombstones" / ("a" * 32 + ".json")
+    store._io.atomic_write(invalid, b"{}")
+    BrowserSessionStore(root)
+    assert not invalid.exists()
+    assert list((root / "quarantine").glob("*.bad"))
+
+
+def test_defensive_internal_state_branches_are_safe(tmp_path: Path) -> None:
+    store = BrowserSessionStore(tmp_path / "sessions")
+    store._quarantine_metadata(store.root / "metadata" / "missing.json")
+    store._delete_metadata(store.root / "metadata" / "missing.json")
+    unsafe = store.root / "profiles" / ("e" * 64)
+    unsafe.write_text("not-directory", encoding="ascii")
+    with pytest.raises((BrowserSessionError, RegistryIOError)):
+        store._verify_profile(unsafe)

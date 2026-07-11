@@ -65,6 +65,8 @@ class RegistryIO(Protocol):
     def durable_move(self, source: Path, destination: Path) -> None: ...
     def open_lock(self, path: Path) -> BufferedRandom: ...
     def reject_link(self, path: Path) -> None: ...
+    def secure_tree_size(self, path: Path, max_entries: int, max_bytes: int) -> int: ...
+    def secure_remove_tree(self, path: Path, max_entries: int) -> None: ...
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -92,6 +94,109 @@ def _read_limit(descriptor: int, limit: int) -> bytes:
 
 
 class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
+    def secure_tree_size(self, path: Path, max_entries: int, max_bytes: int) -> int:
+        parent_fd = self._open_directory(path.parent, require_private=True)
+        descriptors: list[int] = []
+        total = 0
+        count = 0
+        try:
+            root_fd = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            descriptors.append(root_fd)
+            while descriptors:
+                directory_fd = descriptors.pop()
+                try:
+                    with os.scandir(directory_fd) as entries:
+                        for entry in entries:
+                            count += 1
+                            if count > max_entries:
+                                raise RegistryIOSizeError("tree entry limit exceeded")
+                            metadata = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                            if stat.S_ISLNK(metadata.st_mode):
+                                raise RegistryIOError("tree contains a symlink")
+                            if stat.S_ISDIR(metadata.st_mode):
+                                child_fd = os.open(
+                                    entry.name,
+                                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                                    dir_fd=directory_fd,
+                                )
+                                child_metadata = os.fstat(child_fd)
+                                if not stat.S_ISDIR(child_metadata.st_mode):
+                                    os.close(child_fd)
+                                    raise RegistryIOError("tree directory changed during traversal")
+                                descriptors.append(child_fd)
+                            elif stat.S_ISREG(metadata.st_mode):
+                                total += metadata.st_size
+                                if total > max_bytes:
+                                    raise RegistryIOSizeError("tree byte limit exceeded")
+                            else:
+                                raise RegistryIOError("tree contains an unsafe object")
+                finally:
+                    os.close(directory_fd)
+            return total
+        except OSError as exc:
+            raise RegistryIOError("tree cannot be measured safely") from exc
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            os.close(parent_fd)
+
+    def secure_remove_tree(self, path: Path, max_entries: int) -> None:
+        parent_fd = self._open_directory(path.parent, require_private=True)
+        root_fd = -1
+        count = 0
+        try:
+            root_fd = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            frames: list[tuple[int, int, str, Any]] = [
+                (root_fd, parent_fd, path.name, os.scandir(root_fd))
+            ]
+            root_fd = -1
+            while frames:
+                directory_fd, ancestor_fd, name, entries = frames[-1]
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    entries.close()
+                    os.close(directory_fd)
+                    frames.pop()
+                    os.rmdir(name, dir_fd=ancestor_fd)
+                    continue
+                count += 1
+                if count > max_entries:
+                    raise RegistryIOSizeError("tree entry limit exceeded")
+                metadata = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise RegistryIOError("tree contains a symlink")
+                if stat.S_ISDIR(metadata.st_mode):
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                    frames.append((child_fd, directory_fd, entry.name, os.scandir(child_fd)))
+                elif stat.S_ISREG(metadata.st_mode):
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                else:
+                    raise RegistryIOError("tree contains an unsafe object")
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise RegistryIOError("tree cannot be removed safely") from exc
+        finally:
+            if root_fd >= 0:
+                os.close(root_fd)
+            if "frames" in locals():
+                for descriptor, _, _, entries in frames:
+                    entries.close()
+                    os.close(descriptor)
+            os.close(parent_fd)
+
     def reject_link(self, path: Path) -> None:
         descriptor = self._open_directory(path.parent, require_private=False)
         try:
@@ -770,6 +875,36 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         finally:
             self._kernel32.CloseHandle(handle)
 
+    def open_tree_handle(self, path: Path, *, directory: bool) -> tuple[int, _ByHandleFileInformation]:
+        flags = 0x00200000 | (0x02000000 if directory else 0x80)
+        handle = self._kernel32.CreateFileW(str(path), 0x00010080, 0x3, None, 3, flags, None)
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            raise RegistryIOError("tree handle cannot be opened safely")
+        try:
+            information = _ByHandleFileInformation()
+            if not self._kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+                raise RegistryIOError("tree handle cannot be verified")
+            is_directory = bool(information.dwFileAttributes & 0x10)
+            if information.dwFileAttributes & self._REPARSE or is_directory != directory:
+                raise RegistryIOError("tree handle targets an unsafe object")
+            if self._final_path(handle) != self._canonical(path):
+                raise RegistryIOError("tree handle final path mismatch")
+            return handle, information
+        except Exception:
+            self._kernel32.CloseHandle(handle)
+            raise
+
+    def mark_tree_handle_delete(self, handle: int) -> None:
+        disposition = _FileDispositionInfoEx(0x1)
+        if not self._kernel32.SetFileInformationByHandle(
+            handle, 21, ctypes.byref(disposition), ctypes.sizeof(disposition)
+        ):
+            raise RegistryIOError("tree handle deletion failed")
+
+    def close_tree_handle(self, handle: int) -> None:
+        self._kernel32.CloseHandle(handle)
+
 
 class _HeldAnchorStream:
     def __init__(self, stream: BufferedRandom, guard: Any) -> None:
@@ -979,6 +1114,95 @@ class WindowsRegistryIO:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
+
+    def secure_tree_size(self, path: Path, max_entries: int, max_bytes: int) -> int:
+        open_handle = getattr(self._api, "open_tree_handle", None)
+        close_handle = getattr(self._api, "close_tree_handle", None)
+        if open_handle is None or close_handle is None:
+            raise RegistryIOError("secure tree APIs are unavailable")
+        root_handle, _ = open_handle(path, directory=True)
+        stack: list[tuple[Path, int]] = [(path, root_handle)]
+        total = 0
+        count = 0
+        try:
+            while stack:
+                directory, handle = stack.pop()
+                try:
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            count += 1
+                            if count > max_entries:
+                                raise RegistryIOSizeError("tree entry limit exceeded")
+                            metadata = entry.stat(follow_symlinks=False)
+                            if stat.S_ISLNK(metadata.st_mode) or bool(
+                                getattr(metadata, "st_file_attributes", 0) & 0x400
+                            ):
+                                raise RegistryIOError("tree contains a reparse point")
+                            child = directory / entry.name
+                            if stat.S_ISDIR(metadata.st_mode):
+                                child_handle, _ = open_handle(child, directory=True)
+                                stack.append((child, child_handle))
+                            elif stat.S_ISREG(metadata.st_mode):
+                                child_handle, information = open_handle(child, directory=False)
+                                try:
+                                    total += (information.nFileSizeHigh << 32) | information.nFileSizeLow
+                                finally:
+                                    close_handle(child_handle)
+                                if total > max_bytes:
+                                    raise RegistryIOSizeError("tree byte limit exceeded")
+                            else:
+                                raise RegistryIOError("tree contains an unsafe object")
+                finally:
+                    close_handle(handle)
+            return total
+        finally:
+            for _, handle in stack:
+                close_handle(handle)
+
+    def secure_remove_tree(self, path: Path, max_entries: int) -> None:
+        open_handle = getattr(self._api, "open_tree_handle", None)
+        close_handle = getattr(self._api, "close_tree_handle", None)
+        mark_delete = getattr(self._api, "mark_tree_handle_delete", None)
+        if open_handle is None or close_handle is None or mark_delete is None:
+            raise RegistryIOError("secure tree APIs are unavailable")
+        root_handle, _ = open_handle(path, directory=True)
+        stack: list[tuple[Path, int, bool]] = [(path, root_handle, False)]
+        count = 0
+        try:
+            while stack:
+                current, handle, visited = stack.pop()
+                if visited:
+                    mark_delete(handle)
+                    close_handle(handle)
+                    continue
+                stack.append((current, handle, True))
+                children: list[tuple[Path, int, bool]] = []
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        count += 1
+                        if count > max_entries:
+                            raise RegistryIOSizeError("tree entry limit exceeded")
+                        metadata = entry.stat(follow_symlinks=False)
+                        if stat.S_ISLNK(metadata.st_mode) or bool(
+                            getattr(metadata, "st_file_attributes", 0) & 0x400
+                        ):
+                            raise RegistryIOError("tree contains a reparse point")
+                        child = current / entry.name
+                        is_directory = stat.S_ISDIR(metadata.st_mode)
+                        if not is_directory and not stat.S_ISREG(metadata.st_mode):
+                            raise RegistryIOError("tree contains an unsafe object")
+                        child_handle, _ = open_handle(child, directory=is_directory)
+                        children.append((child, child_handle, is_directory))
+                for child, child_handle, is_directory in children:
+                    if is_directory:
+                        stack.append((child, child_handle, False))
+                    else:
+                        mark_delete(child_handle)
+                        close_handle(child_handle)
+            # Closing the root's delete-pending handle durably removes the name.
+        finally:
+            for _, handle, _ in stack:
+                close_handle(handle)
 
 
 def default_registry_io() -> RegistryIO:
