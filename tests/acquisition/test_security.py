@@ -59,6 +59,31 @@ def test_validate_permits_public_ipv6_literal_without_dns() -> None:
     assert target.addresses == ("2606:2800:220:1:248:1893:25c8:1946",)
 
 
+@pytest.mark.parametrize("url", ["http://[::ffff:127.0.0.1]/", "http://[::ffff:a00:1]/"])
+def test_validate_rejects_ipv4_mapped_private_ipv6(url: str) -> None:
+    with pytest.raises(UrlSafetyError) as caught:
+        UrlSafetyPolicy(resolver=StubResolver({})).validate(url)
+
+    assert caught.value.code == "unsafe_address"
+
+
+def test_validate_permits_ipv4_mapped_public_ipv6() -> None:
+    target = UrlSafetyPolicy(resolver=StubResolver({})).validate("https://[::ffff:8.8.8.8]/")
+
+    assert target.addresses == ("::ffff:8.8.8.8",)
+
+
+@pytest.mark.parametrize("host", ["2130706433", "0177.0.0.1", "0x7f000001"])
+def test_noncanonical_ipv4_forms_must_be_resolved_and_checked(host: str) -> None:
+    resolver = StubResolver({host: ("127.0.0.1",)})
+
+    with pytest.raises(UrlSafetyError) as caught:
+        UrlSafetyPolicy(resolver=resolver).validate(f"http://{host}/")
+
+    assert caught.value.code == "unsafe_address"
+    assert resolver.calls == [(host, 80)]
+
+
 def test_validate_rejects_mixed_public_and_private_dns_answers() -> None:
     resolver = StubResolver({"example.com": ("93.184.216.34", "192.168.1.10")})
 
@@ -77,6 +102,14 @@ def test_validate_rejects_localhost_names(host: str) -> None:
     assert resolver.calls == []
 
 
+@pytest.mark.parametrize("host", ["localhost\u3002", "\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54"])
+def test_idna_separator_and_fullwidth_localhost_are_rejected(host: str) -> None:
+    with pytest.raises(UrlSafetyError) as caught:
+        UrlSafetyPolicy(resolver=StubResolver({})).validate(f"http://{host}/")
+
+    assert caught.value.code == "localhost"
+
+
 @pytest.mark.parametrize(
     ("url", "code"),
     [
@@ -87,6 +120,9 @@ def test_validate_rejects_localhost_names(host: str) -> None:
         ("https://example.com:not-a-port/", "invalid_port"),
         ("https://bad host.example/", "malformed_host"),
         ("https://bad_host.example/", "malformed_host"),
+        ("https://[fe80::1%25eth0]/", "zone_identifier_not_allowed"),
+        ("https://[2606:4700:4700::1111%25eth0]/", "zone_identifier_not_allowed"),
+        ("https://example.com:/", "invalid_port"),
     ],
 )
 def test_validate_rejects_invalid_urls_without_resolving(url: str, code: str) -> None:
@@ -126,3 +162,46 @@ def test_validate_redirect_rejects_unsafe_target_and_redacts_it() -> None:
 
     assert caught.value.safe_url == "http://127.0.0.1/admin"
     assert "secret" not in str(caught.value)
+
+
+def test_validate_redirect_resolves_relative_target_against_source() -> None:
+    resolver = StubResolver({"source.example": ("8.8.8.8",)})
+
+    target = UrlSafetyPolicy(resolver=resolver).validate_redirect(
+        "https://source.example/book/one?secret=1", "../chapter/two?token=2"
+    )
+
+    assert target.host == "source.example"
+    assert target.port == 443
+    assert resolver.calls == [("source.example", 443)]
+
+
+def test_each_redirect_hop_invokes_policy_resolution() -> None:
+    resolver = StubResolver(
+        {
+            "first.example": ("8.8.8.8",),
+            "second.example": ("1.1.1.1",),
+        }
+    )
+    policy = UrlSafetyPolicy(resolver=resolver)
+
+    policy.validate_redirect("https://origin.example/start", "https://first.example/next")
+    policy.validate_redirect("https://first.example/next", "https://second.example/final")
+
+    assert resolver.calls == [("first.example", 443), ("second.example", 443)]
+
+
+@pytest.mark.parametrize(
+    ("url", "expected_port"),
+    [
+        ("http://example.com/", 80),
+        ("https://example.com/", 443),
+        ("http://example.com:8080/", 8080),
+        ("https://example.com:444/", 444),
+    ],
+)
+def test_default_and_explicit_ports_are_passed_to_resolver(url: str, expected_port: int) -> None:
+    resolver = StubResolver({"example.com": ("8.8.8.8",)})
+
+    assert UrlSafetyPolicy(resolver=resolver).validate(url).port == expected_port
+    assert resolver.calls == [("example.com", expected_port)]

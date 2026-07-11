@@ -22,10 +22,20 @@ The injected stub resolver records `(host, port)` calls and returns deterministi
 
 ## Verification
 
-- Focused: `python -m pytest tests/acquisition/test_security.py -q` — 24 passed.
-- Full: `python -m pytest -q` — 118 passed.
+- Focused: `python -m pytest tests/acquisition/test_security.py -q` — 41 passed.
+- Full: `python -m pytest -q` — 135 passed.
 - Ruff (maintained package/tests): `python -m ruff check novel_crawler tests` — passed.
 - Mypy: `python -m mypy novel_crawler` — passed, 33 files checked.
 - Build: `python -m build --no-isolation` — sdist and wheel built successfully.
 
 `python -m build` could not create an isolated virtual environment under the Microsoft Store Python installation, so the equivalent non-isolated build was used after installing the declared build requirements. A repository-wide `ruff check .` also reports pre-existing violations in root utility scripts (`calibrate.py`, `decode_font.py`, `download_novel.py`, `merge_final.py`, and `verify_parts.py`); the new and maintained package/test paths are clean.
+
+## Review follow-up
+
+Review findings were addressed in a second strict RED/GREEN cycle:
+
+- RED produced six expected failures covering relative redirects, scoped IPv6, Unicode IDNA separators, and empty ports. The only assertion-only correction was the standard library's canonical spelling for public IPv4-mapped IPv6.
+- `validate_redirect` now joins relative targets against the source URL before applying the complete validation path. Sequential hop tests prove resolver invocation on every hop.
+- IPv6 scope/zone identifiers are rejected, including on otherwise-public literals.
+- Tests explicitly cover private and public IPv4-mapped IPv6, deterministic resolver handling of integer/octal/hex IPv4-like hosts, Unicode separator/fullwidth localhost forms, and default/explicit/empty ports.
+- API documentation states that a connector MUST connect to a validated `ResolvedTarget.addresses` entry, using `host` only for Host/SNI. Re-resolving the host is unsafe. Task 2 validates resolution but does **not** claim to close DNS TOCTOU; address pinning belongs to Task 3's connector.

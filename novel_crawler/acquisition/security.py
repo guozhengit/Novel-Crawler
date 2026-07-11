@@ -7,7 +7,7 @@ import re
 import socket
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 Resolver = Callable[[str, int], Iterable[str]]
 
@@ -23,6 +23,14 @@ class UrlSafetyError(ValueError):
 
 @dataclass(frozen=True)
 class ResolvedTarget:
+    """A validated endpoint and the exact addresses approved for connection.
+
+    Connectors MUST pin the connection to one of ``addresses``. ``host`` is
+    only for the HTTP Host header and TLS SNI; resolving it again is unsafe
+    because DNS may change after validation. This policy validates resolution
+    results but does not itself close that DNS TOCTOU window.
+    """
+
     host: str
     port: int
     addresses: tuple[str, ...]
@@ -55,6 +63,14 @@ def _is_unsafe(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
 
 
 class UrlSafetyPolicy:
+    """Validate URL syntax and all resolver answers before network access.
+
+    The resolver contract is ``resolver(idna_ascii_host, port) -> addresses``.
+    Every returned address is checked, including answers for noncanonical
+    integer/octal/hex-looking host names. Consumers must obey the pinning
+    contract documented by :class:`ResolvedTarget`.
+    """
+
     def __init__(
         self,
         allowed_schemes: tuple[str, ...] = ("http", "https"),
@@ -77,6 +93,11 @@ class UrlSafetyPolicy:
         raw_host = parts.hostname
         if raw_host is None or not raw_host:
             raise UrlSafetyError("malformed_host", safe_url)
+        if "%" in raw_host:
+            raise UrlSafetyError("zone_identifier_not_allowed", safe_url)
+        authority = parts.netloc.rsplit("@", 1)[-1]
+        if authority.endswith(":"):
+            raise UrlSafetyError("invalid_port", safe_url)
         try:
             port = parts.port
         except ValueError as exc:
@@ -111,16 +132,16 @@ class UrlSafetyPolicy:
         return ResolvedTarget(host, port, tuple(normalized))
 
     def validate_redirect(self, source_url: str, target_url: str) -> ResolvedTarget:
-        del source_url  # Cross-domain redirects are allowed when the target is public.
-        return self.validate(target_url)
+        """Resolve a possibly relative redirect and fully validate its target."""
+        return self.validate(urljoin(source_url, target_url))
 
     @staticmethod
     def _normalize_host(host: str, safe_url: str) -> str:
-        host = host.rstrip(".").lower()
+        host = host.lower()
         if not host or any(character.isspace() for character in host):
             raise UrlSafetyError("malformed_host", safe_url)
         try:
-            normalized = host.encode("idna").decode("ascii")
+            normalized = host.encode("idna").decode("ascii").rstrip(".")
         except UnicodeError as exc:
             raise UrlSafetyError("malformed_host", safe_url) from exc
         invalid_dns_label = ":" not in normalized and any(
