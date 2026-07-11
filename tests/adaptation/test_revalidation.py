@@ -20,6 +20,7 @@ from novel_crawler.adaptation.revalidation import (
     RevalidationStatus,
     _RevalidationRunContext,
 )
+from novel_crawler.browser.coordinator import BrowserCleanupRequired
 
 INDEX = "https://example.test/book"
 C1 = "https://example.test/c1"
@@ -501,3 +502,13 @@ def test_fetch_catalog_and_anchor_guards_cover_every_bounded_boundary() -> None:
     oversized = ConfigRevalidator(acquirer=Oversized(pages), registry=MemoryRegistry(config), max_revalidation_bytes=1)  # type: ignore[arg-type]
     with pytest.raises(AcquisitionError):
         oversized._fetch(INDEX, _RevalidationRunContext(oversized._origin_key(INDEX)))
+def test_revalidation_propagates_browser_cleanup_required(tmp_path: Path) -> None:
+    pages = {INDEX: _index(), C1: _chapter(1), C2: _chapter(2)}
+    registry, entry = _registered(tmp_path, pages)
+
+    class CleanupAcquirer(FakeAcquirer):
+        def fetch_page(self, url: str, **kwargs: object) -> AcquiredPage:
+            raise BrowserCleanupRequired("private-cleanup-token", "https://example.test")
+
+    with pytest.raises(BrowserCleanupRequired):
+        ConfigRevalidator(acquirer=CleanupAcquirer({}), registry=registry).revalidate(entry, "https://example.test/book")

@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 from novel_crawler.acquisition.http import AcquisitionError
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.adaptation.service import ProbeService
+from novel_crawler.browser.coordinator import BrowserCleanupRequired
 
 
 def snapshot(url: str, html: str) -> PageSnapshot:
@@ -223,3 +224,11 @@ def test_explicit_novel_book_metadata_matches_and_mismatches() -> None:
     mismatched = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/books/1/index.html")
     assert "book_title_mismatch" in mismatched.reason_ids
     assert "Secret Other Book" not in mismatched.to_json()
+def test_probe_propagates_browser_cleanup_required() -> None:
+    class CleanupAcquirer(FakeAcquirer):
+        def fetch_page(self, url: str, **kwargs: object) -> AcquiredPage:
+            raise BrowserCleanupRequired("private-cleanup-token", "https://example.test")
+
+    service = ProbeService(acquirer=CleanupAcquirer({}))
+    with pytest.raises(BrowserCleanupRequired):
+        service.probe("https://example.test/book")

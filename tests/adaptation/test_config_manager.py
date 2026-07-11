@@ -18,7 +18,7 @@ from novel_crawler.adaptation.revalidation import ConfigRevalidator, Revalidatio
 from novel_crawler.adaptation.service import ProbeService
 from novel_crawler.adaptation.url_paths import canonical_path
 from novel_crawler.adaptation.validation import ConfigDraft, ValidationResult
-from novel_crawler.browser.coordinator import VerificationRequired
+from novel_crawler.browser.coordinator import BrowserCleanupRequired, VerificationRequired
 from tests.adaptation.test_service import FakeAcquirer
 
 
@@ -636,4 +636,16 @@ def test_verification_required_is_not_hidden_by_manager() -> None:
 
     manager = ConfigManager(RaisingRegistry(), object(), object())  # type: ignore[arg-type]
     with pytest.raises(VerificationRequired):
+        manager.resolve("https://example.test/private")
+
+
+def test_browser_cleanup_required_is_not_hidden_by_manager() -> None:
+    class RaisingRegistry:
+        root = None
+
+        def lookup(self, url: str) -> None:
+            raise BrowserCleanupRequired("private-cleanup-token", "https://example.test")
+
+    manager = ConfigManager(RaisingRegistry(), object(), object())  # type: ignore[arg-type]
+    with pytest.raises(BrowserCleanupRequired):
         manager.resolve("https://example.test/private")

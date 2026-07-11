@@ -21,7 +21,7 @@ from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.acquisition.security import UrlSafetyPolicy, redact_url
 from novel_crawler.core.domains import canonical_domain
-from novel_crawler.verification import VerificationRequired
+from novel_crawler.verification import BrowserCleanupRequired, VerificationRequired
 
 from .driver import BrowserContextWorker, BrowserRequestPolicy, DefaultPlaywrightDriver, Driver
 from .models import VerificationOutcome, VerificationStatus, VerificationTicket
@@ -34,17 +34,6 @@ _REPAIR_LIMIT = 1024
 
 class HttpAcquirer(Protocol):
     def fetch_page(self, url: str, **kwargs: object) -> AcquiredPage: ...
-
-
-class BrowserCleanupRequired(AcquisitionError):
-    """A headless context remains quarantined until its safe token is retried."""
-
-    def __init__(self, token: str, safe_origin: str) -> None:
-        self.token = token
-        super().__init__("browser_cleanup_failed", safe_origin, False)
-
-    def __repr__(self) -> str:
-        return "BrowserCleanupRequired(code='browser_cleanup_failed', token='<redacted>')"
 
 
 @dataclass
@@ -141,7 +130,17 @@ class _AttemptLedger:
                     "expires_at": (self._clock() + self._ttl).isoformat(),
                 }
             )
-            self._write()
+            try:
+                self._write()
+            except Exception:
+                attempts[:] = [item for item in attempts if item["reservation_id"] != reservation_id]
+                if not attempts:
+                    self._values.pop(key, None)
+                try:
+                    self._write()
+                except Exception:
+                    pass
+                raise VerificationRequired("verification_ledger_failed") from None
             return reservation_id
         finally:
             lock.release()
@@ -288,10 +287,14 @@ class VerificationCoordinator:
             self._reserved += 1
         try:
             reservation_id = self._ledger.reserve(ledger_key, self.max_attempts)
-        except Exception:
+        except VerificationRequired:
             with self._guard:
                 self._reserved -= 1
             raise
+        except Exception:
+            with self._guard:
+                self._reserved -= 1
+            raise VerificationRequired("verification_ledger_failed") from None
         lease: BrowserSessionLease | None = None
         worker: BrowserContextWorker | None = None
         token = secrets.token_urlsafe(32)
@@ -354,6 +357,8 @@ class VerificationCoordinator:
             with self._guard:
                 if self._active.get(token) is not active:
                     raise VerificationRequired("verification_token_invalid")
+                if active.lifecycle == "quarantined":
+                    return self._cleanup_outcome(active)
             if self.clock() >= active.expires_at:
                 return self._finish(active, VerificationStatus.TIMED_OUT)
             try:
@@ -382,6 +387,8 @@ class VerificationCoordinator:
     def cancel(self, token: str) -> VerificationOutcome:
         active = self._lookup(token)
         with active.lock:
+            if active.lifecycle == "quarantined":
+                return self._cleanup_outcome(active)
             return self._finish(active, VerificationStatus.CANCELLED)
 
     def retry_cleanup(self, token: str) -> bool:
@@ -430,9 +437,19 @@ class VerificationCoordinator:
             raise VerificationRequired("verification_token_invalid")
         with self._guard:
             active = self._active.get(token)
-        if active is None or active.lifecycle != "active":
+        if active is None or active.lifecycle not in {"active", "quarantined"}:
             raise VerificationRequired("verification_token_invalid")
         return active
+
+    @staticmethod
+    def _cleanup_outcome(active: _ActiveVerification) -> VerificationOutcome:
+        return VerificationOutcome(
+            VerificationStatus.FAILED,
+            active.safe_origin,
+            active.attempt,
+            cleanup_required=True,
+            cleanup_ticket=active.token,
+        )
 
     def _finish(
         self,
@@ -444,7 +461,9 @@ class VerificationCoordinator:
     ) -> VerificationOutcome:
         with self._guard:
             if active.lifecycle in {"terminating", "quarantined", "released"}:
-                return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
+                return self._cleanup_outcome(active) if active.lifecycle == "quarantined" else VerificationOutcome(
+                    VerificationStatus.FAILED, active.safe_origin, active.attempt
+                )
             active.lifecycle = "terminating"
         try:
             active.worker.close()
@@ -454,7 +473,10 @@ class VerificationCoordinator:
                 active.token, active.ledger_key, active.reservation_id,
                 consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
             )
-            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
+            return VerificationOutcome(
+                VerificationStatus.FAILED, active.safe_origin, active.attempt, page,
+                cleanup_required=True, cleanup_ticket=active.token,
+            )
         try:
             active.lease.close()
         except Exception:
@@ -463,7 +485,10 @@ class VerificationCoordinator:
                 active.token, active.ledger_key, active.reservation_id,
                 consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
             )
-            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
+            return VerificationOutcome(
+                VerificationStatus.FAILED, active.safe_origin, active.attempt, page,
+                cleanup_required=True, cleanup_ticket=active.token,
+            )
         with self._guard:
             self._active.pop(active.token, None)
             active.lifecycle = "released"

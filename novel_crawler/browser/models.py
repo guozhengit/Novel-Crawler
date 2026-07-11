@@ -37,4 +37,9 @@ class VerificationOutcome:
     safe_origin: str
     attempt: int = 0
     page: AcquiredPage | None = field(default=None, repr=False)
+    cleanup_required: bool = False
+    cleanup_ticket: str | None = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        if self.cleanup_required != (self.cleanup_ticket is not None):
+            raise ValueError("cleanup signal and ticket must agree")

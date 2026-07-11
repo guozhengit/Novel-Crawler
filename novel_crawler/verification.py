@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from novel_crawler.acquisition.http import AcquisitionError
 from novel_crawler.acquisition.security import redact_url
 
 if TYPE_CHECKING:
@@ -34,4 +35,15 @@ class VerificationRequired(RuntimeError):
         return f"VerificationRequired(code={self.code!r}, safe_origin={self.safe_origin!r}, ticket_present={self.ticket is not None!r})"
 
 
-__all__ = ["VerificationRequired"]
+class BrowserCleanupRequired(AcquisitionError):
+    """A headless context remains quarantined until its private token is retried."""
+
+    def __init__(self, token: str, safe_origin: str) -> None:
+        self.token = token
+        super().__init__("browser_cleanup_failed", safe_origin, False)
+
+    def __repr__(self) -> str:
+        return "BrowserCleanupRequired(code='browser_cleanup_failed', token='<redacted>')"
+
+
+__all__ = ["BrowserCleanupRequired", "VerificationRequired"]

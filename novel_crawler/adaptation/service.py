@@ -17,7 +17,7 @@ from novel_crawler.acquisition.classifier import Classification, PageClassifier,
 from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.core.domains import canonical_domain
-from novel_crawler.verification import VerificationRequired
+from novel_crawler.verification import BrowserCleanupRequired, VerificationRequired
 
 from .config_schema import validate_candidate_selectors
 from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, FieldDecision, ScoredPageBatch
@@ -107,7 +107,7 @@ class ProbeService:
             if draft is None:
                 return self._safe_failure("selector_not_reusable")
             return self.validator.validate(first_item, second_item, draft, index_decision=index_analysis.decision.kind)
-        except VerificationRequired:
+        except (BrowserCleanupRequired, VerificationRequired):
             raise
         except AcquisitionError as exc:
             return self._safe_failure(f"acquisition.{exc.code}")

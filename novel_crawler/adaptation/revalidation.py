@@ -20,7 +20,7 @@ from novel_crawler.acquisition.classifier import Classification, PageClassifier,
 from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage
 from novel_crawler.core.domains import canonical_domain
-from novel_crawler.verification import VerificationRequired
+from novel_crawler.verification import BrowserCleanupRequired, VerificationRequired
 
 from .config_schema import SiteConfig
 from .decision import AdaptationDecision, DecisionKind, DecisionPolicy, ScoredPageBatch
@@ -234,7 +234,7 @@ class ConfigRevalidator:
             if validated_entry is None:
                 return self._conflict_result(entry, scores, matches, checked_at)
             return RevalidationResult(RevalidationStatus.VALID, (), scores, matches, checked_at, validated_entry)
-        except VerificationRequired:
+        except (BrowserCleanupRequired, VerificationRequired):
             raise
         except _AuthRequired:
             return self._stale(entry, ("auth_required",), {}, {}, checked_at)

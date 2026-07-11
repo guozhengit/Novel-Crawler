@@ -407,6 +407,11 @@ def test_failed_close_keeps_stale_lease_and_capacity_until_explicit_retry(tmp_pa
     ticket = coordinator.begin("https://example.test/a", task_key="download")
     outcome = coordinator.cancel(ticket.token)
     assert outcome.status is VerificationStatus.FAILED
+    assert outcome.cleanup_required
+    assert outcome.cleanup_ticket == ticket.token
+    assert "cleanup-token" not in repr(outcome)
+    repeated = coordinator.cancel(ticket.token)
+    assert repeated.cleanup_required and repeated.cleanup_ticket == ticket.token
     with pytest.raises(VerificationRequired, match="verification_capacity"):
         coordinator.begin("https://other.test/a", task_key="other")
     with pytest.raises(SessionLockTimeout):
@@ -760,6 +765,34 @@ def test_ledger_key_and_record_capacity_fail_closed(tmp_path: Path) -> None:
     with pytest.raises(VerificationRequired, match="verification_ledger_capacity"):
         records.reserve(second_key, 2)
 
+
+def test_begin_wraps_unexpected_ledger_reserve_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    coordinator = VerificationCoordinator(BrowserSessionStore(tmp_path), driver=FakeDriver([]), safety_policy=PUBLIC_POLICY)
+    monkeypatch.setattr(coordinator._ledger, "reserve", lambda *args: (_ for _ in ()).throw(ValueError("private ledger")))
+    with pytest.raises(VerificationRequired, match="verification_ledger_failed") as caught:
+        coordinator.begin("https://example.test/private?secret=yes", task_key="download")
+    assert caught.value.__cause__ is None
+    assert coordinator._reserved == 0
+
+
+def test_ledger_write_failure_rolls_back_attempt_reservation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 7, 11, tzinfo=UTC)
+    ledger = _AttemptLedger(BrowserSessionStore(tmp_path), lambda: now, timedelta(minutes=1))
+    key = ledger.opaque_key("https://example.test/", "download")
+    original = ledger._write
+    failures = 1
+
+    def fail_once() -> None:
+        nonlocal failures
+        if failures:
+            failures -= 1
+            raise OSError("private disk failure")
+        original()
+
+    monkeypatch.setattr(ledger, "_write", fail_once)
+    with pytest.raises(VerificationRequired, match="verification_ledger_failed"):
+        ledger.reserve(key, 1)
+    assert ledger.reserve(key, 1)
 
 def test_ledger_process_reservation_survives_other_process_success(tmp_path: Path) -> None:
     now = datetime(2026, 7, 11, tzinfo=UTC)
