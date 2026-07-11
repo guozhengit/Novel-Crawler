@@ -148,10 +148,10 @@ class ProbeService:
     @staticmethod
     def _book_identity(html: str) -> str | None:
         soup = BeautifulSoup(html, "lxml")
-        meta = soup.select_one('meta[property="og:novel:book_name"], meta[property="og:title"]')
+        meta = soup.select_one('meta[property="og:novel:book_name"], meta[name="book_name"]')
         value = str(meta.get("content", "")) if isinstance(meta, Tag) else ""
         if not value:
-            node = soup.select_one(".book-title, .breadcrumb [data-book-title], .breadcrumb .book")
+            node = soup.select_one('[data-book-title], .book-title, .breadcrumb [itemprop="book"], .breadcrumb .book, .breadcrumb .book-name, .breadcrumb [itemprop="name"].book')
             value = node.get_text(" ", strip=True) if isinstance(node, Tag) else ""
         normalized = re.sub(r"\s+", " ", value).strip().casefold()
         return normalized or None

@@ -89,7 +89,30 @@ def test_middle_and_last_chapter_choose_directory_neighbor_with_nested_relative_
 
 def test_book_identity_mismatch_rejects_without_leaking_title() -> None:
     pages = _nested_pages()
-    pages["https://example.test/books/1/chapters/2.html"] = pages["https://example.test/books/1/chapters/2.html"].replace('content="Book A"', 'content="Private Other Book"')
+    pages["https://example.test/books/1/index.html"] = pages["https://example.test/books/1/index.html"].replace('property="og:title"', 'property="og:novel:book_name"')
+    pages["https://example.test/books/1/chapters/2.html"] = pages["https://example.test/books/1/chapters/2.html"].replace('property="og:title" content="Book A"', 'property="og:novel:book_name" content="Private Other Book"')
     result = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/books/1/index.html")
     assert not result.ok and "book_title_mismatch" in result.reason_ids
     assert "Private Other Book" not in result.to_json()
+
+
+def test_generic_og_title_is_never_used_as_book_identity() -> None:
+    pages = _nested_pages()
+    pages["https://example.test/books/1/chapters/1.html"] = pages["https://example.test/books/1/chapters/1.html"].replace('content="Book A"', 'content="Chapter 1 - Book A"')
+    pages["https://example.test/books/1/chapters/2.html"] = pages["https://example.test/books/1/chapters/2.html"].replace('content="Book A"', 'content="Chapter 2 - Book A"')
+    result = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/books/1/index.html")
+    assert "book_title_mismatch" not in result.reason_ids
+
+
+def test_explicit_novel_book_metadata_matches_and_mismatches() -> None:
+    pages = _nested_pages()
+    pages["https://example.test/books/1/index.html"] = pages["https://example.test/books/1/index.html"].replace('property="og:title"', 'property="og:novel:book_name"')
+    for number in (1, 2):
+        url = f"https://example.test/books/1/chapters/{number}.html"
+        pages[url] = pages[url].replace('property="og:title"', 'property="og:novel:book_name"')
+    matched = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/books/1/index.html")
+    assert "book_title_mismatch" not in matched.reason_ids
+    pages["https://example.test/books/1/chapters/2.html"] = pages["https://example.test/books/1/chapters/2.html"].replace('content="Book A"', 'content="Secret Other Book"')
+    mismatched = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/books/1/index.html")
+    assert "book_title_mismatch" in mismatched.reason_ids
+    assert "Secret Other Book" not in mismatched.to_json()
