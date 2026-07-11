@@ -4,6 +4,15 @@ from .decision import AdaptationDecision, DecisionConfig, DecisionKind, Decision
 from .diagnostics import Diagnostic, DiagnosticCode
 from .extractor import CandidateExtractor, ExtractionRule, ExtractorConfig
 from .models import Candidate, Evidence, ExtractionResult, FieldKind
+from .registry import (
+    ConfigConflictError,
+    ConfigRegistry,
+    ConfigStatus,
+    RegistryEntry,
+    RegistryError,
+    RegistryLimitError,
+    RegistryLockTimeout,
+)
 from .scoring import (
     CandidateIdentity,
     CandidateScorer,
@@ -45,7 +54,14 @@ __all__ = [
     "ScoredPageBatch",
     "ProbeService",
     "ConfigDraft",
+    "ConfigConflictError",
+    "ConfigRegistry",
+    "ConfigStatus",
     "MultiPageValidator",
     "PageValidation",
+    "RegistryEntry",
+    "RegistryError",
+    "RegistryLimitError",
+    "RegistryLockTimeout",
     "ValidationResult",
 ]
