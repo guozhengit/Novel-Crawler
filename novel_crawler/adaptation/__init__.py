@@ -15,6 +15,8 @@ from .scoring import (
     ScoringContext,
     ScoringRule,
 )
+from .service import ProbeService
+from .validation import ConfigDraft, MultiPageValidator, PageValidation, ValidationResult
 
 __all__ = [
     "AdaptationDecision",
@@ -41,4 +43,9 @@ __all__ = [
     "ScoringContext",
     "ScoringRule",
     "ScoredPageBatch",
+    "ProbeService",
+    "ConfigDraft",
+    "MultiPageValidator",
+    "PageValidation",
+    "ValidationResult",
 ]
