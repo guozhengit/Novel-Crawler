@@ -22,10 +22,10 @@ class PageSnapshot:
     headers: Mapping[str, str]
     encoding: str
     html: str
+    body: bytes
     method: str
     redirects: tuple[RedirectHop, ...]
     retrieved_at: datetime
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
-

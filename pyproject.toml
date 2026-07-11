@@ -12,6 +12,7 @@ license = "MIT"
 authors = [{ name = "Novel Crawler contributors" }]
 dependencies = [
   "requests>=2.31,<3",
+  "urllib3>=2.2,<3",
   "beautifulsoup4>=4.12,<5",
   "lxml>=5,<7",
   "charset-normalizer>=3,<4",

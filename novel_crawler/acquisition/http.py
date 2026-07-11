@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -112,27 +113,40 @@ class HttpPageAcquirer:
             try:
                 target = self.policy.validate(current_url) if target is None else target
             except UrlSafetyError as exc:
-                raise AcquisitionError(exc.code, exc.safe_url, False) from exc
+                raise AcquisitionError(exc.code, exc.safe_url, False) from None
             parts = urlsplit(current_url)
             scheme = parts.scheme.lower()
             headers = {
                 "Host": self._host_header(target.host, target.port, scheme),
                 "User-Agent": self.user_agent,
             }
-            try:
-                response = self.transport.request(
-                    approved_ip=target.addresses[0],
-                    original_host=target.host,
-                    port=target.port,
-                    scheme=scheme,
-                    path=self._request_target(parts.path, parts.query),
-                    headers=headers,
-                    timeout=self.timeout,
+            deadline = time.monotonic() + self.timeout
+            response: TransportResponse | None = None
+            failures: list[Exception] = []
+            for approved_ip in target.addresses:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failures.append(TimeoutError())
+                    break
+                try:
+                    response = self.transport.request(
+                        approved_ip=approved_ip,
+                        original_host=target.host,
+                        port=target.port,
+                        scheme=scheme,
+                        path=self._request_target(parts.path, parts.query),
+                        headers=headers,
+                        timeout=remaining,
+                    )
+                    break
+                except Exception as exc:
+                    failures.append(exc)
+            if response is None:
+                timed_out = bool(failures) and all(
+                    isinstance(exc, (TimeoutError, urllib3.exceptions.TimeoutError)) for exc in failures
                 )
-            except (TimeoutError, urllib3.exceptions.TimeoutError) as exc:
-                raise AcquisitionError("timeout", redact_url(current_url), True) from exc
-            except Exception as exc:
-                raise AcquisitionError("transport_error", redact_url(current_url), True) from exc
+                code = "timeout" if timed_out else "transport_error"
+                raise AcquisitionError(code, redact_url(current_url), True) from None
 
             if response.status_code in REDIRECT_STATUSES:
                 location = self._header(response.headers, "location")
@@ -146,7 +160,7 @@ class HttpPageAcquirer:
                 try:
                     next_target = self.policy.validate_redirect(current_url, location)
                 except UrlSafetyError as exc:
-                    raise AcquisitionError(exc.code, exc.safe_url, False) from exc
+                    raise AcquisitionError(exc.code, exc.safe_url, False) from None
                 redirects.append(RedirectHop(current_url, response.status_code))
                 seen.add(next_url)
                 current_url = next_url
@@ -168,6 +182,7 @@ class HttpPageAcquirer:
                 headers=filtered,
                 encoding=encoding,
                 html=html,
+                body=response.body,
                 method="GET",
                 redirects=tuple(redirects),
                 retrieved_at=datetime.now(UTC),
@@ -203,12 +218,11 @@ class HttpPageAcquirer:
         result = from_bytes(body).best()
         if result is not None and result.encoding:
             detected = result.encoding.lower()
-            if detected in {"utf_8", "utf-8", "utf8"}:
-                return "utf-8", str(result)
+            normalized = "utf-8" if detected in {"utf_8", "utf-8", "utf8"} else detected.replace("_", "-")
+            return normalized, str(result)
         for encoding in ("utf-8", "gb18030"):
             try:
                 return encoding, body.decode(encoding)
             except UnicodeDecodeError:
                 continue
         return "utf-8", body.decode("utf-8", errors="replace")
-

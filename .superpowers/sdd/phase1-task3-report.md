@@ -25,9 +25,17 @@
 
 ## Verification
 
-- Focused: `python -m pytest tests/acquisition/test_http.py -q` — 19 passed.
-- Full: `python -m pytest -q` — 154 passed.
+- Focused: `python -m pytest tests/acquisition/test_http.py -q` — 24 passed.
+- Full: `python -m pytest -q` — 159 passed.
 - Ruff: `python -m ruff check novel_crawler tests` — passed.
 - Mypy: `python -m mypy novel_crawler` — passed, 35 source files checked.
 - Build: `python -m build --no-isolation` — sdist and wheel built successfully.
 - Whitespace: `git diff --check` — passed (only Git's Windows line-ending notices).
+
+## Review follow-up
+
+- Added ordered fallback across every policy-approved address while sharing a monotonic total timeout budget. A regression proves an IPv6 connection failure falls through to the approved IPv4 address without another resolver call.
+- Charset-normalizer's best result is now honored and its normalized codec label recorded. Header charset remains first priority; real Big5 and GB18030 samples verify detection and decoding.
+- `PageSnapshot` now retains immutable original `body` bytes. Legacy `fetch_bytes` returns those exact bytes (including non-roundtrippable/BOM data), while `fetch_text` returns decoded HTML.
+- Acquisition errors suppress raw transport and safety exception chains, preventing query secrets in exception causes/messages.
+- Declared urllib3 as a direct dependency. Constructor-level tests prove HTTP/HTTPS pools receive only the approved IP as the connection host, while HTTPS receives the original hostname for SNI and certificate checks; IPv6 Host formatting is also covered.

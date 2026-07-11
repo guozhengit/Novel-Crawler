@@ -63,7 +63,7 @@ class Fetcher:
     def fetch_bytes(self, url: str, referer: str | None = None) -> bytes:
         if self.acquirer is not None:
             snapshot = self.acquirer.fetch(url)
-            return snapshot.html.encode(snapshot.encoding)
+            return snapshot.body
         last_error: Exception | None = None
         for attempt in range(self.options.retries):
             proxy = self._select_proxy()
