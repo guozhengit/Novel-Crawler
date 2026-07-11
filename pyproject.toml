@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=75", "wheel>=0.44"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "novel-crawler"
+version = "0.1.0"
+description = "可解释、可恢复的多站点小说抓取工具"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+authors = [{ name = "Novel Crawler contributors" }]
+dependencies = [
+  "requests>=2.31,<3",
+  "beautifulsoup4>=4.12,<5",
+  "lxml>=5,<7",
+  "charset-normalizer>=3,<4",
+  "fonttools>=4,<5",
+  "pillow>=10,<13",
+  "numpy>=1.26,<3",
+  "PyYAML>=6,<7",
+  "ebooklib>=0.18,<1",
+  "playwright>=1.40,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "mypy>=1.11,<2",
+  "pytest>=8,<10",
+  "pytest-cov>=5,<8",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+novel-crawler = "novel_crawler.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["novel_crawler*"]
+
+[tool.setuptools.package-data]
+novel_crawler = ["configs/*.json", "configs/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.coverage.run]
+branch = true
+source = ["novel_crawler"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 80
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+no_implicit_optional = true
+warn_unused_ignores = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = [
+  "novel_crawler.cli",
+  "novel_crawler.runtime.*",
+]
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+  "novel_crawler.core.*",
+  "novel_crawler.sites.*",
+  "novel_crawler.decoders.*",
+  "novel_crawler.exporters.*",
+  "novel_crawler.web.*",
+]
+ignore_errors = true

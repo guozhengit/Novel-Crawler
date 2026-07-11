@@ -1,0 +1,28 @@
+{
+  "site": "example",
+  "domain": ["example.com"],
+  "book": {
+    "title_selector": "h1",
+    "author_selector": ".author",
+    "chapter_list_selector": ".chapter-list a"
+  },
+  "chapter": {
+    "title_selector": "h1",
+    "content_selector": ".content",
+    "paragraph_selector": "p"
+  },
+  "clean": {
+    "remove_selectors": ["script", "style", ".ad", ".ads"],
+    "remove_text_contains": ["请收藏本站", "最新网址", "手機閱讀"]
+  },
+  "request": {
+    "delay_min": 2,
+    "delay_max": 6,
+    "long_pause_min": 8,
+    "long_pause_max": 20,
+    "long_pause_every_min": 15,
+    "long_pause_every_max": 25,
+    "retries": 4,
+    "timeout": 25
+  }
+}

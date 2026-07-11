@@ -1,0 +1,31 @@
+name: Build distributions
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install build pytest
+      - run: python -m build
+      - run: python -m pytest tests/test_distribution.py -v
+      - run: python -m venv /tmp/release-venv
+      - run: /tmp/release-venv/bin/python -m pip install dist/*.whl
+      - run: /tmp/release-venv/bin/novel-crawler --help
+      - run: docker build -t novel-crawler .
+      - name: Smoke test Docker image
+        run: |
+          output="$(docker run --rm novel-crawler env)"
+          echo "$output"
+          grep -F "Runtime:" <<< "$output"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/*

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+data/
+*.txt
+!requirements.txt
+*.db
+*.sqlite
+*.epub
+*.woff2
+*.ttf
+.git/

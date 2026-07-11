@@ -1,0 +1,21 @@
+site: example_yaml
+domain:
+  - example.org
+book:
+  title_selector: h1
+  author_selector: .author
+  chapter_list_selector: .chapter-list a
+chapter:
+  title_selector: h1
+  content_selector: .content
+  paragraph_selector: p
+clean:
+  remove_selectors:
+    - script
+    - style
+    - .ad
+    - .ads
+  remove_text_contains:
+    - 请收藏本站
+    - 最新网址
+    - 手機閱讀
