@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 import threading
 from collections.abc import Callable, Iterator, Mapping
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 
 from novel_crawler.application.errors import ApplicationError
 from novel_crawler.application.models import CrawlOptions, InteractionView, TaskEventView, TaskView
+from novel_crawler.core.domains import canonical_domain
 from novel_crawler.task_engine import (
     ExecutorClosed,
     ExecutorQueueFull,
@@ -690,8 +692,11 @@ def _safe_timestamp(value: object) -> str | None:
 def _safe_origin(value: object) -> str | None:
     if not isinstance(value, str) or not value or len(value) > 300 or not value.isascii():
         return None
-    if re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value, re.I):
-        return value.lower()
+    if "://" not in value:
+        try:
+            return canonical_domain(value) if canonical_domain(value) == value.lower().rstrip(".") else None
+        except (TypeError, ValueError):
+            return None
     try:
         parsed = urlsplit(value)
         host = parsed.hostname
@@ -708,10 +713,18 @@ def _safe_origin(value: object) -> str | None:
         or parsed.fragment
     ):
         return None
-    if not re.fullmatch(r"[A-Za-z0-9.:-]+", host):
+    try:
+        address = ipaddress.ip_address(host)
+        display_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    except ValueError:
+        try:
+            display_host = canonical_domain(host)
+        except (TypeError, ValueError):
+            return None
+    if display_host.lower() != (f"[{host.lower()}]" if ":" in host else host.lower().rstrip(".")):
         return None
     default_port = 443 if parsed.scheme == "https" else 80
-    authority = host.lower() if port in {None, default_port} else f"{host.lower()}:{port}"
+    authority = display_host if port in {None, default_port} else f"{display_host}:{port}"
     return f"{parsed.scheme}://{authority}/"
 
 

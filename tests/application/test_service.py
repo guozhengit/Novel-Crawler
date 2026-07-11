@@ -899,6 +899,34 @@ def test_interaction_view_exposes_only_valid_safe_origin(tmp_path: Path) -> None
     service.close()
 
 
+@pytest.mark.parametrize(
+    "unsafe_origin",
+    [
+        "https://user:secret@evil.test/",
+        "https://evil.test/private?token=x",
+        "https://evil..test/",
+        "https://evil.test/#secret",
+        "https://例子.测试/",
+    ],
+)
+def test_interaction_view_rejects_malicious_or_noncanonical_origin(
+    tmp_path: Path, unsafe_origin: str
+) -> None:
+    class UnsafeSummary(FakeSummary):
+        def to_safe_dict(self):
+            return {**super().to_safe_dict(), "safe_origin": unsafe_origin}
+
+    class UnsafeController(FakeController):
+        def interaction(self, task_id: str):
+            return UnsafeSummary()
+
+    repo = TaskRepository(tmp_path / f"unsafe-origin-{len(unsafe_origin)}.db")
+    task = repo.create_task("https://example.com")
+    service = ApplicationService(repo, FakeExecutor(repo), controller=UnsafeController())
+    assert service.get_task(task.task_id).interaction.safe_origin is None  # type: ignore[union-attr]
+    service.close()
+
+
 def test_interaction_view_accepts_only_timezone_aware_iso_expiration(tmp_path: Path) -> None:
     class TimestampSummary(FakeSummary):
         def to_safe_dict(self):
