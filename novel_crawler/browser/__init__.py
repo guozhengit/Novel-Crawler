@@ -1,5 +1,6 @@
 """Persistent, domain-isolated browser sessions."""
 
+from .adaptive import AdaptiveBrowserService, AdaptiveResult
 from .coordinator import BrowserAcquirer, BrowserCleanupRequired, VerificationCoordinator, VerificationRequired
 from .driver import (
     BrowserContextWorker,
@@ -25,6 +26,8 @@ from .sessions import (
 )
 
 __all__ = [
+    "AdaptiveBrowserService",
+    "AdaptiveResult",
     "BrowserAcquirer",
     "BrowserCleanupRequired",
     "BrowserContextWorker",

@@ -18,6 +18,7 @@ from novel_crawler.adaptation.revalidation import ConfigRevalidator, Revalidatio
 from novel_crawler.adaptation.service import ProbeService
 from novel_crawler.adaptation.url_paths import canonical_path
 from novel_crawler.adaptation.validation import ConfigDraft, ValidationResult
+from novel_crawler.browser.coordinator import VerificationRequired
 from tests.adaptation.test_service import FakeAcquirer
 
 
@@ -626,3 +627,13 @@ def test_revoked_never_reused_and_registry_corruption_is_isolated(tmp_path: Path
     isolated = ConfigManager(BrokenRegistry(), Revalidator(RevalidationStatus.VALID), probe).resolve("https://example.test/book/1")  # type: ignore[arg-type]
     assert isolated.kind is ResolutionKind.TRANSIENT_FAILURE
     assert "private corrupt payload" not in isolated.to_json()
+def test_verification_required_is_not_hidden_by_manager() -> None:
+    class RaisingRegistry:
+        root = None
+
+        def lookup(self, url: str) -> None:
+            raise VerificationRequired(original_url=url, safe_origin="https://example.test")
+
+    manager = ConfigManager(RaisingRegistry(), object(), object())  # type: ignore[arg-type]
+    with pytest.raises(VerificationRequired):
+        manager.resolve("https://example.test/private")

@@ -112,6 +112,42 @@ def test_browser_acquirer_falls_back_headless_for_unknown_and_uses_persistent_pr
         assert launch[1] == lease.profile_path
 
 
+def test_verified_profile_is_used_for_only_three_challenge_pages(tmp_path: Path) -> None:
+    chapter = browser_snapshot("<title>Chapter</title><article id='content'>body</article>")
+    driver = FakeDriver([FakeContext([chapter], []) for _ in range(3)])
+    acquirer = BrowserAcquirer(
+        http=FakeHttp("<title>Login</title><form><input type='password'></form>"),
+        driver=driver,
+        sessions=BrowserSessionStore(tmp_path),
+        safety_policy=PUBLIC_POLICY,
+    )
+    url = "https://example.test/private?q=secret"
+    acquirer.activate_persistent_profile(url, task_key="download", pages=3)
+
+    assert [acquirer.fetch_page(url, task_key="download", max_body_bytes=1024, locked_origin="https://example.test").snapshot.method for _ in range(3)] == ["browser"] * 3
+    with pytest.raises(VerificationRequired):
+        acquirer.fetch_page(url, task_key="download", locked_origin="https://example.test")
+    assert len(driver.calls) == 3
+    assert len({call[1] for call in driver.calls}) == 1
+    assert acquirer.http.options[0]["locked_origin"] == "https://example.test"
+
+
+def test_verified_profile_grant_cannot_be_consumed_by_another_task(tmp_path: Path) -> None:
+    chapter = browser_snapshot("<title>Chapter</title><article id='content'>body</article>")
+    driver = FakeDriver([FakeContext([chapter], [])])
+    acquirer = BrowserAcquirer(
+        http=FakeHttp("<title>Login</title><form><input type='password'></form>"),
+        driver=driver,
+        sessions=BrowserSessionStore(tmp_path),
+        safety_policy=PUBLIC_POLICY,
+    )
+    url = "https://example.test/private"
+    acquirer.activate_persistent_profile(url, task_key="download", pages=1)
+    with pytest.raises(VerificationRequired):
+        acquirer.fetch_page(url, task_key="preview")
+    assert acquirer.fetch_page(url, task_key="download").snapshot.method == "browser"
+
+
 def test_auth_is_never_auto_bypassed_and_visible_begin_returns_safe_ticket(tmp_path: Path) -> None:
     visible = FakeContext([browser_snapshot("<title>Login</title><form><input type='password'></form>")], [])
     driver = FakeDriver([visible])

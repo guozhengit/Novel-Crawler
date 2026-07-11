@@ -10,6 +10,7 @@ import re
 import secrets
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -20,6 +21,7 @@ from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.acquisition.security import UrlSafetyPolicy, redact_url
 from novel_crawler.core.domains import canonical_domain
+from novel_crawler.verification import VerificationRequired
 
 from .driver import BrowserContextWorker, BrowserRequestPolicy, DefaultPlaywrightDriver, Driver
 from .models import VerificationOutcome, VerificationStatus, VerificationTicket
@@ -32,17 +34,6 @@ _REPAIR_LIMIT = 1024
 
 class HttpAcquirer(Protocol):
     def fetch_page(self, url: str, **kwargs: object) -> AcquiredPage: ...
-
-
-class VerificationRequired(RuntimeError):
-    """Safe, actionable signal that a human browser step is required."""
-
-    def __init__(self, code: str = "verification_required", ticket: VerificationTicket | None = None) -> None:
-        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
-            raise ValueError("verification error code is invalid")
-        self.code = code
-        self.ticket = ticket
-        super().__init__(code)
 
 
 class BrowserCleanupRequired(AcquisitionError):
@@ -594,17 +585,42 @@ class BrowserAcquirer:
         self._cleanup_guard = threading.Lock()
         self._failed_cleanups: dict[str, _FailedHeadlessCleanup] = {}
         self._cleanup_reserved = 0
+        self._profile_grants: dict[str, int] = {}
+        self._resolution_local = threading.local()
 
-    def fetch_page(self, url: str, *, task_key: str = "browser-acquisition") -> AcquiredPage:
-        page = self.http.fetch_page(
-            url,
-            max_body_bytes=self.max_body_bytes,
-            classifiable_statuses=frozenset({401, 403, 429, 503}),
-        )
+    def fetch_page(
+        self,
+        url: str,
+        *,
+        task_key: str | None = None,
+        max_body_bytes: int | None = None,
+        locked_origin: str | None = None,
+    ) -> AcquiredPage:
+        limit = self.max_body_bytes if max_body_bytes is None else min(self.max_body_bytes, max_body_bytes)
+        if limit <= 0:
+            raise AcquisitionError("response_too_large", redact_url(url), False)
+        if locked_origin is not None and redact_url(url).rstrip("/") != locked_origin.rstrip("/"):
+            raise AcquisitionError("cross_origin", redact_url(url), False)
+        scoped_task_key = getattr(self._resolution_local, "task_key", None)
+        effective_task_key = task_key or (scoped_task_key if isinstance(scoped_task_key, str) else "browser-acquisition")
+        if locked_origin is not None:
+            page = self.http.fetch_page(
+                url,
+                max_body_bytes=limit,
+                locked_origin=locked_origin,
+                classifiable_statuses=frozenset({401, 403, 429, 503}),
+            )
+        else:
+            page = self.http.fetch_page(
+                url,
+                max_body_bytes=limit,
+                classifiable_statuses=frozenset({401, 403, 429, 503}),
+            )
         kind = self.classifier.classify(page.snapshot).kind
-        if kind is PageKind.AUTH_OR_CHALLENGE:
-            self._require_verification(url, task_key)
-        if kind is not PageKind.UNKNOWN:
+        profile_granted = self._consume_profile_grant(url, effective_task_key) if kind is PageKind.AUTH_OR_CHALLENGE else False
+        if kind is PageKind.AUTH_OR_CHALLENGE and not profile_granted:
+            self._require_verification(url, effective_task_key)
+        if kind is not PageKind.UNKNOWN and not profile_granted:
             return page
         with self._cleanup_guard:
             if len(self._failed_cleanups) + self._cleanup_reserved >= self.max_failed_cleanups:
@@ -624,13 +640,13 @@ class BrowserAcquirer:
                 ttl=self.browser_ttl,
             )
             worker.start()
-            browser_page = worker.navigate(url).to_acquired_page(max_body_bytes=self.max_body_bytes)
+            browser_page = worker.navigate(url).to_acquired_page(max_body_bytes=limit)
             if self.classifier.classify(browser_page.snapshot).kind is PageKind.AUTH_OR_CHALLENGE:
                 worker.close()
                 lease.close()
                 worker = None
                 lease = None
-                self._require_verification(url, task_key)
+                self._require_verification(url, effective_task_key)
             return browser_page
         except VerificationRequired:
             raise
@@ -665,12 +681,50 @@ class BrowserAcquirer:
             if cleanup_error is not None:
                 raise cleanup_error from None
 
-    def fetch(self, url: str, *, task_key: str = "browser-acquisition") -> PageSnapshot:
+    def fetch(self, url: str, *, task_key: str | None = None) -> PageSnapshot:
         return self.fetch_page(url, task_key=task_key).snapshot
 
     def _require_verification(self, url: str, task_key: str) -> None:
         ticket = self.coordinator.begin(url, task_key=task_key) if self.coordinator is not None else None
-        raise VerificationRequired(ticket=ticket)
+        raise VerificationRequired(ticket=ticket, original_url=url, safe_origin=redact_url(url))
+
+    def activate_persistent_profile(self, url: str, *, task_key: str, pages: int = 3) -> None:
+        """Allow a bounded number of same-origin headless reads after manual verification."""
+        if pages <= 0 or pages > 3:
+            raise ValueError("profile page allowance must be between one and three")
+        if not _TASK_KEY.fullmatch(task_key):
+            raise ValueError("profile task key is invalid")
+        origin = redact_url(url)
+        with self._cleanup_guard:
+            self._profile_grants[f"{origin}|{task_key}"] = pages
+
+    def _consume_profile_grant(self, url: str, task_key: str) -> bool:
+        key = f"{redact_url(url)}|{task_key}"
+        with self._cleanup_guard:
+            remaining = self._profile_grants.get(key, 0)
+            if remaining <= 0:
+                return False
+            if remaining == 1:
+                self._profile_grants.pop(key, None)
+            else:
+                self._profile_grants[key] = remaining - 1
+            return True
+
+    def deactivate_persistent_profile(self, url: str, *, task_key: str) -> None:
+        with self._cleanup_guard:
+            self._profile_grants.pop(f"{redact_url(url)}|{task_key}", None)
+
+    @contextmanager
+    def resolution_scope(self, task_key: str):
+        previous = getattr(self._resolution_local, "task_key", None)
+        self._resolution_local.task_key = task_key
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._resolution_local.task_key
+            else:
+                self._resolution_local.task_key = previous
 
     def retry_cleanup(self, token: str) -> bool:
         with self._cleanup_guard:

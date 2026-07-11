@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from novel_crawler.core.domains import canonical_domain
+from novel_crawler.verification import VerificationRequired
 
 from .config_schema import SafeUrlPattern, SiteConfig, validate_candidate_selectors
 from .decision import DecisionKind
@@ -38,6 +39,10 @@ class ResolutionKind(StrEnum):
     CONFIRMATION_REQUIRED = "confirmation_required"
     REJECTED = "rejected"
     TRANSIENT_FAILURE = "transient_failure"
+    WAITING_FOR_USER = "waiting_for_user"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+    VERIFICATION_FAILED = "verification_failed"
 
 
 class ConfigResolution:
@@ -150,18 +155,24 @@ class ConfigManager:
                     except ConfigConflictError:
                         continue
                 return ConfigResolution(ResolutionKind.TRANSIENT_FAILURE, reason_ids=("concurrent_revision",))
+        except VerificationRequired:
+            raise
         except Exception:
             return ConfigResolution(ResolutionKind.TRANSIENT_FAILURE, reason_ids=("registry_unavailable",))
 
     def _resolve_locked(self, url: str) -> ConfigResolution:
         try:
             entry = self.registry.lookup(url)
+        except VerificationRequired:
+            raise
         except Exception:
             return ConfigResolution(ResolutionKind.TRANSIENT_FAILURE, reason_ids=("registry_unavailable",))
         if entry is not None:
             try:
                 with self._collaborator_lock(self.revalidator):
                     checked = self.revalidator.revalidate(entry, url)
+            except VerificationRequired:
+                raise
             except Exception:
                 return ConfigResolution(ResolutionKind.TRANSIENT_FAILURE, reason_ids=("revalidation_unavailable",))
             if "concurrent_revision" in checked.reason_ids:
@@ -263,6 +274,8 @@ class ConfigManager:
         try:
             with self._collaborator_lock(self.probe):
                 result = self.probe.probe(url)
+        except VerificationRequired:
+            raise
         except Exception:
             return ConfigResolution(ResolutionKind.TRANSIENT_FAILURE, reason_ids=("probe_unavailable",))
         if result.outcome is DecisionKind.REJECT or result.config_draft is None:
