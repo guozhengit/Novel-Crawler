@@ -19,9 +19,9 @@ PAGES: dict[str, tuple[int, str, bytes]] = {
     "/book": (200, "text/html; charset=utf-8", """
         <html><head><title>星海纪元 - 章节目录</title></head><body>
         <h1>星海纪元</h1><div id='list'>
-        <a href='/chapter/1'>第一章 启程</a><a href='/chapter/2'>第二章 风暴</a>
-        <a href='/chapter/3'>第三章 星门</a><a href='/chapter/4'>第四章 归途</a>
-        </div></body></html>""".encode()),
+        <a href='/1'>第一章 启程</a><a href='/2.html'>第二章 风暴</a>
+        <a href='/read?cid=3'>第三章 星门</a><a href='/?chapter_id=4'>第四章 归途</a>
+        </div><form class='login-widget'><input type='password'></form></body></html>""".encode()),
     "/chapter/1": (200, "text/html; charset=utf-8", """
         <html><head><title>第一章 启程</title></head><body><h1>第一章 启程</h1>
         <article id='content'><p>夜色落在港口，旅人终于登上远航的飞船。</p>
@@ -32,7 +32,7 @@ PAGES: dict[str, tuple[int, str, bytes]] = {
         <div class='chapter-content'>风暴席卷甲板，船员们在呼啸声中继续前进。这是一段小说正文内容。</div>
         <a href='/chapter/1'>上一章</a></body></html>""".encode()),
     "/login": (200, "text/html; charset=utf-8", b"<title>Login</title><form><input type='password'></form>"),
-    "/challenge": (200, "text/html; charset=utf-8", b"<title>Just a moment...</title><div id='cf-challenge'>Verify you are human</div>"),
+    "/challenge": (200, "text/html; charset=utf-8", b"<title>Just a moment...</title><form action='/captcha'><input name='captcha'></form><p>Verify you are human</p>"),
     "/search": (200, "text/html; charset=utf-8", "<title>搜索结果</title><form role='search'></form><a href='/book'>星海纪元</a>".encode()),
     "/noise": (200, "text/html; charset=utf-8", """
         <title>社区动态</title><section class='comments'><h2>评论</h2>
@@ -62,7 +62,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
 
 class LocalFixtureTransport:
-    """Test-only: map a policy-approved documentation IP to the loopback fixture."""
+    """Injected integration adapter; maps an approved public IP to a local fixture only in tests."""
 
     def __init__(self, fixture_port: int) -> None:
         self.fixture_port = fixture_port
@@ -102,7 +102,7 @@ def snapshot(status: int, html: str, url: str = "https://example.test/page") -> 
 
 
 def test_classification_is_frozen_bounded_and_uses_stable_evidence_ids() -> None:
-    result = PageClassifier().classify(snapshot(200, "<title>Login</title><input type='password'>"))
+    result = PageClassifier().classify(snapshot(200, "<title>Login</title><form><input type='password'></form>"))
     assert result == Classification(PageKind.AUTH_OR_CHALLENGE, result.confidence, ("auth.password_input",))
     assert 0 <= result.confidence <= 1
     assert all("Login" not in item for item in result.evidence)
@@ -113,10 +113,49 @@ def test_classification_is_frozen_bounded_and_uses_stable_evidence_ids() -> None
 def test_error_and_auth_precede_content_signals() -> None:
     classifier = PageClassifier()
     error = classifier.classify(snapshot(503, "<article id='content'>第一章 正文</article>"))
-    auth = classifier.classify(snapshot(200, "<title>Verify human</title><article id='content'>第一章 正文</article>"))
+    auth = classifier.classify(snapshot(
+        200,
+        "<title>Verify human</title><form action='/captcha'><input name='captcha'></form><article>正文</article>",
+    ))
     assert error.kind is PageKind.ERROR
     assert error.evidence == ("error.http_status",)
     assert auth.kind is PageKind.AUTH_OR_CHALLENGE
+
+
+def test_actual_http_error_precedes_auth_but_soft_error_title_does_not() -> None:
+    html = "<title>404 Not Found - Login</title><form><input type='password'></form>"
+    classifier = PageClassifier()
+    assert classifier.classify(snapshot(404, html)).kind is PageKind.ERROR
+    result = classifier.classify(snapshot(200, html))
+    assert result.kind is PageKind.AUTH_OR_CHALLENGE
+    assert result.evidence == ("auth.password_input",)
+
+
+def test_login_widget_and_reading_challenge_class_do_not_override_content() -> None:
+    chapter = snapshot(
+        200,
+        """<title>第八章 夜航</title><article class='reading-challenge'>
+        夜色落在群山之间，主人公继续赶路。这是明确且充分的章节正文内容。
+        </article><form class='login-widget'><input type='password'></form>""",
+        "https://example.test/8.html",
+    )
+    assert PageClassifier().classify(chapter).kind is PageKind.CHAPTER
+
+
+def test_lone_challenge_class_and_unrelated_password_field_are_unknown() -> None:
+    classifier = PageClassifier()
+    assert classifier.classify(snapshot(200, "<div class='reading-challenge'>Weekly reading challenge</div>")).kind is PageKind.UNKNOWN
+    assert classifier.classify(snapshot(200, "<input type='password'>")).kind is PageKind.UNKNOWN
+
+
+def test_chinese_text_and_numeric_or_query_urls_form_book_index_cluster() -> None:
+    html = """<title>山海录</title><main>
+      <a href='/1001'>第一章 入山</a><a href='/1002.html'>第二章 问路</a>
+      <a href='/read?cid=1003'>第三章 古庙</a><a href='/?chapter_id=1004'>第四章 夜雨</a>
+    </main>"""
+    result = PageClassifier().classify(snapshot(200, html, "https://example.test/book/42"))
+    assert result.kind is PageKind.BOOK_INDEX
+    assert result.evidence == ("book_index.chapter_link_cluster",)
 
 
 def test_fixture_pages_classify_and_acquisition_handles_redirect_and_gbk() -> None:
