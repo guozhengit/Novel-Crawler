@@ -1,6 +1,7 @@
 import random
 import time
 from dataclasses import dataclass
+from typing import Protocol
 
 import requests
 
@@ -11,6 +12,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
 ]
+
+
+class PageAcquirer(Protocol):
+    def fetch(self, url: str): ...
 
 
 @dataclass
@@ -28,11 +33,19 @@ class FetchOptions:
 
 
 class Fetcher:
-    def __init__(self, proxies: dict[str, str] | None = None, options: FetchOptions | None = None, enable_playwright: bool = False, proxy_pool: ProxyPool | None = None):
+    def __init__(
+        self,
+        proxies: dict[str, str] | None = None,
+        options: FetchOptions | None = None,
+        enable_playwright: bool = False,
+        proxy_pool: ProxyPool | None = None,
+        acquirer: PageAcquirer | None = None,
+    ):
         self.proxies = proxies or {}
         self.options = options or FetchOptions()
         self.enable_playwright = enable_playwright
         self.proxy_pool = proxy_pool
+        self.acquirer = acquirer
         self.session = requests.Session()
         self._next_long_pause_at = random.randint(self.options.long_pause_every_min, self.options.long_pause_every_max)
 
@@ -48,6 +61,9 @@ class Fetcher:
         return headers
 
     def fetch_bytes(self, url: str, referer: str | None = None) -> bytes:
+        if self.acquirer is not None:
+            snapshot = self.acquirer.fetch(url)
+            return snapshot.html.encode(snapshot.encoding)
         last_error: Exception | None = None
         for attempt in range(self.options.retries):
             proxy = self._select_proxy()
@@ -74,6 +90,8 @@ class Fetcher:
         return self.proxies or None
 
     def fetch_text(self, url: str, referer: str | None = None) -> str:
+        if self.acquirer is not None:
+            return self.acquirer.fetch(url).html
         try:
             content = self.fetch_bytes(url, referer)
             text = decode_bytes(content)
