@@ -51,6 +51,7 @@ class _ActiveVerification:
     attempt: int = 0
     lifecycle: str = "pending"
     cleanup_status: VerificationStatus | None = None
+    resume_ready: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     terminal_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
@@ -439,6 +440,7 @@ class VerificationCoordinator:
                 active.cleanup_status or VerificationStatus.FAILED,
                 active.safe_origin,
                 active.attempt,
+                resume_ready=terminal.resume_ready if terminal is not None else active.resume_ready,
             )
             with self._guard:
                 self._store_terminal_locked(token, outcome)
@@ -485,6 +487,7 @@ class VerificationCoordinator:
             active.attempt,
             cleanup_required=True,
             cleanup_ticket=active.token,
+            resume_ready=active.resume_ready,
         )
 
     def _terminal_outcome(self, token: str) -> VerificationOutcome | None:
@@ -497,7 +500,15 @@ class VerificationCoordinator:
 
     def _store_terminal_locked(self, token: str, outcome: VerificationOutcome) -> None:
         self._purge_terminal_locked()
-        self._terminal[token] = (self.clock() + self._terminal_ttl, outcome)
+        tombstone = VerificationOutcome(
+            outcome.status,
+            outcome.safe_origin,
+            outcome.attempt,
+            cleanup_required=outcome.cleanup_required,
+            cleanup_ticket=outcome.cleanup_ticket,
+            resume_ready=outcome.resume_ready or outcome.page is not None,
+        )
+        self._terminal[token] = (self.clock() + self._terminal_ttl, tombstone)
         while len(self._terminal) > self._max_terminal:
             self._terminal.popitem(last=False)
 
@@ -537,6 +548,7 @@ class VerificationCoordinator:
         try:
             active.worker.close()
         except Exception:
+            active.resume_ready = status is VerificationStatus.COMPLETED and page is not None
             self._quarantine(active, status)
             self._finish_ledger(
                 active.token, active.ledger_key, active.reservation_id,
@@ -545,6 +557,7 @@ class VerificationCoordinator:
             outcome = VerificationOutcome(
                 status, active.safe_origin, active.attempt, page,
                 cleanup_required=True, cleanup_ticket=active.token,
+                resume_ready=active.resume_ready,
             )
             self._store_terminal(active.token, outcome)
             active.terminal_event.set()
@@ -552,6 +565,7 @@ class VerificationCoordinator:
         try:
             active.lease.close()
         except Exception:
+            active.resume_ready = status is VerificationStatus.COMPLETED and page is not None
             self._quarantine(active, status)
             self._finish_ledger(
                 active.token, active.ledger_key, active.reservation_id,
@@ -560,12 +574,17 @@ class VerificationCoordinator:
             outcome = VerificationOutcome(
                 status, active.safe_origin, active.attempt, page,
                 cleanup_required=True, cleanup_ticket=active.token,
+                resume_ready=active.resume_ready,
             )
             self._store_terminal(active.token, outcome)
             active.terminal_event.set()
             return outcome
         outcome = VerificationOutcome(
-            status, active.safe_origin, active.attempt, page if status is VerificationStatus.COMPLETED else None
+            status,
+            active.safe_origin,
+            active.attempt,
+            page if status is VerificationStatus.COMPLETED else None,
+            resume_ready=status is VerificationStatus.COMPLETED and page is not None,
         )
         with self._guard:
             self._store_terminal_locked(active.token, outcome)

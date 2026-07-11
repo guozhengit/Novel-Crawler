@@ -240,7 +240,7 @@ class AdaptiveBrowserService:
                 return self._hold_visible_cleanup(
                     context,
                     outcome.cleanup_ticket,
-                    resume=outcome.page is not None,
+                    resume=outcome.resume_ready or outcome.page is not None,
                     terminal_kind=self._resolution_kind(outcome.status),
                 )
             if outcome.status is VerificationStatus.WAITING:

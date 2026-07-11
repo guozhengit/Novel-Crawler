@@ -39,6 +39,7 @@ class VerificationOutcome:
     page: AcquiredPage | None = field(default=None, repr=False)
     cleanup_required: bool = False
     cleanup_ticket: str | None = field(default=None, repr=False)
+    resume_ready: bool = False
 
     def __post_init__(self) -> None:
         if self.cleanup_required != (self.cleanup_ticket is not None):

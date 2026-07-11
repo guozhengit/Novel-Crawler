@@ -634,6 +634,55 @@ def test_terminal_outcome_cache_is_bounded_and_expires(tmp_path: Path) -> None:
         coordinator.continue_verification(second.token)
 
 
+def test_completed_terminal_cache_never_retains_page_body(tmp_path: Path) -> None:
+    private_body = "private chapter text" * 100_000
+    chapter = browser_snapshot(f"<title>Chapter</title><article>{private_body}</article>")
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([FakeContext([chapter, chapter, chapter], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/private", task_key="download")
+
+    first = coordinator.continue_verification(ticket.token)
+    cached = coordinator._terminal[ticket.token][1]
+    repeated = coordinator.continue_verification(ticket.token)
+
+    assert first.status is VerificationStatus.COMPLETED
+    assert first.page is not None and private_body in first.page.snapshot.html
+    assert cached.page is None and repeated.page is None
+    assert cached.resume_ready and repeated.resume_ready
+    assert private_body not in repr(cached)
+
+
+def test_completed_cleanup_tombstone_keeps_resume_signal_without_page(tmp_path: Path) -> None:
+    private_body = "sensitive body" * 100_000
+    chapter = browser_snapshot(f"<title>Chapter</title><article>{private_body}</article>")
+
+    class CloseFailsOnce(FakeContext):
+        failures = 1
+
+        def close(self) -> None:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("close failure")
+
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([CloseFailsOnce([chapter, chapter, chapter], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/private", task_key="download")
+    first = coordinator.continue_verification(ticket.token)
+    cached = coordinator._terminal[ticket.token][1]
+
+    assert first.cleanup_required and first.page is not None
+    assert cached.cleanup_required and cached.page is None and cached.resume_ready
+    cleaned = coordinator.retry_cleanup(ticket.token)
+    assert cleaned.status is VerificationStatus.COMPLETED
+    assert cleaned.page is None and cleaned.resume_ready
+
+
 def test_async_crash_terminal_is_idempotently_failed(tmp_path: Path) -> None:
     coordinator = VerificationCoordinator(
         BrowserSessionStore(tmp_path),
