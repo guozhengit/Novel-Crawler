@@ -41,9 +41,9 @@ _CREDENTIAL_LABEL = (
     r"refresh[ _-]*token|session[ _-]*(?:token|id)|auth[ _-]*token|"
     r"private[ _-]*key|secret[ _-]*key|password|passwd|cookie|token|secret)"
 )
-_CREDENTIAL_EQUALS = re.compile(rf"(?i)(?<![a-z0-9_]){_CREDENTIAL_LABEL}\s*=\s*\S+")
+_CREDENTIAL_EQUALS = re.compile(rf"(?i)(?<![a-z0-9]){_CREDENTIAL_LABEL}\s*=\s*\S+")
 _CREDENTIAL_COLON_VALUE = re.compile(
-    rf"(?i)(?<![a-z0-9_]){_CREDENTIAL_LABEL}\s*:\s*=?\s*(?P<value>[^\s,;]+)"
+    rf"(?i)(?<![a-z0-9_])(?P<label>{_CREDENTIAL_LABEL})\s*:\s*=?\s*(?P<value>[^\s,;]+)"
 )
 _CREDENTIAL_JSON = re.compile(
     rf'''(?i)["']{_CREDENTIAL_LABEL}["']\s*:\s*["'][^"']+["']'''
@@ -53,7 +53,7 @@ _HTML_STRUCTURE = re.compile(r"(?i)<\s*(?:html|body)(?:\s|>)")
 _PROFILE_PATH_ASSIGNMENT = re.compile(r"(?i)profile(?:_|\s+)path\s*[:=]\s*\S+")
 _STATUS_SQL = ", ".join(f"'{status.value}'" for status in TaskStatus)
 _RESUMABLE_STATUSES = frozenset({TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED})
-_DISPLAY_TEXT_KEYS = frozenset({"book_name", "book_title", "title"})
+_DISPLAY_TEXT_KEYS = frozenset({"book_name", "book_title", "name", "title"})
 _MAX_MIGRATION_EVENTS = 100_000
 
 
@@ -595,7 +595,11 @@ def _contains_sensitive_text(value: str, *, display_text: bool = False) -> bool:
         or _PROFILE_PATH_ASSIGNMENT.search(value)
     ):
         return True
-    if not display_text and _CREDENTIAL_COLON_VALUE.search(value):
+    colon_matches = _CREDENTIAL_COLON_VALUE.finditer(value)
+    if display_text:
+        if any(_looks_like_display_credential(match.group("label"), match.group("value")) for match in colon_matches):
+            return True
+    elif next(colon_matches, None) is not None:
         return True
     if not display_text:
         for match in _BEARER_VALUE.finditer(value):
@@ -611,6 +615,19 @@ def _looks_like_credential(value: str) -> bool:
         or any(character.isdigit() for character in candidate)
         or any(character in "._~+/=-" for character in candidate)
     )
+
+
+def _looks_like_display_credential(label: str, value: str) -> bool:
+    del label  # The regex already restricts this to an explicit credential label.
+    candidate = value.strip("\"'()[]{}").rstrip(".,;:")
+    lowered = candidate.casefold()
+    if lowered.startswith(("sk-", "pk-", "ghp_")):
+        return True
+    if any(character.isdigit() for character in candidate):
+        return True
+    if candidate == lowered and candidate.isalpha():
+        return True
+    return len(candidate) >= 16 and not candidate.istitle()
 
 
 def _validated_resume_origin(

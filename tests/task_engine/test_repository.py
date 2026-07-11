@@ -685,6 +685,25 @@ def test_allows_normal_book_text_that_contains_credential_words(
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("book_title", "access_token: abc123"),
+        ("title", "API Key: sk-live-example"),
+        ("name", "browser token: aB3dE5"),
+        ("book_title", "api key: private"),
+        ("title", "ACCESS-TOKEN: opaque"),
+        ("name", "api key: aBcdEfghIjkl1234"),
+    ],
+)
+def test_display_fields_still_reject_high_confidence_colon_credentials(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        with pytest.raises(TaskInputError, match="metadata"):
+            repository.create_task("https://example.test/book", metadata={field: value})
+
+
+@pytest.mark.parametrize(
     "credential",
     [
         "BROWSER_TOKEN=abc123",
@@ -733,6 +752,32 @@ def test_rejects_structured_credential_keys(tmp_path: Path, key: str) -> None:
     with TaskRepository(tmp_path / "tasks.db") as repository:
         with pytest.raises(TaskInputError, match="metadata"):
             repository.create_task("https://example.test/book", metadata={key: "value"})
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "OPENAI_API_KEY=sk-live-example",
+        "MY_ACCESS_TOKEN=abc123",
+        "CRAWLER_BROWSER_TOKEN=private",
+        "vendor_Refresh_Token=opaque",
+        "PREFIX_SESSION_ID=session-private",
+    ],
+)
+def test_rejects_prefixed_environment_credential_assignments(
+    tmp_path: Path, assignment: str
+) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        with pytest.raises(TaskInputError, match="metadata"):
+            repository.create_task("https://example.test/book", metadata={"note": assignment})
+        task = repository.create_task("https://example.test/book")
+        with pytest.raises(TaskInputError, match="metadata"):
+            repository.transition(
+                task.task_id,
+                TaskStatus.PROBING,
+                expected_version=0,
+                metadata={"note": assignment},
+            )
 
 
 def test_rejects_sensitive_error_details_and_boolean_version(tmp_path: Path) -> None:
