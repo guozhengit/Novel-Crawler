@@ -34,7 +34,7 @@ def item(field: FieldKind, selector: str, *, metadata: dict[str, str | int | flo
 
 def test_context_requires_real_snapshot_and_results_do_not_retain_derived_content() -> None:
     page = snapshot("<h1>Private Book Title</h1>")
-    context = ScoringContext(PageKind.BOOK_INDEX, page, "sample-1")
+    context = ScoringContext(PageKind.BOOK_INDEX, page)
     scored = CandidateScorer().score(item(FieldKind.TITLE, "h1"), context)
     assert scored.score > 0 and scored.confidence == scored.score
     assert "Private Book Title" not in repr(scored)
@@ -48,13 +48,13 @@ def test_context_requires_real_snapshot_and_results_do_not_retain_derived_conten
         asdict(context)  # type: ignore[arg-type]
     assert scored.calibration_id == "heuristic-v1"
     with pytest.raises(TypeError):
-        ScoringContext(PageKind.CHAPTER, {}, "sample-1")  # type: ignore[arg-type]
+        ScoringContext(PageKind.CHAPTER, {})  # type: ignore[arg-type]
     with pytest.raises(FrozenInstanceError):
         scored.score = 0.1  # type: ignore[misc]
 
 
 def test_metadata_and_raw_score_cannot_spoof_quality() -> None:
-    context = ScoringContext(PageKind.CHAPTER, snapshot("<div id='x'>tiny</div>"), "sample-1")
+    context = ScoringContext(PageKind.CHAPTER, snapshot("<div id='x'>tiny</div>"))
     honest = item(FieldKind.CONTENT, "#x", raw=-100, metadata={})
     spoofed = item(FieldKind.CONTENT, "#x", raw=10000, metadata={"paragraph_count": 999, "noise_ratio": 0.0, "semantic_role": "content"})
     assert CandidateScorer().score(honest, context).score == CandidateScorer().score(spoofed, context).score
@@ -62,7 +62,7 @@ def test_metadata_and_raw_score_cannot_spoof_quality() -> None:
 
 @pytest.mark.parametrize("selector", ["#missing", "[", "script"])
 def test_missing_invalid_or_wrong_semantic_selector_scores_zero(selector: str) -> None:
-    context = ScoringContext(PageKind.CHAPTER, snapshot("<script>" + "private " * 100 + "</script><article>short</article>"), "sample-1")
+    context = ScoringContext(PageKind.CHAPTER, snapshot("<script>" + "private " * 100 + "</script><article>short</article>"))
     scored = CandidateScorer().score(item(FieldKind.CONTENT, selector), context)
     assert scored.score == 0 and all(component.score == 0 for component in scored.components)
     assert all(math.isfinite(component.score) for component in scored.components)
@@ -74,7 +74,7 @@ def test_extractor_to_scorer_scores_all_chapter_fields_and_comments_lose() -> No
     extra += "<section class='comments'><p>" + "discussion words " * 500 + "</p><p>more comments</p></section>"
     html = html.replace("</body>", extra + "</body>")
     page = snapshot(html)
-    context = ScoringContext(PageKind.CHAPTER, page, "sample-1")
+    context = ScoringContext(PageKind.CHAPTER, page)
     candidates = CandidateExtractor().extract(page, PageKind.CHAPTER)
     scorer = CandidateScorer()
     fields = {candidate.field for candidate in candidates}
@@ -90,7 +90,7 @@ def test_extractor_to_scorer_scores_catalog_title_author_and_mixed_list() -> Non
     html = (FIXTURES / "catalog_mixed.html").read_text(encoding="utf-8")
     html = "<h1>Example Novel</h1><p class='author'>Written by Ada Stone</p>" + html
     page = snapshot(html)
-    context = ScoringContext(PageKind.BOOK_INDEX, page, "sample-1")
+    context = ScoringContext(PageKind.BOOK_INDEX, page)
     result = CandidateExtractor().extract(page, PageKind.BOOK_INDEX)
     scorer = CandidateScorer()
     for field in (FieldKind.TITLE, FieldKind.AUTHOR, FieldKind.CHAPTER_LIST):
@@ -116,7 +116,7 @@ def test_extractor_to_scorer_scores_catalog_title_author_and_mixed_list() -> Non
     ],
 )
 def test_every_field_has_prefixed_bounded_components(field: FieldKind, html: str, selector: str, prefixes: set[str]) -> None:
-    scored = CandidateScorer().score(item(field, selector), ScoringContext(PageKind.CHAPTER, snapshot(html), "sample-1"))
+    scored = CandidateScorer().score(item(field, selector), ScoringContext(PageKind.CHAPTER, snapshot(html)))
     assert scored.components
     assert all(any(component.rule_id.startswith(prefix) for prefix in prefixes) for component in scored.components)
     assert all(math.isfinite(component.score) and 0 <= component.score <= 1 and component.weight > 0 for component in scored.components)
@@ -134,7 +134,7 @@ def test_component_weights_form_exact_normalized_mean() -> None:
             del features
             return (ScoreComponent("title.low", 0, 1), ScoreComponent("title.high", 1, 3))
 
-    scored = CandidateScorer([FixedRule()]).score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, snapshot("<h1>x</h1>"), "sample-1"))
+    scored = CandidateScorer([FixedRule()]).score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, snapshot("<h1>x</h1>")))
     assert isinstance(FixedRule(), ScoringRule)
     assert scored.score == 0.75
 
@@ -151,8 +151,8 @@ def test_component_weights_form_exact_normalized_mean() -> None:
 )
 def test_representative_signals_are_monotonic(field: FieldKind, weak: str, strong: str) -> None:
     scorer = CandidateScorer()
-    weak_score = scorer.score(item(field, weak.split("<", 2)[1].split(">", 1)[0].split()[0]), ScoringContext(PageKind.CHAPTER, snapshot(weak), "sample-1")).score
-    strong_score = scorer.score(item(field, strong.split("<", 2)[1].split(">", 1)[0].split()[0]), ScoringContext(PageKind.CHAPTER, snapshot(strong), "sample-1")).score
+    weak_score = scorer.score(item(field, weak.split("<", 2)[1].split(">", 1)[0].split()[0]), ScoringContext(PageKind.CHAPTER, snapshot(weak))).score
+    strong_score = scorer.score(item(field, strong.split("<", 2)[1].split(">", 1)[0].split()[0]), ScoringContext(PageKind.CHAPTER, snapshot(strong))).score
     assert strong_score >= weak_score
 
 
@@ -175,7 +175,7 @@ def test_rule_registry_and_malformed_outputs_fail_stably() -> None:
             CandidateScorer(bad)  # type: ignore[arg-type]
     for result in ([], (ScoreComponent("title.a", 1, 1), ScoreComponent("title.a", 0, 1)), (ScoreComponent("author.a", 1, 1),)):
         with pytest.raises(ValueError, match="components"):
-            CandidateScorer([Rule(result)]).score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, snapshot("<h1>x</h1>"), "sample-1"))  # type: ignore[list-item]
+            CandidateScorer([Rule(result)]).score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, snapshot("<h1>x</h1>")))  # type: ignore[list-item]
     with pytest.raises(ValueError):
         ScoreComponent("bad id", 1, 1)
 
@@ -188,7 +188,7 @@ def test_config_is_versioned_and_score_model_rejects_invalid_values() -> None:
     with pytest.raises(ValueError):
         ScoreComponent("title.x", float("nan"), 1)
     with pytest.raises(ValueError):
-        ScoredCandidate(item(FieldKind.TITLE, "h1"), 2, (), "heuristic-v1", "v1", "sample-1", "https://example.test")
+        ScoredCandidate(item(FieldKind.TITLE, "h1"), 2, (), "heuristic-v1", "v1", "sample-1", "https://example.test", PageKind.BOOK_INDEX)
 
 
 def test_identity_is_frozen_and_selector_is_safe() -> None:
@@ -206,7 +206,7 @@ def test_chapter_continuity_requires_adjacent_numbers() -> None:
     scorer = CandidateScorer()
 
     def continuity(html: str) -> float:
-        scored = scorer.score(item(FieldKind.CHAPTER_LIST, "nav a"), ScoringContext(PageKind.BOOK_INDEX, snapshot(html), "sample-1"))
+        scored = scorer.score(item(FieldKind.CHAPTER_LIST, "nav a"), ScoringContext(PageKind.BOOK_INDEX, snapshot(html)))
         return next(component.score for component in scored.components if component.rule_id == "chapter_list.continuity")
 
     adjacent = "<nav><a href='/1'>Chapter 1</a><a href='/2'>Chapter 2</a><a href='/3'>Chapter 3</a></nav>"
@@ -226,14 +226,29 @@ def test_remaining_validation_boundaries_are_stable() -> None:
         with pytest.raises(ValueError):
             ScoreComponent("title.boundary", score, weight)
     with pytest.raises(TypeError):
-        ScoringContext("chapter", snapshot(""), "sample-1")  # type: ignore[arg-type]
+        ScoringContext("chapter", snapshot(""))  # type: ignore[arg-type]
 
 
 def test_scoring_provenance_is_safe_and_set_only_from_context() -> None:
     page = snapshot("<h1>Book</h1>")
-    for sample_id in ("", "https://example.test", "private content"):
-        with pytest.raises(ValueError):
-            ScoringContext(PageKind.BOOK_INDEX, page, sample_id)
-    scored_value = CandidateScorer().score(item(FieldKind.TITLE, "h1"), ScoringContext(PageKind.BOOK_INDEX, page, "sample-7"))
-    assert scored_value.sample_id == "sample-7"
+    first = ScoringContext(PageKind.BOOK_INDEX, page)
+    second = ScoringContext(PageKind.BOOK_INDEX, page)
+    assert first.sample_id != second.sample_id
+    with pytest.raises(TypeError):
+        ScoringContext(PageKind.BOOK_INDEX, page, "caller-id")  # type: ignore[call-arg]
+    scored_value = CandidateScorer().score(item(FieldKind.TITLE, "h1"), first)
+    assert scored_value.sample_id == first.sample_id
     assert scored_value.origin_key == "https://reader.example"
+    assert scored_value.page_kind is PageKind.BOOK_INDEX
+
+
+def test_two_contexts_for_same_snapshot_cannot_be_mixed_in_one_batch() -> None:
+    from novel_crawler.adaptation.decision import ScoredPageBatch
+
+    page = snapshot("<h1>Book</h1>")
+    scorer = CandidateScorer()
+    first = ScoringContext(PageKind.BOOK_INDEX, page)
+    second = ScoringContext(PageKind.BOOK_INDEX, page)
+    values = (scorer.score(item(FieldKind.TITLE, "h1"), first), scorer.score(item(FieldKind.TITLE, "h1"), second))
+    with pytest.raises(ValueError, match="sample_id"):
+        ScoredPageBatch(first.sample_id, first.origin_key, PageKind.BOOK_INDEX, values)

@@ -14,7 +14,7 @@ from novel_crawler.adaptation.scoring import ScoreComponent, ScoredCandidate
 
 def scored(field: FieldKind, selector: str, score: float) -> ScoredCandidate:
     candidate = Candidate(field, selector, "count=1", 0, 0, (Evidence("extract.test", 1, "count=1"),), {})
-    return ScoredCandidate(candidate, score, (ScoreComponent("title.test", score, 1),), "heuristic-v1", "score-v1", "sample-1", "https://example.test")
+    return ScoredCandidate(candidate, score, (ScoreComponent("title.test", score, 1),), "heuristic-v1", "score-v1", "sample-1", "https://example.test", PageKind.BOOK_INDEX if field in {FieldKind.TITLE, FieldKind.CHAPTER_LIST} else PageKind.CHAPTER)
 
 
 def batch(kind: PageKind, values: list[ScoredCandidate] | tuple[ScoredCandidate, ...] = ()) -> ScoredPageBatch:
@@ -62,6 +62,7 @@ def test_missing_fields_reject_for_each_supported_page_kind() -> None:
 def test_classifier_terminal_pages_reject(page_kind: PageKind, code: DiagnosticCode) -> None:
     result = DecisionPolicy().decide(Classification(page_kind, 1, ("private.payload",)), batch(page_kind))
     assert result.kind is DecisionKind.REJECT
+    assert result.fields == ()
     assert result.diagnostic.codes == (code,)
 
 
@@ -129,6 +130,10 @@ def test_batch_validates_identity_origin_kind_and_single_page_contract() -> None
     object.__setattr__(other_origin, "origin_key", "https://other.test")
     with pytest.raises(ValueError, match="origin"):
         ScoredPageBatch("sample-1", "https://example.test", PageKind.CHAPTER, (other_origin,))
+    wrong_kind = scored(FieldKind.CONTENT, "article", 0.9)
+    object.__setattr__(wrong_kind, "page_kind", PageKind.BOOK_INDEX)
+    with pytest.raises(ValueError, match="page_kind"):
+        ScoredPageBatch("sample-1", "https://example.test", PageKind.CHAPTER, (wrong_kind,))
 
 
 def test_decision_repr_and_serialization_never_expose_selector_or_private_markup() -> None:
@@ -191,3 +196,9 @@ def test_adaptation_decision_constructor_rejects_malformed_and_copies_fields() -
     for args in bad_values:
         with pytest.raises((TypeError, ValueError)):
             AdaptationDecision(*args)  # type: ignore[arg-type]
+    terminal = Diagnostic((DiagnosticCode.AUTH_REQUIRED,))
+    assert AdaptationDecision(DecisionKind.REJECT, 0, (), "decision-v2", terminal).fields == ()
+    with pytest.raises(ValueError):
+        AdaptationDecision(DecisionKind.REJECT, 0, (), "decision-v2", Diagnostic((DiagnosticCode.LOW_CONFIDENCE,)))
+    with pytest.raises(ValueError):
+        AdaptationDecision(DecisionKind.REJECT, 0, (), "decision-v2", Diagnostic((DiagnosticCode.AUTH_REQUIRED, DiagnosticCode.LOW_CONFIDENCE)))

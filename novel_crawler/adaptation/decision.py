@@ -66,6 +66,8 @@ class ScoredPageBatch:
             raise ValueError("every candidate sample_id must match the batch sample_id")
         if any(item.origin_key != self.safe_origin for item in values):
             raise ValueError("every candidate origin must match the batch safe_origin")
+        if any(item.page_kind is not self.page_kind for item in values):
+            raise ValueError("every candidate page_kind must match the batch page_kind")
         object.__setattr__(self, "candidates", values)
 
     def __repr__(self) -> str:
@@ -116,18 +118,22 @@ class AdaptationDecision:
             raise TypeError("kind must be DecisionKind")
         if not math.isfinite(overall_score) or not 0 <= overall_score <= 1:
             raise ValueError("overall_score must be finite and bounded")
+        if not isinstance(diagnostic, Diagnostic):
+            raise TypeError("diagnostic must be Diagnostic")
         values = tuple(fields)
-        if not values or not all(isinstance(item, FieldDecision) for item in values):
-            raise TypeError("fields must be a nonempty sequence of FieldDecision")
+        terminal_codes = {DiagnosticCode.AUTH_REQUIRED, DiagnosticCode.ERROR_PAGE, DiagnosticCode.UNSUPPORTED_PAGE}
+        if not values:
+            if kind is not DecisionKind.REJECT or not diagnostic.codes or not set(diagnostic.codes) <= terminal_codes:
+                raise ValueError("empty fields are allowed only for terminal reject diagnostics")
+        elif not all(isinstance(item, FieldDecision) for item in values):
+            raise TypeError("fields must contain FieldDecision values")
         if len({item.field for item in values}) != len(values):
             raise ValueError("fields must have unique field kinds")
         expected_kind = DecisionKind.REJECT if any(item.status is DecisionKind.REJECT for item in values) else DecisionKind.REQUIRE_CONFIRMATION if any(item.status is DecisionKind.REQUIRE_CONFIRMATION for item in values) else DecisionKind.AUTO_ACCEPT
-        if kind is not expected_kind:
+        if values and kind is not expected_kind:
             raise ValueError("kind must agree with field statuses")
         if not _SAFE_ID.fullmatch(config_version):
             raise ValueError("config_version must be a stable identifier")
-        if not isinstance(diagnostic, Diagnostic):
-            raise TypeError("diagnostic must be Diagnostic")
         object.__setattr__(self, "_kind", kind)
         object.__setattr__(self, "_overall_score", overall_score)
         object.__setattr__(self, "_fields", values)
@@ -171,13 +177,11 @@ class DecisionPolicy:
         terminal = {PageKind.AUTH_OR_CHALLENGE: DiagnosticCode.AUTH_REQUIRED, PageKind.ERROR: DiagnosticCode.ERROR_PAGE, PageKind.UNKNOWN: DiagnosticCode.UNSUPPORTED_PAGE, PageKind.SEARCH_OR_LIST: DiagnosticCode.UNSUPPORTED_PAGE}
         if classification.kind in terminal:
             diagnostic = Diagnostic((terminal[classification.kind],), (), batch.safe_origin, {"candidate_count": len(values)})
-            terminal_field = FieldDecision(FieldKind.CLEAN_SELECTOR, None, 0.0, self.config.medium, DecisionKind.REJECT, (terminal[classification.kind].value,))
-            return AdaptationDecision(DecisionKind.REJECT, 0.0, (terminal_field,), self.config.version, diagnostic)
+            return AdaptationDecision(DecisionKind.REJECT, 0.0, (), self.config.version, diagnostic)
         required = _REQUIRED.get(classification.kind)
         if required is None:
             diagnostic = Diagnostic((DiagnosticCode.UNSUPPORTED_PAGE,), (), batch.safe_origin, {"candidate_count": len(values)})
-            unsupported_field = FieldDecision(FieldKind.CLEAN_SELECTOR, None, 0.0, self.config.medium, DecisionKind.REJECT, ("unsupported_page",))
-            return AdaptationDecision(DecisionKind.REJECT, 0.0, (unsupported_field,), self.config.version, diagnostic)
+            return AdaptationDecision(DecisionKind.REJECT, 0.0, (), self.config.version, diagnostic)
         fields: list[FieldDecision] = []
         codes: list[DiagnosticCode] = []
         for field in required:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol, TypeAlias, runtime_checkable
@@ -46,11 +47,11 @@ class ScoringContext:
     _sample_id: str
     _snapshot: PageSnapshot
 
-    def __init__(self, page_kind: PageKind, snapshot: PageSnapshot, sample_id: str) -> None:
+    def __init__(self, page_kind: PageKind, snapshot: PageSnapshot) -> None:
+        """Create one scoring context per snapshot and reuse it for every candidate."""
         if not isinstance(page_kind, PageKind) or not isinstance(snapshot, PageSnapshot):
             raise TypeError("ScoringContext requires PageKind and PageSnapshot")
-        if not _SAFE_ID.fullmatch(sample_id):
-            raise ValueError("sample_id must be a safe structural identifier")
+        sample_id = f"sample-{secrets.token_hex(16)}"
         object.__setattr__(self, "_page_kind", page_kind)
         object.__setattr__(self, "_snapshot", snapshot)
         object.__setattr__(self, "_sample_id", sample_id)
@@ -129,6 +130,7 @@ class ScoredCandidate:
     version: str
     sample_id: str
     origin_key: str
+    page_kind: PageKind
 
     def __post_init__(self) -> None:
         if not isinstance(self.candidate, Candidate):
@@ -144,6 +146,8 @@ class ScoredCandidate:
             raise ValueError("sample_id must be a safe structural identifier")
         if self.origin_key != "redacted" and safe_origin(self.origin_key) != self.origin_key:
             raise ValueError("origin_key must contain only a safe origin")
+        if not isinstance(self.page_kind, PageKind):
+            raise TypeError("page_kind must be PageKind")
         object.__setattr__(self, "components", values)
 
     @property
@@ -303,7 +307,7 @@ class CandidateScorer:
             raise ValueError("components must have unique field-prefixed rule IDs")
         total = sum(value.weight for value in raw)
         score = sum(value.score * value.weight for value in raw) / total
-        return ScoredCandidate(candidate, score, raw, self.config.calibration_id, self.config.version, context.sample_id, context.origin_key)
+        return ScoredCandidate(candidate, score, raw, self.config.calibration_id, self.config.version, context.sample_id, context.origin_key, context.page_kind)
 
     def rank(self, candidates: Sequence[Candidate], context: ScoringContext) -> tuple[ScoredCandidate, ...]:
         if len({candidate.field for candidate in candidates}) > 1:
