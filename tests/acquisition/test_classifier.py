@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import http.client
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from novel_crawler.acquisition.classifier import Classification, PageClassifier, PageKind
+from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer, TransportResponse
+from novel_crawler.acquisition.models import PageSnapshot
+from novel_crawler.acquisition.security import UrlSafetyPolicy
+
+PAGES: dict[str, tuple[int, str, bytes]] = {
+    "/book": (200, "text/html; charset=utf-8", """
+        <html><head><title>星海纪元 - 章节目录</title></head><body>
+        <h1>星海纪元</h1><div id='list'>
+        <a href='/chapter/1'>第一章 启程</a><a href='/chapter/2'>第二章 风暴</a>
+        <a href='/chapter/3'>第三章 星门</a><a href='/chapter/4'>第四章 归途</a>
+        </div></body></html>""".encode()),
+    "/chapter/1": (200, "text/html; charset=utf-8", """
+        <html><head><title>第一章 启程</title></head><body><h1>第一章 启程</h1>
+        <article id='content'><p>夜色落在港口，旅人终于登上远航的飞船。</p>
+        <p>这是足够长的小说正文，用来确认页面包含连续的叙事内容。</p></article>
+        <a rel='next' href='/chapter/2'>下一章</a></body></html>""".encode()),
+    "/chapter/2": (200, "text/html; charset=utf-8", """
+        <html><head><title>第二章 风暴</title></head><body><h1>第二章 风暴</h1>
+        <div class='chapter-content'>风暴席卷甲板，船员们在呼啸声中继续前进。这是一段小说正文内容。</div>
+        <a href='/chapter/1'>上一章</a></body></html>""".encode()),
+    "/login": (200, "text/html; charset=utf-8", b"<title>Login</title><form><input type='password'></form>"),
+    "/challenge": (200, "text/html; charset=utf-8", b"<title>Just a moment...</title><div id='cf-challenge'>Verify you are human</div>"),
+    "/search": (200, "text/html; charset=utf-8", "<title>搜索结果</title><form role='search'></form><a href='/book'>星海纪元</a>".encode()),
+    "/noise": (200, "text/html; charset=utf-8", """
+        <title>社区动态</title><section class='comments'><h2>评论</h2>
+        <a href='/chapter/1'>第一章真好看</a><a href='/chapter/2'>第二章也不错</a></section>
+        <aside class='recommendations'><a href='/book/a'>推荐小说一</a><a href='/book/b'>推荐小说二</a></aside>""".encode()),
+    "/error": (500, "text/html; charset=utf-8", b"<title>Novel chapter 1</title><article>content</article>"),
+    "/gbk": (200, "text/html; charset=gbk", "<title>第三章 归来</title><h1>第三章 归来</h1><div id='content'>这是采用国标编码的小说正文，主人公终于回到故乡。</div>".encode("gbk")),
+}
+
+
+class FixtureHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "chapter/1")
+            self.end_headers()
+            return
+        status, content_type, body = PAGES.get(self.path, (404, "text/plain", b"missing"))
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class LocalFixtureTransport:
+    """Test-only: map a policy-approved documentation IP to the loopback fixture."""
+
+    def __init__(self, fixture_port: int) -> None:
+        self.fixture_port = fixture_port
+
+    def request(
+        self, *, approved_ip: str, original_host: str, port: int, scheme: str, path: str,
+        headers: Mapping[str, str], timeout: float,
+    ) -> TransportResponse:
+        assert approved_ip == "93.184.216.34"
+        assert original_host == "fixture.example"
+        assert scheme == "http"
+        connection = http.client.HTTPConnection("127.0.0.1", self.fixture_port, timeout=timeout)
+        try:
+            connection.request("GET", path, headers=dict(headers))
+            response = connection.getresponse()
+            return TransportResponse(response.status, dict(response.getheaders()), response.read())
+        finally:
+            connection.close()
+
+
+@contextmanager
+def fixture_acquirer() -> Iterator[HttpPageAcquirer]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        policy = UrlSafetyPolicy(resolver=lambda host, port: ("93.184.216.34",))
+        yield HttpPageAcquirer(LocalFixtureTransport(server.server_port), policy)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def snapshot(status: int, html: str, url: str = "https://example.test/page") -> PageSnapshot:
+    return PageSnapshot(url, url, status, {}, "utf-8", html, html.encode(), "GET", (), datetime.now(UTC))
+
+
+def test_classification_is_frozen_bounded_and_uses_stable_evidence_ids() -> None:
+    result = PageClassifier().classify(snapshot(200, "<title>Login</title><input type='password'>"))
+    assert result == Classification(PageKind.AUTH_OR_CHALLENGE, result.confidence, ("auth.password_input",))
+    assert 0 <= result.confidence <= 1
+    assert all("Login" not in item for item in result.evidence)
+    with pytest.raises(FrozenInstanceError):
+        result.confidence = 0  # type: ignore[misc]
+
+
+def test_error_and_auth_precede_content_signals() -> None:
+    classifier = PageClassifier()
+    error = classifier.classify(snapshot(503, "<article id='content'>第一章 正文</article>"))
+    auth = classifier.classify(snapshot(200, "<title>Verify human</title><article id='content'>第一章 正文</article>"))
+    assert error.kind is PageKind.ERROR
+    assert error.evidence == ("error.http_status",)
+    assert auth.kind is PageKind.AUTH_OR_CHALLENGE
+
+
+def test_fixture_pages_classify_and_acquisition_handles_redirect_and_gbk() -> None:
+    expected = {
+        "/book": PageKind.BOOK_INDEX,
+        "/chapter/1": PageKind.CHAPTER,
+        "/chapter/2": PageKind.CHAPTER,
+        "/login": PageKind.AUTH_OR_CHALLENGE,
+        "/challenge": PageKind.AUTH_OR_CHALLENGE,
+        "/search": PageKind.SEARCH_OR_LIST,
+        "/noise": PageKind.UNKNOWN,
+        "/gbk": PageKind.CHAPTER,
+    }
+    classifier = PageClassifier()
+    with fixture_acquirer() as acquirer:
+        for path, kind in expected.items():
+            acquired = acquirer.fetch(f"http://fixture.example:{acquirer.transport.fixture_port}{path}")  # type: ignore[attr-defined]
+            result = classifier.classify(acquired)
+            assert result.kind is kind, (path, result)
+            assert 0 <= result.confidence <= 1
+        redirected = acquirer.fetch(f"http://fixture.example:{acquirer.transport.fixture_port}/redirect")  # type: ignore[attr-defined]
+        assert redirected.final_url.endswith("/chapter/1")
+        assert classifier.classify(redirected).kind is PageKind.CHAPTER
+        gbk = acquirer.fetch(f"http://fixture.example:{acquirer.transport.fixture_port}/gbk")  # type: ignore[attr-defined]
+        assert gbk.encoding == "gbk"
+        assert "第三章" in gbk.html
+        with pytest.raises(AcquisitionError) as caught:
+            acquirer.fetch(f"http://fixture.example:{acquirer.transport.fixture_port}/error")  # type: ignore[attr-defined]
+        assert caught.value.code == "http_500"
+
+
+def test_blank_and_unrelated_pages_are_unknown() -> None:
+    classifier = PageClassifier()
+    for html in ("", "<title>Company home</title><nav>About Products Contact</nav>"):
+        assert classifier.classify(snapshot(200, html)).kind is PageKind.UNKNOWN
