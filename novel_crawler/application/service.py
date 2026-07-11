@@ -367,7 +367,7 @@ class ApplicationService:
             _positive_id(book_id, "book_id_invalid")
             if not isinstance(export, bool):
                 raise ApplicationError("export_invalid")
-            if concurrency != 1:
+            if isinstance(concurrency, bool) or concurrency != 1:
                 raise ApplicationError("concurrency_unsupported")
             try:
                 crawler.retry_failed(book_id, export=export, concurrency=concurrency)
@@ -381,16 +381,78 @@ class ApplicationService:
             if not isinstance(fmt, str) or fmt not in _FORMATS:
                 raise ApplicationError("export_format_invalid")
             try:
-                paths = crawler.export_all(fmt)
-                return {"completed": min(len(paths), 2_147_483_647), "format": fmt}
+                books = crawler.list_books()
+                requested = min(len(books), 2_147_483_647)
+                attempted_books = books[:1000]
+                remaining = max(0, requested - len(attempted_books))
+                succeeded = 0
+                failed = 0
+                for book in attempted_books:
+                    book_id = _safe_count(book.get("id"))
+                    if book_id < 1:
+                        failed += 1
+                        continue
+                    try:
+                        crawler.export(book_id, fmt)
+                        succeeded += 1
+                    except Exception:
+                        failed += 1
+                return {
+                    "best_effort": True,
+                    "requested": requested,
+                    "attempted": len(attempted_books),
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "remaining": remaining,
+                    "format": fmt,
+                    "error_codes": [
+                        code
+                        for code, present in (
+                            ("export_failed", failed > 0),
+                            ("export_limit_reached", remaining > 0),
+                        )
+                        if present
+                    ],
+                }
             except Exception:
                 raise ApplicationError("crawler_operation_failed", retryable=True) from None
 
-    def retry_all_failed_chapters(self) -> dict[str, int]:
+    def retry_all_failed_chapters(self) -> dict[str, object]:
         with self._operation():
             crawler = self._require_crawler()
             try:
-                return {"scheduled_books": _safe_count(crawler.retry_all_failed())}
+                books = crawler.list_books()
+                targets = [
+                    _safe_count(book.get("id"))
+                    for book in books
+                    if _safe_count(book.get("failed")) > 0 and _safe_count(book.get("id")) > 0
+                ]
+                attempted_targets = targets[:1000]
+                remaining = len(targets) - len(attempted_targets)
+                succeeded = 0
+                failed = 0
+                for book_id in attempted_targets:
+                    try:
+                        crawler.retry_failed(book_id, export=False, concurrency=1)
+                        succeeded += 1
+                    except Exception:
+                        failed += 1
+                return {
+                    "best_effort": True,
+                    "requested": len(targets),
+                    "attempted": len(attempted_targets),
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "remaining": remaining,
+                    "error_codes": [
+                        code
+                        for code, present in (
+                            ("retry_failed", failed > 0),
+                            ("retry_limit_reached", remaining > 0),
+                        )
+                        if present
+                    ],
+                }
             except Exception:
                 raise ApplicationError("crawler_operation_failed", retryable=True) from None
 
@@ -453,7 +515,7 @@ class ApplicationService:
         concurrency: int = 1,
         max_chapters: int | None = None,
     ) -> dict[str, object]:
-        if concurrency != 1:
+        if isinstance(concurrency, bool) or concurrency != 1:
             raise ApplicationError("concurrency_unsupported")
         options = CrawlOptions(max_chapters=max_chapters, concurrency=concurrency, export=False)
         if not isinstance(file_path, Path):
@@ -479,8 +541,35 @@ class ApplicationService:
                 or parsed.password is not None
             ):
                 raise ApplicationError("source_url_invalid")
-        views = [self.create_crawl_task(url, options) for url in urls]
-        return {"created": len(views), "tasks": [view.to_safe_dict() for view in views]}
+        views: list[TaskView] = []
+        submitted = 0
+        failed = 0
+        attempted = 0
+        error_code: str | None = None
+        for url in urls:
+            attempted += 1
+            try:
+                view = self.create_crawl_task(url, options)
+                views.append(view)
+                submitted += 1
+            except ApplicationError as exc:
+                failed = 1
+                error_code = exc.code
+                if exc.task_id is not None:
+                    try:
+                        views.append(self.get_task(exc.task_id))
+                    except ApplicationError:
+                        pass
+                break
+        return {
+            "requested": len(urls),
+            "created": len(views),
+            "submitted": submitted,
+            "failed": failed,
+            "not_started": max(0, len(urls) - attempted),
+            "error_code": error_code,
+            "tasks": [view.to_safe_dict() for view in views],
+        }
 
     def _bounded_result(
         self,
@@ -693,10 +782,8 @@ def _safe_origin(value: object) -> str | None:
     if not isinstance(value, str) or not value or len(value) > 300 or not value.isascii():
         return None
     if "://" not in value:
-        try:
-            return canonical_domain(value) if canonical_domain(value) == value.lower().rstrip(".") else None
-        except (TypeError, ValueError):
-            return None
+        display = _canonical_ascii_host(value)
+        return display.strip("[]") if display is not None else None
     try:
         parsed = urlsplit(value)
         host = parsed.hostname
@@ -711,21 +798,36 @@ def _safe_origin(value: object) -> str | None:
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
+        or port is not None and not 1 <= port <= 65_535
     ):
         return None
-    try:
-        address = ipaddress.ip_address(host)
-        display_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
-    except ValueError:
-        try:
-            display_host = canonical_domain(host)
-        except (TypeError, ValueError):
-            return None
-    if display_host.lower() != (f"[{host.lower()}]" if ":" in host else host.lower().rstrip(".")):
+    display_host = _canonical_ascii_host(host)
+    if display_host is None:
         return None
     default_port = 443 if parsed.scheme == "https" else 80
     authority = display_host if port in {None, default_port} else f"{display_host}:{port}"
     return f"{parsed.scheme}://{authority}/"
+
+
+def _canonical_ascii_host(host: str) -> str | None:
+    if not host or not host.isascii() or "%" in host or host.endswith("."):
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # Numeric-only names and non-canonical dotted numbers are interpreted
+        # differently by legacy URL stacks; never present them as DNS names.
+        if host.isdigit() or re.fullmatch(r"[0-9.]+", host):
+            return None
+        try:
+            canonical = canonical_domain(host)
+        except (TypeError, ValueError):
+            return None
+        return canonical if canonical == host.lower().rstrip(".") else None
+    canonical_ip = address.compressed.lower()
+    if canonical_ip != host.lower():
+        return None
+    return f"[{canonical_ip}]" if address.version == 6 else canonical_ip
 
 
 def _safe_text(value: object, *, maximum: int = 256) -> str:

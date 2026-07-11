@@ -408,9 +408,51 @@ def test_parser_rejects_non_numeric_and_out_of_range_wait_values(capsys) -> None
 
 def test_web_dispatch_and_decode_font_paths_are_safe(tmp_path, capsys, monkeypatch) -> None:
     web_calls = []
-    monkeypatch.setattr("novel_crawler.web.run_web_ui", lambda ctx, host, port: web_calls.append((host, port)))
-    assert main(["web", "--port", "9000"], project_dir=tmp_path) == 0
-    assert web_calls == [("127.0.0.1", 9000)]
+    app = FakeApplication()
+    monkeypatch.setattr(
+        "novel_crawler.web.run_web_ui",
+        lambda ctx, host, port, **kwargs: web_calls.append((host, port, kwargs)),
+    )
+    assert main(
+        ["web", "--port", "9000"],
+        project_dir=tmp_path,
+        application_factory=app_factory(app),
+    ) == 0
+    assert web_calls == [(
+        "127.0.0.1",
+        9000,
+        {"application": app, "close_application": False, "unsafe_remote": False},
+    )]
+    assert app.closed
+
+    web_calls.clear()
+    app = FakeApplication()
+    assert main(
+        ["web", "--host", "0.0.0.0"],
+        project_dir=tmp_path,
+        application_factory=app_factory(app),
+    ) == 2
+    assert "remote_bind_forbidden" in capsys.readouterr().err
+    assert web_calls == []
+    assert app.closed
+
+    app = FakeApplication()
+    assert main(
+        ["web", "--host", "0.0.0.0", "--unsafe-remote"],
+        project_dir=tmp_path,
+        application_factory=app_factory(app),
+    ) == 0
+    assert web_calls[-1][2]["unsafe_remote"] is True
+    assert app.closed
+
+    def fail_web(*_args, **_kwargs):
+        raise RuntimeError("https://private.test token=secret")
+
+    app = FakeApplication()
+    monkeypatch.setattr("novel_crawler.web.run_web_ui", fail_web)
+    assert main(["web"], project_dir=tmp_path, application_factory=app_factory(app)) == 3
+    assert "private" not in capsys.readouterr().err
+    assert app.closed
 
     empty_ctx = SimpleNamespace(chinese_fonts=[])
     monkeypatch.setattr("novel_crawler.cli.create_runtime_context", lambda *_args: empty_ctx)
@@ -483,6 +525,70 @@ def test_retryable_application_error_uses_stable_exit_code(tmp_path, capsys) -> 
     error = capsys.readouterr().err
     assert "task_queue_full" in error
     assert "队列已满" in error
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"task_id": "task-safe", "status": "paused", "terminal": False},
+        {"task_id": "task-safe", "status": "recoverable_failed", "terminal": False},
+        {"task_id": "task-safe", "status": "crawling", "terminal": False, "cleanup_required": True},
+    ],
+)
+def test_wait_returns_immediately_for_non_progressing_task_states(tmp_path, capsys, payload) -> None:
+    app = FakeApplication(iter([SafeView(payload)]))
+    assert main(
+        ["crawl", "https://example.test", "--wait", "--timeout", "10"],
+        project_dir=tmp_path,
+        application_factory=app_factory(app),
+    ) == 13
+    assert output_json(capsys) == payload
+    assert len([call for call in app.calls if call[0] == "get"]) == 1
+
+
+def test_batch_partial_success_is_visible_and_nonzero(tmp_path, capsys) -> None:
+    class PartialBatchApplication(FakeApplication):
+        def create_crawl_tasks_from_file(self, path, concurrency, max_chapters):
+            self.calls.append(("crawl-batch", path, concurrency, max_chapters))
+            return {
+                "requested": 3,
+                "created": 2,
+                "submitted": 1,
+                "failed": 1,
+                "not_started": 1,
+                "error_code": "task_queue_full",
+                "tasks": [{"task_id": "safe-one", "status": "created"}, {"task_id": "safe-two", "status": "paused"}],
+            }
+
+    app = PartialBatchApplication()
+    assert main(
+        ["crawl-batch", "urls.txt"],
+        project_dir=tmp_path,
+        application_factory=app_factory(app),
+    ) == 6
+    payload = output_json(capsys)
+    assert payload["failed"] == 1
+    assert [task["task_id"] for task in payload["tasks"]] == ["safe-one", "safe-two"]
+    assert "url" not in json.dumps(payload).lower()
+
+
+@pytest.mark.parametrize(("command", "operation"), [(["export-all"], "export-all"), (["retry-all"], "retry-all")])
+def test_best_effort_bulk_failure_is_visible_and_nonzero(tmp_path, capsys, command, operation) -> None:
+    class PartialApplication(FakeApplication):
+        def _book(self, name: str, *values: object):
+            self.calls.append((name, *values))
+            return {
+                "best_effort": True,
+                "requested": 2,
+                "succeeded": 1,
+                "failed": 1,
+                "error_codes": ["operation_failed"],
+            }
+
+    app = PartialApplication()
+    assert main(command, project_dir=tmp_path, application_factory=app_factory(app)) == 6
+    assert output_json(capsys)["failed"] == 1
+    assert app.calls[0][0] == operation
 
 
 def test_real_composition_smoke_for_tasks(tmp_path, capsys) -> None:

@@ -227,8 +227,25 @@ def test_admin_book_facade_allowlists_and_redacts_legacy_results(app) -> None:
     }
     assert service.book_logs(4, 10)[0]["message"] == "[redacted]"
     assert service.retry_failed_chapters(4, False, 1) == {"completed": True}
-    assert service.export_all_books("txt") == {"completed": 1, "format": "txt"}
-    assert service.retry_all_failed_chapters() == {"scheduled_books": 2}
+    assert service.export_all_books("txt") == {
+        "best_effort": True,
+        "requested": 1,
+        "attempted": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "remaining": 0,
+        "format": "txt",
+        "error_codes": [],
+    }
+    assert service.retry_all_failed_chapters() == {
+        "best_effort": True,
+        "requested": 0,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "remaining": 0,
+        "error_codes": [],
+    }
     assert service.preview_book_chapter(4, 1, 100) == "safe preview\n[redacted]"
     assert service.book_stats() == {
         "books": 2,
@@ -256,6 +273,11 @@ def test_batch_facade_reads_bounded_url_file_and_returns_only_safe_task_views(ap
     result = service.create_crawl_tasks_from_file(source, concurrency=1, max_chapters=9)
 
     assert result["created"] == 2
+    assert result["requested"] == 2
+    assert result["submitted"] == 2
+    assert result["failed"] == 0
+    assert result["not_started"] == 0
+    assert result["error_code"] is None
     assert len(result["tasks"]) == 2
     assert all(set(item) <= set(TaskView.__dataclass_fields__) for item in result["tasks"])
     assert len(executor.submitted) == 2
@@ -263,7 +285,130 @@ def test_batch_facade_reads_bounded_url_file_and_returns_only_safe_task_views(ap
 
     with pytest.raises(ApplicationError, match="concurrency_unsupported"):
         service.create_crawl_tasks_from_file(source, concurrency=2)
+    with pytest.raises(ApplicationError, match="concurrency_unsupported"):
+        service.create_crawl_tasks_from_file(source, concurrency=True)
     assert len(executor.submitted) == 2
+
+
+def test_batch_facade_returns_safe_partial_result_when_queue_fills(tmp_path: Path) -> None:
+    class SecondSubmissionFull(FakeExecutor):
+        def submit(self, task_id: str) -> bool:
+            if self.submitted:
+                raise ExecutorQueueFull("private url=https://secret.test token=x")
+            return super().submit(task_id)
+
+    repo = TaskRepository(tmp_path / "partial-batch.db")
+    executor = SecondSubmissionFull(repo)
+    service = ApplicationService(repo, executor)
+    source = tmp_path / "urls.txt"
+    source.write_text(
+        "https://one.test/book\nhttps://two.test/book\nhttps://three.test/book\n",
+        encoding="utf-8",
+    )
+
+    result = service.create_crawl_tasks_from_file(source)
+
+    assert result["requested"] == 3
+    assert result["created"] == 2
+    assert result["submitted"] == 1
+    assert result["failed"] == 1
+    assert result["not_started"] == 1
+    assert result["error_code"] == "task_queue_full"
+    assert len(result["tasks"]) == 2
+    assert all("source_url" not in task for task in result["tasks"])
+    assert "secret.test" not in repr(result)
+    service.close()
+
+
+def test_batch_facade_counts_unstarted_inputs_when_failure_has_no_task_id(tmp_path: Path) -> None:
+    class NoIdFailureService(ApplicationService):
+        attempts = 0
+
+        def create_crawl_task(self, url, options=None):
+            self.attempts += 1
+            if self.attempts == 2:
+                raise ApplicationError("task_create_failed", retryable=True)
+            return super().create_crawl_task(url, options)
+
+    repo = TaskRepository(tmp_path / "batch-no-id.db")
+    executor = FakeExecutor(repo)
+    service = NoIdFailureService(repo, executor)
+    source = tmp_path / "urls.txt"
+    source.write_text(
+        "https://one.test/book\nhttps://two.test/book\nhttps://three.test/book\n",
+        encoding="utf-8",
+    )
+
+    result = service.create_crawl_tasks_from_file(source)
+
+    assert result["requested"] == 3
+    assert result["submitted"] == 1
+    assert result["failed"] == 1
+    assert result["not_started"] == 1
+    assert result["created"] == 1
+    service.close()
+
+
+def test_best_effort_bulk_book_operations_report_partial_failures(tmp_path: Path) -> None:
+    class PartialCrawler(FakeCrawler):
+        def list_books(self):
+            return [
+                {"id": 1, "title": "one", "failed": 1},
+                {"id": 2, "title": "two", "failed": 2},
+            ]
+
+        def export(self, book_id: int, fmt: str):
+            if book_id == 2:
+                raise RuntimeError("C:\\private\\two.txt token=x")
+            return Path("C:/private/one.txt")
+
+        def retry_failed(self, book_id: int, *, export: bool = True, concurrency: int = 1):
+            if book_id == 2:
+                raise RuntimeError("https://private.test token=x")
+
+    repo = TaskRepository(tmp_path / "bulk-partial.db")
+    crawler = PartialCrawler()
+    service = ApplicationService(repo, FakeExecutor(repo), crawler=crawler)
+
+    assert service.export_all_books("txt") == {
+        "best_effort": True,
+        "requested": 2,
+        "attempted": 2,
+        "succeeded": 1,
+        "failed": 1,
+        "remaining": 0,
+        "format": "txt",
+        "error_codes": ["export_failed"],
+    }
+    assert service.retry_all_failed_chapters() == {
+        "best_effort": True,
+        "requested": 2,
+        "attempted": 2,
+        "succeeded": 1,
+        "failed": 1,
+        "remaining": 0,
+        "error_codes": ["retry_failed"],
+    }
+    service.close()
+
+
+def test_retry_all_reports_bounded_remaining_work(tmp_path: Path) -> None:
+    class ManyCrawler(FakeCrawler):
+        def list_books(self):
+            return [{"id": index, "failed": 1} for index in range(1, 1003)]
+
+    repo = TaskRepository(tmp_path / "many-retries.db")
+    service = ApplicationService(repo, FakeExecutor(repo), crawler=ManyCrawler())
+
+    result = service.retry_all_failed_chapters()
+
+    assert result["requested"] == 1002
+    assert result["attempted"] == 1000
+    assert result["succeeded"] == 1000
+    assert result["failed"] == 0
+    assert result["remaining"] == 2
+    assert result["error_codes"] == ["retry_limit_reached"]
+    service.close()
 
 
 @pytest.mark.parametrize(
@@ -907,6 +1052,13 @@ def test_interaction_view_exposes_only_valid_safe_origin(tmp_path: Path) -> None
         "https://evil..test/",
         "https://evil.test/#secret",
         "https://例子.测试/",
+        "https://evil.test:0/",
+        "https://[fe80::1%25eth0]/",
+        "https://010.000.000.001/",
+        "https://2130706433/",
+        "https://evil.test./",
+        "010.000.000.001",
+        "2130706433",
     ],
 )
 def test_interaction_view_rejects_malicious_or_noncanonical_origin(

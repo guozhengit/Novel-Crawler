@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -142,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     web = sub.add_parser("web", help="启动 Web UI 管理界面")
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--unsafe-remote", action="store_true", help="明确允许非本机地址监听（有安全风险）")
     fix_titles = sub.add_parser("fix-titles", help="修正章节标题编号")
     fix_titles.add_argument("book_id", type=int)
     dedup = sub.add_parser("dedup", help="检测或移除重复章节")
@@ -178,17 +180,11 @@ def main(
         return 0
     if args.command == "decode-font":
         return _decode_font(ctx, args)
-    if args.command == "web":
-        from novel_crawler.web import run_web_ui
-
-        run_web_ui(ctx, args.host, args.port)
-        return 0
-
     app: _Application | None = None
     result = 3
     try:
         app = application_factory(ctx)
-        result = _dispatch(app, args)
+        result = _dispatch(app, args, ctx)
     except ApplicationError as exc:
         result = _application_error(exc)
     except KeyboardInterrupt:
@@ -210,8 +206,23 @@ def main(
     return result
 
 
-def _dispatch(app: _Application, args: argparse.Namespace) -> int:
+def _dispatch(app: _Application, args: argparse.Namespace, ctx: RuntimeContext) -> int:
     command = args.command
+    if command == "web":
+        from novel_crawler.web import run_web_ui
+
+        if not _is_loopback_host(args.host) and not args.unsafe_remote:
+            print("非本机监听必须显式指定 --unsafe-remote（code=remote_bind_forbidden）。", file=sys.stderr)
+            return 2
+        run_web_ui(
+            ctx,
+            args.host,
+            args.port,
+            application=app,
+            close_application=False,
+            unsafe_remote=args.unsafe_remote,
+        )
+        return 0
     if command == "crawl":
         if args.chase:
             print("当前版本不支持递推抓取（code=chase_unsupported）。", file=sys.stderr)
@@ -306,7 +317,13 @@ def _dispatch_book_command(app: _Application, args: argparse.Namespace) -> int:
     method, values = calls.get(command, ("", ()))
     if not method:
         raise ApplicationError("command_unsupported")
-    _print_json(_call(app, method, *values))
+    result = _call(app, method, *values)
+    _print_json(result)
+    if command in {"crawl-batch", "export-all", "retry-all"} and isinstance(result, Mapping):
+        for field in ("failed", "remaining"):
+            value = result.get(field, 0)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return 6
     return 0
 
 
@@ -319,6 +336,9 @@ def _wait_for_task(app: _Application, task_id: str, interval: float, timeout: fl
         if status == "waiting_for_user":
             _print_json(payload)
             return 10
+        if status in {"paused", "recoverable_failed"} or payload.get("cleanup_required") is True:
+            _print_json(payload)
+            return 13
         if payload.get("terminal") is True or status in _TERMINAL_EXIT:
             _print_json(payload)
             return _TERMINAL_EXIT.get(str(status), 11)
@@ -403,6 +423,17 @@ def _application_error(exc: ApplicationError) -> int:
     if exc.code.endswith("_invalid") or exc.code.endswith("_unsupported"):
         return 2
     return 6 if exc.retryable else 3
+
+
+def _is_loopback_host(host: object) -> bool:
+    if not isinstance(host, str):
+        return False
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _decode_font(ctx: RuntimeContext, args: argparse.Namespace) -> int:
