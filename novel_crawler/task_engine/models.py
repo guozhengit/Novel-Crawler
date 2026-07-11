@@ -26,7 +26,7 @@ TERMINAL_STATUSES = frozenset(
 
 
 _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.CREATED: frozenset({TaskStatus.PROBING, TaskStatus.PAUSED, TaskStatus.CANCELLED}),
+    TaskStatus.CREATED: frozenset({TaskStatus.PROBING, TaskStatus.CANCELLED}),
     TaskStatus.PROBING: frozenset(
         {
             TaskStatus.WAITING_FOR_USER,
@@ -82,6 +82,7 @@ _TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.RECOVERABLE_FAILED: frozenset(
         {
             TaskStatus.PROBING,
+            TaskStatus.WAITING_FOR_USER,
             TaskStatus.VALIDATING,
             TaskStatus.READY,
             TaskStatus.CRAWLING,
@@ -105,6 +106,7 @@ class TaskRecord:
     created_at: str
     updated_at: str
     error_code: str | None = None
+    resume_status: TaskStatus | None = None
     source_url: str = field(default="", repr=False)
     metadata: dict[str, Any] = field(default_factory=dict, repr=False)
     error_message: str | None = field(default=None, repr=False)
@@ -121,6 +123,7 @@ class TaskRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error_code": self.error_code,
+            "resume_status": self.resume_status.value if self.resume_status is not None else None,
             "is_terminal": self.is_terminal,
         }
 

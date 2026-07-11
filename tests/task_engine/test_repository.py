@@ -44,16 +44,16 @@ def test_migration_is_idempotent_and_non_destructive_for_old_storage(tmp_path: P
         storage.conn.commit()
 
     with TaskRepository(path) as first:
-        assert first.schema_version == 1
+        assert first.schema_version == 2
     with TaskRepository(path) as second:
-        assert second.schema_version == 1
+        assert second.schema_version == 2
         tables = {
             row[0]
             for row in second.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert {"books", "chapters", "tasks", "task_events", "checkpoints", "task_schema_migrations"} <= tables
         assert second.connection.execute("SELECT title FROM books").fetchone()[0] == "kept"
-        assert second.connection.execute("SELECT COUNT(*) FROM task_schema_migrations").fetchone()[0] == 1
+        assert second.connection.execute("SELECT COUNT(*) FROM task_schema_migrations").fetchone()[0] == 2
 
 
 def test_database_enables_wal_foreign_keys_and_busy_timeout(tmp_path: Path) -> None:
@@ -238,7 +238,6 @@ def test_transition_table_covers_every_status_and_active_work_can_pause_and_resu
     }
     assert all(not ALLOWED_TRANSITIONS[status] for status in TERMINAL_STATUSES)
     for status in (
-        TaskStatus.CREATED,
         TaskStatus.PROBING,
         TaskStatus.WAITING_FOR_USER,
         TaskStatus.VALIDATING,
@@ -254,6 +253,99 @@ def test_transition_table_covers_every_status_and_active_work_can_pause_and_resu
         TaskStatus.CRAWLING,
     ):
         assert status in ALLOWED_TRANSITIONS[TaskStatus.PAUSED]
+
+
+@pytest.mark.parametrize(
+    ("origin, blocked"),
+    [
+        (TaskStatus.WAITING_FOR_USER, TaskStatus.CRAWLING),
+        (TaskStatus.PROBING, TaskStatus.CRAWLING),
+        (TaskStatus.VALIDATING, TaskStatus.READY),
+    ],
+)
+def test_pause_can_only_resume_its_persisted_origin(
+    tmp_path: Path, origin: TaskStatus, blocked: TaskStatus
+) -> None:
+    path = tmp_path / "tasks.db"
+    with TaskRepository(path) as repository:
+        task = repository.create_task("https://example.test/book")
+        if origin is TaskStatus.PROBING:
+            task = repository.transition(task.task_id, origin, expected_version=task.version)
+        elif origin is TaskStatus.WAITING_FOR_USER:
+            task = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+            task = repository.transition(task.task_id, origin, expected_version=task.version)
+        else:
+            task = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=task.version)
+            task = repository.transition(task.task_id, origin, expected_version=task.version)
+        paused = repository.transition(task.task_id, TaskStatus.PAUSED, expected_version=task.version)
+        assert paused.resume_status is origin
+
+    with TaskRepository(path) as reopened:
+        persisted = reopened.get_task(task.task_id)
+        assert persisted.resume_status is origin
+        with pytest.raises(InvalidTaskTransition):
+            reopened.transition(
+                task.task_id,
+                blocked,
+                expected_version=persisted.version,
+            )
+        resumed = reopened.transition(task.task_id, origin, expected_version=persisted.version)
+        assert resumed.resume_status is None
+
+
+def test_recoverable_failure_only_retries_failed_origin_after_restart(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.db"
+    with TaskRepository(path) as repository:
+        task = repository.create_task("https://example.test/book")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0)
+        failed = repository.transition(
+            task.task_id, TaskStatus.RECOVERABLE_FAILED, expected_version=probing.version
+        )
+        assert failed.resume_status is TaskStatus.PROBING
+
+    with TaskRepository(path) as reopened:
+        failed = reopened.get_task(task.task_id)
+        with pytest.raises(InvalidTaskTransition):
+            reopened.transition(failed.task_id, TaskStatus.CRAWLING, expected_version=failed.version)
+        retried = reopened.transition(failed.task_id, TaskStatus.PROBING, expected_version=failed.version)
+        assert retried.resume_status is None
+
+
+def test_waiting_for_user_recoverable_failure_can_only_return_to_waiting(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test/book")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0)
+        waiting = repository.transition(
+            task.task_id, TaskStatus.WAITING_FOR_USER, expected_version=probing.version
+        )
+        failed = repository.transition(
+            task.task_id, TaskStatus.RECOVERABLE_FAILED, expected_version=waiting.version
+        )
+        resumed = repository.transition(
+            task.task_id, TaskStatus.WAITING_FOR_USER, expected_version=failed.version
+        )
+        assert resumed.resume_status is None
+
+
+def test_resume_origin_is_server_owned_not_client_metadata(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        task = repository.create_task("https://example.test/book")
+        probing = repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0)
+        with pytest.raises(TaskInputError, match="metadata"):
+            repository.transition(
+                task.task_id,
+                TaskStatus.RECOVERABLE_FAILED,
+                expected_version=probing.version,
+                metadata={"resume_status": TaskStatus.CRAWLING.value},
+            )
+        failed = repository.transition(
+            task.task_id,
+            TaskStatus.RECOVERABLE_FAILED,
+            expected_version=probing.version,
+        )
+        assert failed.resume_status is TaskStatus.PROBING
+        with pytest.raises(InvalidTaskTransition):
+            repository.transition(failed.task_id, TaskStatus.CRAWLING, expected_version=failed.version)
 
 
 def test_lists_tasks_for_restart_with_status_filter_and_bounds(tmp_path: Path) -> None:
@@ -281,6 +373,40 @@ def test_refuses_database_from_unknown_future_task_schema(tmp_path: Path) -> Non
         TaskRepository(path)
 
 
+def test_upgrades_existing_v1_task_rows_with_empty_resume_origin(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE task_schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+        INSERT INTO task_schema_migrations VALUES(1, 'v1');
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY,
+            source_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            metadata_json TEXT NOT NULL,
+            error_code TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO tasks VALUES(
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'https://example.test/v1', 'created', 0, '{}',
+            NULL, NULL, 'v1', 'v1'
+        );
+        """
+    )
+    connection.close()
+
+    with TaskRepository(path) as repository:
+        assert repository.schema_version == 2
+        task = repository.get_task("a" * 32)
+        assert task.status is TaskStatus.CREATED
+        assert task.resume_status is None
+        assert repository.transition(task.task_id, TaskStatus.PROBING, expected_version=0).version == 1
+
+
 def test_rejects_cyclic_and_non_mapping_metadata_with_public_error(tmp_path: Path) -> None:
     cyclic: dict[str, object] = {}
     cyclic["child"] = cyclic
@@ -288,6 +414,38 @@ def test_rejects_cyclic_and_non_mapping_metadata_with_public_error(tmp_path: Pat
         for metadata in (cyclic, ["not", "a", "mapping"]):
             with pytest.raises(TaskInputError, match="metadata"):
                 repository.create_task("https://example.test/book", metadata=metadata)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "private_value",
+    [
+        "Authorization: Bearer abc123",
+        "Bearer abc123",
+        "cookie=session-private",
+        "token=private",
+        "password=hunter2",
+        "secret=private",
+        "<html><body>chapter正文</body></html>",
+        "profile_path=C:/Users/private/browser",
+        "https://username:password@example.test/private",
+    ],
+)
+def test_rejects_sensitive_string_values_in_task_and_event_nested_metadata(
+    tmp_path: Path, private_value: str
+) -> None:
+    with TaskRepository(tmp_path / "tasks.db") as repository:
+        with pytest.raises(TaskInputError, match="metadata"):
+            repository.create_task(
+                "https://example.test/book", metadata={"safe": [{"note": private_value}]}
+            )
+        task = repository.create_task("https://example.test/book")
+        with pytest.raises(TaskInputError, match="metadata"):
+            repository.transition(
+                task.task_id,
+                TaskStatus.PROBING,
+                expected_version=0,
+                metadata={"safe": [[private_value]]},
+            )
 
 
 def test_rejects_sensitive_error_details_and_boolean_version(tmp_path: Path) -> None:

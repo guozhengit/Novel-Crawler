@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from novel_crawler.task_engine.models import ALLOWED_TRANSITIONS, TaskEvent, TaskRecord, TaskStatus
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SENSITIVE_KEYS = (
     "authorization",
@@ -25,6 +25,7 @@ _SENSITIVE_KEYS = (
     "page_body",
     "password",
     "profile_path",
+    "resume_status",
     "secret",
     "token",
 )
@@ -37,8 +38,13 @@ _SENSITIVE_TEXT_MARKERS = (
     "<html",
     "page_body",
     "password=",
+    "password:",
     "profile_path",
+    "profile path",
+    "secret=",
+    "secret:",
     "token=",
+    "token:",
 )
 _STATUS_SQL = ", ".join(f"'{status.value}'" for status in TaskStatus)
 
@@ -182,8 +188,24 @@ class TaskRepository:
                 self._connection.execute(statement)
             self._connection.execute(
                 "INSERT OR IGNORE INTO task_schema_migrations(version, applied_at) VALUES(?, ?)",
-                (SCHEMA_VERSION, _now()),
+                (1, _now()),
             )
+        if self.schema_version < 2:
+            with self._transaction():
+                columns = {
+                    str(row[1]) for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()
+                }
+                if "resume_status" not in columns:
+                    self._connection.execute(
+                        f"ALTER TABLE tasks ADD COLUMN resume_status TEXT "
+                        f"CHECK(resume_status IS NULL OR resume_status IN ({_STATUS_SQL}))"
+                    )
+                self._connection.execute(
+                    "INSERT INTO task_schema_migrations(version, applied_at) VALUES(2, ?)", (_now(),)
+                )
+        columns = {str(row[1]) for row in self._connection.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "resume_status" not in columns:
+            raise TaskInputError("task_schema_corrupt")
 
     def create_task(self, source_url: str, *, metadata: Mapping[str, Any] | None = None) -> TaskRecord:
         source_url = _validate_source_url(source_url)
@@ -215,6 +237,7 @@ class TaskRepository:
             metadata=metadata_value,
             created_at=timestamp,
             updated_at=timestamp,
+            resume_status=None,
         )
 
     def get_task(self, task_id: str) -> TaskRecord:
@@ -291,16 +314,29 @@ class TaskRepository:
                 raise InvalidTaskTransition(
                     f"transition_not_allowed:{current.status.value}:{to_status.value}"
                 )
+            if current.status in {TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED} and to_status not in {
+                TaskStatus.TERMINAL_FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                if current.resume_status is None or to_status is not current.resume_status:
+                    raise InvalidTaskTransition(
+                        f"resume_not_allowed:{current.status.value}:{to_status.value}"
+                    )
+            if to_status in {TaskStatus.PAUSED, TaskStatus.RECOVERABLE_FAILED}:
+                resume_status = current.status
+            else:
+                resume_status = None
             next_version = current.version + 1
             cursor = self._connection.execute(
                 """
                 UPDATE tasks
-                SET status=?, version=?, error_code=?, error_message=?, updated_at=?
+                SET status=?, version=?, resume_status=?, error_code=?, error_message=?, updated_at=?
                 WHERE task_id=? AND version=?
                 """,
                 (
                     to_status.value,
                     next_version,
+                    resume_status.value if resume_status is not None else None,
                     error_code,
                     error_message,
                     timestamp,
@@ -337,6 +373,7 @@ class TaskRepository:
             metadata=current.metadata,
             error_code=error_code,
             error_message=error_message,
+            resume_status=resume_status,
             created_at=current.created_at,
             updated_at=timestamp,
         )
@@ -417,6 +454,16 @@ def _reject_sensitive_metadata(value: Any) -> None:
     elif isinstance(value, (list, tuple)):
         for child in value:
             _reject_sensitive_metadata(child)
+    elif isinstance(value, str):
+        normalized = value.casefold()
+        if any(marker in normalized for marker in _SENSITIVE_TEXT_MARKERS):
+            raise TaskInputError("metadata_sensitive")
+        try:
+            parsed = urlsplit(value)
+        except ValueError as exc:
+            raise TaskInputError("metadata_invalid") from exc
+        if parsed.scheme.casefold() in {"http", "https"} and (parsed.username or parsed.password):
+            raise TaskInputError("metadata_sensitive")
 
 
 def _task_from_row(row: sqlite3.Row) -> TaskRecord:
@@ -427,6 +474,7 @@ def _task_from_row(row: sqlite3.Row) -> TaskRecord:
         version=int(row["version"]),
         metadata=json.loads(row["metadata_json"]),
         error_code=row["error_code"],
+        resume_status=TaskStatus(row["resume_status"]) if row["resume_status"] is not None else None,
         error_message=row["error_message"],
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
