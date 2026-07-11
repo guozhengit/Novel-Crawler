@@ -81,8 +81,9 @@ class ProbeService:
             else:
                 first, second = self._fetch(links[0]), self._fetch(links[1])
             first_analysis, second_analysis = self._analyze(first.snapshot), self._analyze(second.snapshot)
-            first_item = self._page_validation(first, first_analysis, second.navigation_url)
-            second_item = self._page_validation(second, second_analysis, None)
+            index_identity = self._book_identity(index.snapshot.html)
+            first_item = self._page_validation(first, first_analysis, second.navigation_url, index_identity)
+            second_item = self._page_validation(second, second_analysis, None, index_identity)
             draft = self._draft(index, index_analysis.decision, first_analysis.decision, second_analysis.decision, first_item, second_item)
             return self.validator.validate(first_item, second_item, draft, index_decision=index_analysis.decision.kind)
         except AcquisitionError as exc:
@@ -125,7 +126,7 @@ class ProbeService:
                 return str(node.get("href"))
         return None
 
-    def _page_validation(self, page: AcquiredPage, analysis: _Analysis, expected_next: str | None) -> PageValidation:
+    def _page_validation(self, page: AcquiredPage, analysis: _Analysis, expected_next: str | None, index_identity: str | None) -> PageValidation:
         content = self._selector(analysis.decision, FieldKind.CONTENT) or ""
         soup = BeautifulSoup(page.snapshot.html, "lxml")
         nodes = soup.select(content) if content else []
@@ -133,7 +134,9 @@ class ProbeService:
         next_href = self._candidate_href(page, analysis.extraction, FieldKind.NEXT_LINK)
         matches = expected_next is None or next_href is not None and self._canonical(urljoin(page.navigation_url, next_href)) == self._canonical(expected_next)
         fingerprint = self._fingerprint(node) if node else ""
-        return PageValidation(self._page_id(page.navigation_url), analysis.classification.kind, analysis.decision.kind, "", content, len(node.get_text(" ", strip=True)) if node else 0, len(node.find_all("p")) if node else 0, matches, analysis.classification.kind in {PageKind.AUTH_OR_CHALLENGE, PageKind.ERROR}, fingerprint)
+        page_identity = self._book_identity(page.snapshot.html)
+        identity_matches = index_identity is None or page_identity is None or index_identity == page_identity
+        return PageValidation(self._page_id(page.navigation_url), analysis.classification.kind, analysis.decision.kind, identity_matches, content, len(node.get_text(" ", strip=True)) if node else 0, len(node.find_all("p")) if node else 0, matches, analysis.classification.kind in {PageKind.AUTH_OR_CHALLENGE, PageKind.ERROR}, fingerprint)
 
     @staticmethod
     def _fingerprint(node: Tag) -> str:
@@ -141,6 +144,17 @@ class ProbeService:
         role = str(node.get("role", ""))
         stable = next((str(value) for value in [node.get("id"), *node.get("class", [])] if value and not re.search(r"\d", str(value))), "")
         return "/".join([*reversed(ancestry), node.name, role, stable])
+
+    @staticmethod
+    def _book_identity(html: str) -> str | None:
+        soup = BeautifulSoup(html, "lxml")
+        meta = soup.select_one('meta[property="og:novel:book_name"], meta[property="og:title"]')
+        value = str(meta.get("content", "")) if isinstance(meta, Tag) else ""
+        if not value:
+            node = soup.select_one(".book-title, .breadcrumb [data-book-title], .breadcrumb .book")
+            value = node.get_text(" ", strip=True) if isinstance(node, Tag) else ""
+        normalized = re.sub(r"\s+", " ", value).strip().casefold()
+        return normalized or None
 
     def _draft(self, index: AcquiredPage, index_decision: AdaptationDecision, first: AdaptationDecision, second: AdaptationDecision, first_page: PageValidation, second_page: PageValidation) -> ConfigDraft:
         all_fields = (*index_decision.fields, *first.fields, *second.fields)

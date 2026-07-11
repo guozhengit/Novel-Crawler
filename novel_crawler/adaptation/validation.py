@@ -57,7 +57,7 @@ class PageValidation:
     page_id: str
     kind: PageKind
     decision: DecisionKind
-    book_key: str
+    book_identity_matches: bool
     content_selector: str
     content_length: int
     paragraph_count: int
@@ -101,7 +101,7 @@ class MultiPageValidator:
             reasons.append("auth_or_error")
         if not first.content_fingerprint or first.content_fingerprint != second.content_fingerprint:
             reasons.append("content_structure_mismatch")
-        if first.book_key and second.book_key and first.book_key != second.book_key:
+        if not first.book_identity_matches or not second.book_identity_matches:
             reasons.append("book_title_mismatch")
         if not self._reasonable(first, second):
             reasons.append("content_shape_invalid")
@@ -112,13 +112,6 @@ class MultiPageValidator:
             confidence = min(confidence, 0.84)
         unique = tuple(dict.fromkeys(reasons))
         return ValidationResult(not unique, confidence if not unique else 0.0, unique, (index_decision, first.decision, second.decision), {"pages": 3, "failures": len(unique)}, draft if not unique else None)
-
-    @staticmethod
-    def _compatible(left: str, right: str) -> bool:
-        def normalize(value: str) -> str:
-            return re.sub(r":nth-of-type\(\d+\)", "", value).strip()
-
-        return normalize(left) == normalize(right) or ({left.split(" ")[-1], right.split(" ")[-1]} <= {"article", "main", "section", "div"})
 
     @staticmethod
     def _reasonable(first: PageValidation, second: PageValidation) -> bool:

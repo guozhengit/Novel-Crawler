@@ -66,3 +66,30 @@ def test_probe_budget_and_acquisition_failures_are_safe_rejections() -> None:
     failed = ProbeService(acquirer=Broken()).probe("https://example.test/private?q=secret")
     assert failed.reason_ids == ("acquisition.timeout",)
     assert "private" not in failed.to_json() and "secret" not in failed.to_json()
+
+
+def _nested_pages() -> dict[str, str]:
+    index = '<meta property="og:title" content="Book A"><h1>Book A</h1><div id="list">' + "".join(f'<a href="chapters/{n}.html">Chapter {n}</a>' for n in range(1, 4)) + "</div>"
+    pages = {"https://example.test/books/1/index.html": index}
+    for n in range(1, 4):
+        nav = f'<a rel="next" href="{n + 1}.html">Next</a>' if n < 3 else ""
+        pages[f"https://example.test/books/1/chapters/{n}.html"] = f'<meta property="og:title" content="Book A"><h1>Chapter {n}</h1><main><article class="content"><p>{"x" * 90}</p><p>tail</p></article></main>{nav}<a href="../index.html">Contents</a>'
+    return pages
+
+
+def test_middle_and_last_chapter_choose_directory_neighbor_with_nested_relative_urls() -> None:
+    pages = _nested_pages()
+    middle = FakeAcquirer(pages)
+    ProbeService(acquirer=middle).probe("https://example.test/books/1/chapters/2.html")
+    assert middle.calls == ["https://example.test/books/1/chapters/2.html", "https://example.test/books/1/index.html", "https://example.test/books/1/chapters/3.html"]
+    last = FakeAcquirer(pages)
+    ProbeService(acquirer=last).probe("https://example.test/books/1/chapters/3.html")
+    assert last.calls == ["https://example.test/books/1/chapters/3.html", "https://example.test/books/1/index.html", "https://example.test/books/1/chapters/2.html"]
+
+
+def test_book_identity_mismatch_rejects_without_leaking_title() -> None:
+    pages = _nested_pages()
+    pages["https://example.test/books/1/chapters/2.html"] = pages["https://example.test/books/1/chapters/2.html"].replace('content="Book A"', 'content="Private Other Book"')
+    result = ProbeService(acquirer=FakeAcquirer(pages)).probe("https://example.test/books/1/index.html")
+    assert not result.ok and "book_title_mismatch" in result.reason_ids
+    assert "Private Other Book" not in result.to_json()
