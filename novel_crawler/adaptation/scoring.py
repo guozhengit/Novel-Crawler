@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup, Tag
 from novel_crawler.acquisition.classifier import PageKind
 from novel_crawler.acquisition.models import PageSnapshot
 
+from .diagnostics import safe_origin
 from .models import Candidate, FieldKind
 
 _SAFE_ID = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
@@ -38,16 +39,22 @@ _UNSAFE_SELECTOR = re.compile(r"(?:https?://|[?&]|token|secret|session|password)
 class ScoringContext:
     """Ephemeral scoring input whose representation never includes response data."""
 
-    __slots__ = ("_locked", "_page_kind", "_snapshot")
+    __slots__ = ("_locked", "_origin_key", "_page_kind", "_sample_id", "_snapshot")
     _locked: bool
+    _origin_key: str
     _page_kind: PageKind
+    _sample_id: str
     _snapshot: PageSnapshot
 
-    def __init__(self, page_kind: PageKind, snapshot: PageSnapshot) -> None:
+    def __init__(self, page_kind: PageKind, snapshot: PageSnapshot, sample_id: str) -> None:
         if not isinstance(page_kind, PageKind) or not isinstance(snapshot, PageSnapshot):
             raise TypeError("ScoringContext requires PageKind and PageSnapshot")
+        if not _SAFE_ID.fullmatch(sample_id):
+            raise ValueError("sample_id must be a safe structural identifier")
         object.__setattr__(self, "_page_kind", page_kind)
         object.__setattr__(self, "_snapshot", snapshot)
+        object.__setattr__(self, "_sample_id", sample_id)
+        object.__setattr__(self, "_origin_key", safe_origin(snapshot.final_url))
         object.__setattr__(self, "_locked", True)
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -61,6 +68,14 @@ class ScoringContext:
     @property
     def snapshot(self) -> PageSnapshot:
         return self._snapshot
+
+    @property
+    def sample_id(self) -> str:
+        return self._sample_id
+
+    @property
+    def origin_key(self) -> str:
+        return self._origin_key
 
     def __repr__(self) -> str:
         snapshot = self.snapshot
@@ -112,6 +127,8 @@ class ScoredCandidate:
     components: tuple[ScoreComponent, ...]
     calibration_id: str
     version: str
+    sample_id: str
+    origin_key: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.candidate, Candidate):
@@ -123,6 +140,10 @@ class ScoredCandidate:
             raise ValueError("components must be a nonempty tuple of ScoreComponent")
         if not _SAFE_ID.fullmatch(self.calibration_id) or not _SAFE_ID.fullmatch(self.version):
             raise ValueError("calibration_id and version must be stable identifiers")
+        if not _SAFE_ID.fullmatch(self.sample_id):
+            raise ValueError("sample_id must be a safe structural identifier")
+        if self.origin_key != "redacted" and safe_origin(self.origin_key) != self.origin_key:
+            raise ValueError("origin_key must contain only a safe origin")
         object.__setattr__(self, "components", values)
 
     @property
@@ -282,7 +303,7 @@ class CandidateScorer:
             raise ValueError("components must have unique field-prefixed rule IDs")
         total = sum(value.weight for value in raw)
         score = sum(value.score * value.weight for value in raw) / total
-        return ScoredCandidate(candidate, score, raw, self.config.calibration_id, self.config.version)
+        return ScoredCandidate(candidate, score, raw, self.config.calibration_id, self.config.version, context.sample_id, context.origin_key)
 
     def rank(self, candidates: Sequence[Candidate], context: ScoringContext) -> tuple[ScoredCandidate, ...]:
         if len({candidate.field for candidate in candidates}) > 1:

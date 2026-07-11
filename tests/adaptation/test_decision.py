@@ -14,7 +14,7 @@ from novel_crawler.adaptation.scoring import ScoreComponent, ScoredCandidate
 
 def scored(field: FieldKind, selector: str, score: float) -> ScoredCandidate:
     candidate = Candidate(field, selector, "count=1", 0, 0, (Evidence("extract.test", 1, "count=1"),), {})
-    return ScoredCandidate(candidate, score, (ScoreComponent("title.test", score, 1),), "heuristic-v1", "score-v1")
+    return ScoredCandidate(candidate, score, (ScoreComponent("title.test", score, 1),), "heuristic-v1", "score-v1", "sample-1", "https://example.test")
 
 
 def batch(kind: PageKind, values: list[ScoredCandidate] | tuple[ScoredCandidate, ...] = ()) -> ScoredPageBatch:
@@ -121,6 +121,14 @@ def test_batch_validates_identity_origin_kind_and_single_page_contract() -> None
         ScoredPageBatch("sample-1", "https://example.test/path", PageKind.CHAPTER, ())
     with pytest.raises(ValueError, match="page_kind"):
         DecisionPolicy().decide(Classification(PageKind.BOOK_INDEX, 1, ()), batch(PageKind.CHAPTER))
+    foreign = scored(FieldKind.CONTENT, "article", 0.9)
+    object.__setattr__(foreign, "sample_id", "sample-2")
+    with pytest.raises(ValueError, match="sample_id"):
+        ScoredPageBatch("sample-1", "https://example.test", PageKind.CHAPTER, (foreign,))
+    other_origin = scored(FieldKind.CONTENT, "article", 0.9)
+    object.__setattr__(other_origin, "origin_key", "https://other.test")
+    with pytest.raises(ValueError, match="origin"):
+        ScoredPageBatch("sample-1", "https://example.test", PageKind.CHAPTER, (other_origin,))
 
 
 def test_decision_repr_and_serialization_never_expose_selector_or_private_markup() -> None:
@@ -159,3 +167,27 @@ def test_new_models_reject_malformed_values_and_are_immutable() -> None:
         result.fields[0].score = 1  # type: ignore[misc]
     with pytest.raises(AttributeError):
         result.kind = DecisionKind.AUTO_ACCEPT  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        DecisionPolicy("bad")  # type: ignore[arg-type]
+
+
+def test_adaptation_decision_constructor_rejects_malformed_and_copies_fields() -> None:
+    from novel_crawler.adaptation.decision import AdaptationDecision, FieldDecision
+
+    diagnostic = Diagnostic(())
+    field = FieldDecision(FieldKind.TITLE, "h1", 0.9, 0.85, DecisionKind.AUTO_ACCEPT)
+    mutable = [field]
+    result = AdaptationDecision(DecisionKind.AUTO_ACCEPT, 0.9, mutable, "decision-v2", diagnostic)  # type: ignore[arg-type]
+    mutable.clear()
+    assert result.fields == (field,)
+    bad_values = [
+        ("accept", 0.9, (field,), "decision-v2", diagnostic),
+        (DecisionKind.AUTO_ACCEPT, float("nan"), (field,), "decision-v2", diagnostic),
+        (DecisionKind.AUTO_ACCEPT, 0.9, (field, field), "decision-v2", diagnostic),
+        (DecisionKind.AUTO_ACCEPT, 0.9, (field,), "bad version", diagnostic),
+        (DecisionKind.AUTO_ACCEPT, 0.9, (field,), "decision-v2", object()),
+        (DecisionKind.REJECT, 0.9, (field,), "decision-v2", diagnostic),
+    ]
+    for args in bad_values:
+        with pytest.raises((TypeError, ValueError)):
+            AdaptationDecision(*args)  # type: ignore[arg-type]
