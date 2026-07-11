@@ -22,7 +22,7 @@ from novel_crawler.browser.coordinator import (
     _AttemptLedger,
 )
 from novel_crawler.browser.driver import BrowserPageSnapshot, DriverLaunchFailure
-from novel_crawler.browser.models import VerificationStatus
+from novel_crawler.browser.models import VerificationOutcome, VerificationStatus
 from novel_crawler.browser.sessions import BrowserSessionLease, BrowserSessionStore, SessionLockTimeout
 
 PUBLIC_POLICY = UrlSafetyPolicy(resolver=lambda host, port: ("93.184.216.34",))
@@ -314,8 +314,7 @@ def test_expire_sweep_closes_expired_entries(tmp_path: Path) -> None:
     now += timedelta(minutes=11)
     assert coordinator.expire_sweep() == 1
     assert context.calls[-1] == "close"
-    with pytest.raises(VerificationRequired, match="verification_token_invalid"):
-        coordinator.cancel(ticket.token)
+    assert coordinator.cancel(ticket.token).status is VerificationStatus.TIMED_OUT
 
 
 def test_headless_auth_closes_fallback_before_requesting_manual_and_fetch_returns_snapshot(tmp_path: Path) -> None:
@@ -511,7 +510,7 @@ def test_retry_cleanup_can_report_repeated_close_failure(tmp_path: Path) -> None
     )
     ticket = coordinator.begin("https://example.test/a", task_key="download")
     assert coordinator.cancel(ticket.token).status is VerificationStatus.CANCELLED
-    assert coordinator.retry_cleanup(ticket.token) is False
+    assert coordinator.retry_cleanup(ticket.token).cleanup_required
 
 
 def test_begin_failure_with_failed_close_is_quarantined_before_lease_release(tmp_path: Path) -> None:
@@ -578,8 +577,9 @@ def test_worker_deadline_callback_releases_confirmed_closed_context_without_swee
     time.sleep(0.25)
     with sessions.acquire("example.test", timeout=0.1):
         pass
-    with pytest.raises(VerificationRequired, match="verification_token_invalid"):
-        coordinator.continue_verification(ticket.token)
+    outcome = coordinator.continue_verification(ticket.token)
+    assert outcome.status is VerificationStatus.TIMED_OUT
+    assert not outcome.cleanup_required
 
 
 def test_worker_deadline_failed_close_keeps_capacity_until_retry(tmp_path: Path) -> None:
@@ -603,9 +603,120 @@ def test_worker_deadline_failed_close_keeps_capacity_until_retry(tmp_path: Path)
     )
     ticket = coordinator.begin("https://example.test/a", task_key="download")
     time.sleep(0.25)
+    pending = coordinator.continue_verification(ticket.token)
+    assert pending.status is VerificationStatus.TIMED_OUT and pending.cleanup_required
     with pytest.raises(VerificationRequired, match="verification_capacity"):
         coordinator.begin("https://other.test/a", task_key="other")
-    assert coordinator.retry_cleanup(ticket.token)
+    cleaned = coordinator.retry_cleanup(ticket.token)
+    assert cleaned.status is VerificationStatus.TIMED_OUT and not cleaned.cleanup_required
+    assert coordinator.continue_verification(ticket.token) == cleaned
+
+
+def test_terminal_outcome_cache_is_bounded_and_expires(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 12, tzinfo=UTC)
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], []) for _ in range(2)]),
+        safety_policy=PUBLIC_POLICY,
+        clock=lambda: now,
+        max_terminal=1,
+        terminal_ttl=timedelta(seconds=1),
+    )
+    first = coordinator.begin("https://one.test/a", task_key="one")
+    assert coordinator.cancel(first.token).status is VerificationStatus.CANCELLED
+    second = coordinator.begin("https://two.test/a", task_key="two")
+    assert coordinator.cancel(second.token).status is VerificationStatus.CANCELLED
+    with pytest.raises(VerificationRequired, match="verification_token_invalid"):
+        coordinator.continue_verification(first.token)
+    assert coordinator.continue_verification(second.token).status is VerificationStatus.CANCELLED
+    now += timedelta(seconds=2)
+    with pytest.raises(VerificationRequired, match="verification_token_invalid"):
+        coordinator.continue_verification(second.token)
+
+
+def test_async_crash_terminal_is_idempotently_failed(tmp_path: Path) -> None:
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    coordinator._worker_terminal(ticket.token, "crash", True)
+    first = coordinator.continue_verification(ticket.token)
+    second = coordinator.cancel(ticket.token)
+    assert first.status is VerificationStatus.FAILED
+    assert second == first
+
+
+def test_inflight_continue_returns_deadline_tombstone_not_synthesized_failure(tmp_path: Path) -> None:
+    coordinator: VerificationCoordinator
+    token = ""
+
+    class DeadlineDuringCapture(FakeContext):
+        def capture(self) -> BrowserPageSnapshot:
+            coordinator._worker_terminal(token, "deadline", True)
+            raise RuntimeError("worker ended at deadline")
+
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([DeadlineDuringCapture([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    token = ticket.token
+    assert coordinator.continue_verification(token).status is VerificationStatus.TIMED_OUT
+
+
+def test_cancel_waiting_on_token_lock_returns_async_deadline_tombstone(tmp_path: Path) -> None:
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    active = coordinator._active[ticket.token]
+    active.lock.acquire()
+    results: list[VerificationOutcome] = []
+    thread = threading.Thread(target=lambda: results.append(coordinator.cancel(ticket.token)))
+    thread.start()
+    coordinator._worker_terminal(ticket.token, "deadline", True)
+    active.lock.release()
+    thread.join()
+    assert results[0].status is VerificationStatus.TIMED_OUT
+
+
+def test_cancel_waits_while_async_terminal_cleanup_is_in_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    coordinator = VerificationCoordinator(
+        BrowserSessionStore(tmp_path),
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    active = coordinator._active[ticket.token]
+    entered = threading.Event()
+    release = threading.Event()
+    original_close = BrowserSessionLease.close
+
+    def blocking_close(lease: BrowserSessionLease) -> None:
+        if lease is active.lease:
+            entered.set()
+            release.wait(2)
+        original_close(lease)
+
+    monkeypatch.setattr(BrowserSessionLease, "close", blocking_close)
+    terminal_thread = threading.Thread(target=coordinator._worker_terminal, args=(ticket.token, "deadline", True))
+    terminal_thread.start()
+    assert entered.wait(1)
+    results: list[VerificationOutcome] = []
+    cancel_thread = threading.Thread(target=lambda: results.append(coordinator.cancel(ticket.token)))
+    cancel_thread.start()
+    assert cancel_thread.is_alive()
+    release.set()
+    terminal_thread.join()
+    cancel_thread.join()
+    assert results[0].status is VerificationStatus.TIMED_OUT
 
 
 def test_ledger_success_removes_only_its_reservation_and_purges_expired_records(tmp_path: Path) -> None:
@@ -735,7 +846,7 @@ def test_partial_launch_cleanup_is_quarantined_until_retry_releases_lease(tmp_pa
     assert caught.value.ticket is not None
     with pytest.raises(SessionLockTimeout):
         sessions.acquire("example.test", timeout=0.01)
-    assert not coordinator.retry_cleanup(caught.value.ticket.token)
+    assert coordinator.retry_cleanup(caught.value.ticket.token).cleanup_required
     with pytest.raises(SessionLockTimeout):
         sessions.acquire("example.test", timeout=0.01)
     assert coordinator.retry_cleanup(caught.value.ticket.token)

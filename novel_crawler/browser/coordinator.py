@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -51,6 +52,7 @@ class _ActiveVerification:
     lifecycle: str = "pending"
     cleanup_status: VerificationStatus | None = None
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    terminal_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 @dataclass
@@ -245,8 +247,17 @@ class VerificationCoordinator:
         clock: Callable[[], datetime] | None = None,
         max_body_bytes: int = 10 * 1024 * 1024,
         max_network_bytes: int = 64 * 1024 * 1024,
+        max_terminal: int = 1024,
+        terminal_ttl: timedelta = timedelta(minutes=10),
     ) -> None:
-        if ttl <= timedelta(0) or attempt_ttl <= timedelta(0) or max_active <= 0 or max_attempts <= 0:
+        if (
+            ttl <= timedelta(0)
+            or attempt_ttl <= timedelta(0)
+            or terminal_ttl <= timedelta(0)
+            or max_active <= 0
+            or max_attempts <= 0
+            or max_terminal <= 0
+        ):
             raise ValueError("verification limits must be positive")
         if max_body_bytes <= 0 or max_network_bytes <= 0:
             raise ValueError("verification limits must be positive")
@@ -266,6 +277,9 @@ class VerificationCoordinator:
         self._failed_closures: dict[str, _ActiveVerification] = {}
         self._early_terminal: dict[str, tuple[str, bool]] = {}
         self._ledger_repairs: dict[str, tuple[str, str, bool]] = {}
+        self._terminal: OrderedDict[str, tuple[datetime, VerificationOutcome]] = OrderedDict()
+        self._terminal_ttl = terminal_ttl
+        self._max_terminal = max_terminal
         self._reserved = 0
         self._guard = threading.Lock()
         self._ledger = _AttemptLedger(sessions, self.clock, attempt_ttl)
@@ -351,10 +365,16 @@ class VerificationCoordinator:
             raise VerificationRequired("verification_start_failed") from None
 
     def continue_verification(self, token: str) -> VerificationOutcome:
+        terminal = self._terminal_outcome(token)
+        if terminal is not None:
+            return terminal
         active = self._lookup(token)
         if not active.lock.acquire(blocking=False):
             raise VerificationRequired("verification_in_progress")
         try:
+            terminal = self._terminal_outcome(token)
+            if terminal is not None:
+                return terminal
             with self._guard:
                 if self._active.get(token) is not active:
                     raise VerificationRequired("verification_token_invalid")
@@ -386,13 +406,22 @@ class VerificationCoordinator:
             active.lock.release()
 
     def cancel(self, token: str) -> VerificationOutcome:
+        terminal = self._terminal_outcome(token)
+        if terminal is not None:
+            return terminal
         active = self._lookup(token)
         with active.lock:
+            terminal = self._terminal_outcome(token)
+            if terminal is not None:
+                return terminal
             if active.lifecycle == "quarantined":
                 return self._cleanup_outcome(active)
             return self._finish(active, VerificationStatus.CANCELLED)
 
-    def retry_cleanup(self, token: str) -> bool:
+    def retry_cleanup(self, token: str) -> VerificationOutcome:
+        terminal = self._terminal_outcome(token)
+        if terminal is not None and not terminal.cleanup_required:
+            return terminal
         with self._guard:
             active = self._failed_closures.get(token)
         if active is None:
@@ -401,16 +430,22 @@ class VerificationCoordinator:
             try:
                 active.worker.close()
             except Exception:  # pragma: no cover - BrowserSessionStore fault injection owns this branch
-                return False  # pragma: no cover
+                return self._cleanup_outcome(active)  # pragma: no cover
             try:
                 active.lease.close()
             except Exception:
-                return False
+                return self._cleanup_outcome(active)
+            outcome = VerificationOutcome(
+                active.cleanup_status or VerificationStatus.FAILED,
+                active.safe_origin,
+                active.attempt,
+            )
             with self._guard:
+                self._store_terminal_locked(token, outcome)
                 self._failed_closures.pop(token, None)
                 self._active.pop(token, None)
                 active.lifecycle = "released"
-            return True
+            return outcome
 
     def expire_sweep(self) -> int:
         self._retry_ledger_repairs()
@@ -438,7 +473,7 @@ class VerificationCoordinator:
             raise VerificationRequired("verification_token_invalid")
         with self._guard:
             active = self._active.get(token)
-        if active is None or active.lifecycle not in {"active", "quarantined"}:
+        if active is None or active.lifecycle not in {"active", "terminating", "quarantined"}:
             raise VerificationRequired("verification_token_invalid")
         return active
 
@@ -452,6 +487,30 @@ class VerificationCoordinator:
             cleanup_ticket=active.token,
         )
 
+    def _terminal_outcome(self, token: str) -> VerificationOutcome | None:
+        if not isinstance(token, str) or len(token) > 128:
+            return None
+        with self._guard:
+            self._purge_terminal_locked()
+            stored = self._terminal.get(token)
+            return stored[1] if stored is not None else None
+
+    def _store_terminal_locked(self, token: str, outcome: VerificationOutcome) -> None:
+        self._purge_terminal_locked()
+        self._terminal[token] = (self.clock() + self._terminal_ttl, outcome)
+        while len(self._terminal) > self._max_terminal:
+            self._terminal.popitem(last=False)
+
+    def _store_terminal(self, token: str, outcome: VerificationOutcome) -> None:
+        with self._guard:
+            self._store_terminal_locked(token, outcome)
+
+    def _purge_terminal_locked(self) -> None:
+        now = self.clock()
+        for token, (expires_at, _) in tuple(self._terminal.items()):
+            if expires_at <= now:
+                self._terminal.pop(token, None)
+
     def _finish(
         self,
         active: _ActiveVerification,
@@ -461,11 +520,20 @@ class VerificationCoordinator:
         ledger_consumed: bool | None = None,
     ) -> VerificationOutcome:
         with self._guard:
-            if active.lifecycle in {"terminating", "quarantined", "released"}:
-                return self._cleanup_outcome(active) if active.lifecycle == "quarantined" else VerificationOutcome(
-                    VerificationStatus.FAILED, active.safe_origin, active.attempt
-                )
-            active.lifecycle = "terminating"
+            lifecycle = active.lifecycle
+            if lifecycle not in {"terminating", "quarantined", "released"}:
+                active.lifecycle = "terminating"
+        if lifecycle in {"terminating", "quarantined", "released"}:
+            terminal = self._terminal_outcome(active.token)
+            if terminal is not None:
+                return terminal
+            if lifecycle == "quarantined":
+                return self._cleanup_outcome(active)
+            if active.terminal_event.wait(timeout=self.ttl.total_seconds()):
+                terminal = self._terminal_outcome(active.token)
+                if terminal is not None:
+                    return terminal
+            raise VerificationRequired("verification_in_progress")
         try:
             active.worker.close()
         except Exception:
@@ -474,10 +542,13 @@ class VerificationCoordinator:
                 active.token, active.ledger_key, active.reservation_id,
                 consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
             )
-            return VerificationOutcome(
+            outcome = VerificationOutcome(
                 status, active.safe_origin, active.attempt, page,
                 cleanup_required=True, cleanup_ticket=active.token,
             )
+            self._store_terminal(active.token, outcome)
+            active.terminal_event.set()
+            return outcome
         try:
             active.lease.close()
         except Exception:
@@ -486,33 +557,64 @@ class VerificationCoordinator:
                 active.token, active.ledger_key, active.reservation_id,
                 consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
             )
-            return VerificationOutcome(
+            outcome = VerificationOutcome(
                 status, active.safe_origin, active.attempt, page,
                 cleanup_required=True, cleanup_ticket=active.token,
             )
+            self._store_terminal(active.token, outcome)
+            active.terminal_event.set()
+            return outcome
+        outcome = VerificationOutcome(
+            status, active.safe_origin, active.attempt, page if status is VerificationStatus.COMPLETED else None
+        )
         with self._guard:
+            self._store_terminal_locked(active.token, outcome)
             self._active.pop(active.token, None)
             active.lifecycle = "released"
+            active.terminal_event.set()
         self._finish_ledger(
             active.token, active.ledger_key, active.reservation_id,
             consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
         )
-        return VerificationOutcome(status, active.safe_origin, active.attempt, page if status is VerificationStatus.COMPLETED else None)
+        return outcome
 
     def _handle_worker_failure(self, active: _ActiveVerification) -> VerificationOutcome:
+        terminal = self._terminal_outcome(active.token)
+        if terminal is not None:
+            return terminal
         with self._guard:
-            if self._active.get(active.token) is not active:
-                return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
+            changed = self._active.get(active.token) is not active
+        if changed:
+            terminal = self._terminal_outcome(active.token)
+            if terminal is not None:
+                return terminal
+            if active.terminal_event.wait(timeout=self.ttl.total_seconds()):
+                terminal = self._terminal_outcome(active.token)
+                if terminal is not None:
+                    return terminal
+            raise VerificationRequired("verification_in_progress")
         try:
             alive = active.worker.is_alive()
         except Exception:  # pragma: no cover - conservative fallback for a broken worker channel
             alive = True  # pragma: no cover
         if not alive:  # pragma: no cover - terminal callback normally owns confirmed crash cleanup
             self._worker_terminal(active.token, "crash", True)
-            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
+            terminal = self._terminal_outcome(active.token)
+            if terminal is not None:
+                return terminal
+            if active.terminal_event.wait(timeout=self.ttl.total_seconds()):
+                terminal = self._terminal_outcome(active.token)
+                if terminal is not None:
+                    return terminal
+            raise VerificationRequired("verification_in_progress")
         return self._finish(active, VerificationStatus.FAILED)
 
     def _worker_terminal(self, token: str, reason: str, closed_ok: bool) -> None:
+        status = {
+            "deadline": VerificationStatus.TIMED_OUT,
+            "cancelled": VerificationStatus.CANCELLED,
+            "crash": VerificationStatus.FAILED,
+        }.get(reason, VerificationStatus.FAILED)
         with self._guard:
             active = self._active.get(token)
             if active is None:
@@ -525,7 +627,9 @@ class VerificationCoordinator:
             consumed = active.lifecycle != "pending"
             active.lifecycle = "terminating"
         if not closed_ok:
-            self._quarantine(active, VerificationStatus.FAILED)
+            self._quarantine(active, status)
+            self._store_terminal(token, self._cleanup_outcome(active))
+            active.terminal_event.set()
             self._finish_ledger(token, active.ledger_key, active.reservation_id, consumed=consumed)
             return
         if reason == "crash":
@@ -536,11 +640,16 @@ class VerificationCoordinator:
         try:
             active.lease.close()
         except Exception:
-            self._quarantine(active, VerificationStatus.FAILED)
+            self._quarantine(active, status)
+            self._store_terminal(token, self._cleanup_outcome(active))
+            active.terminal_event.set()
         else:
+            outcome = VerificationOutcome(status, active.safe_origin, active.attempt)
             with self._guard:
+                self._store_terminal_locked(token, outcome)
                 self._active.pop(token, None)
                 active.lifecycle = "released"
+                active.terminal_event.set()
         self._finish_ledger(token, active.ledger_key, active.reservation_id, consumed=consumed)
 
     def _capacity_used(self) -> int:

@@ -34,7 +34,7 @@ class _Coordinator(Protocol):
     def continue_verification(self, token: str) -> VerificationOutcome: ...
     def cancel(self, token: str) -> VerificationOutcome: ...
     def expire_sweep(self) -> int: ...
-    def retry_cleanup(self, token: str) -> bool: ...
+    def retry_cleanup(self, token: str) -> bool | VerificationOutcome: ...
 
 
 class AdaptiveResult:
@@ -313,7 +313,15 @@ class AdaptiveBrowserService:
                     return self._terminal_result(token) or self._failure("verification_token_invalid")
             try:
                 if cleanup.operation == "visible":
-                    cleaned = self.verification_coordinator.retry_cleanup(token)
+                    retry_result = self.verification_coordinator.retry_cleanup(token)
+                    if isinstance(retry_result, VerificationOutcome):
+                        if retry_result.cleanup_required:
+                            return self._cleanup_required(token, cleanup.source)
+                        if cleanup.terminal_kind is not None:
+                            cleanup.terminal_kind = self._resolution_kind(retry_result.status)
+                        cleaned = True
+                    else:
+                        cleaned = retry_result
                 elif cleanup.operation == "profile":
                     assert cleanup.request_url is not None and cleanup.task_key is not None
                     self.browser_acquirer.deactivate_persistent_profile(cleanup.request_url, task_key=cleanup.task_key)
