@@ -658,7 +658,14 @@ def test_retryable_cleanup_returns_safe_result_and_manifest_contains_only_relati
     assert result.state == "pending" and result.cleanup_required and not result.completed
     assert result.error_code == "deletion_cleanup_retryable"
     assert str(tmp_path) not in repr(result)
-    assert set(result.to_safe_dict()) == {"job_id", "state", "completed", "cleanup_required", "error_code"}
+    assert set(result.to_safe_dict()) == {
+        "job_id",
+        "state",
+        "completed",
+        "cleanup_required",
+        "manual_cleanup_required",
+        "error_code",
+    }
     raw = storage.conn.execute("SELECT manifest_json FROM deletion_jobs WHERE id=?", (result.job_id,)).fetchone()[0]
     assert str(tmp_path) not in raw
     manifest = json.loads(raw)
@@ -772,6 +779,37 @@ def test_schema_migrates_old_absolute_delete_manifest_without_retaining_private_
         raw = reopened.conn.execute("SELECT manifest_json FROM deletion_jobs").fetchone()[0]
         assert str(tmp_path) not in raw
         assert json.loads(raw)["content_files"] == ["7/00001.txt"]
+    finally:
+        reopened.close()
+
+
+def test_irrecoverable_manifest_migration_stays_blocked_under_repeated_force(tmp_path: Path) -> None:
+    data = tmp_path / "private-workspace" / "data"
+    orphan = data / "contents" / "legacy" / "orphan.txt"
+    orphan.parent.mkdir(parents=True)
+    orphan.write_text("must remain for manual cleanup", encoding="utf-8")
+    storage = Storage(data / "crawler.db", data)
+    malformed = json.dumps({"content_files": [str(orphan)], "version": 1})
+    cursor = storage.conn.execute(
+        "INSERT INTO deletion_jobs(manifest_json,state,error_code) VALUES(?,'pending',NULL)", (malformed,)
+    )
+    job_id = int(cursor.lastrowid)
+    storage.conn.commit()
+    storage.close()
+
+    reopened = Storage(data / "crawler.db", data)
+    try:
+        for _ in range(3):
+            result = reopened.retry_deletion_job(job_id, force=True)
+            assert result.state == "blocked"
+            assert result.cleanup_required and result.manual_cleanup_required
+            assert result.error_code == "deletion_manifest_migration_blocked"
+            assert result.to_safe_dict()["manual_cleanup_required"] is True
+            assert orphan.read_text(encoding="utf-8") == "must remain for manual cleanup"
+            row = reopened.conn.execute(
+                "SELECT state,error_code,attempt_count FROM deletion_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            assert tuple(row) == ("blocked", "deletion_manifest_migration_blocked", 0)
     finally:
         reopened.close()
 

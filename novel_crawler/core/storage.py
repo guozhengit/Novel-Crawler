@@ -54,12 +54,17 @@ class BookDeletionResult:
     def cleanup_required(self) -> bool:
         return self.state != "completed"
 
+    @property
+    def manual_cleanup_required(self) -> bool:
+        return self.state == "blocked" and self.error_code == "deletion_manifest_migration_blocked"
+
     def to_safe_dict(self) -> dict[str, int | str | bool | None]:
         return {
             "job_id": self.job_id,
             "state": self.state,
             "completed": self.completed,
             "cleanup_required": self.cleanup_required,
+            "manual_cleanup_required": self.manual_cleanup_required,
             "error_code": self.error_code,
         }
 
@@ -620,8 +625,9 @@ class Storage:
             ).fetchone()
             if row is None:
                 return BookDeletionResult(job_id, "completed")
-            if row["state"] == "blocked" and not force:
-                return BookDeletionResult(job_id, "blocked", str(row["error_code"]) if row["error_code"] else None)
+            error_code = str(row["error_code"]) if row["error_code"] else None
+            if row["state"] == "blocked" and (not force or error_code == "deletion_manifest_migration_blocked"):
+                return BookDeletionResult(job_id, "blocked", error_code)
             if row["state"] == "blocked":
                 self.conn.execute(
                     "UPDATE deletion_jobs SET state='pending', error_code=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?",
