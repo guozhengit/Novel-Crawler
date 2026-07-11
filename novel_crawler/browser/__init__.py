@@ -7,6 +7,7 @@ from .driver import (
     BrowserRequestPolicy,
     DefaultPlaywrightDriver,
     Driver,
+    DriverLaunchFailure,
     RequestDecision,
 )
 from .models import VerificationOutcome, VerificationStatus, VerificationTicket
@@ -36,6 +37,7 @@ __all__ = [
     "BrowserSessionStore",
     "DefaultPlaywrightDriver",
     "Driver",
+    "DriverLaunchFailure",
     "PinnedSocksProxy",
     "ProxyError",
     "RequestDecision",

@@ -21,7 +21,7 @@ from novel_crawler.browser.coordinator import (
     VerificationRequired,
     _AttemptLedger,
 )
-from novel_crawler.browser.driver import BrowserPageSnapshot
+from novel_crawler.browser.driver import BrowserPageSnapshot, DriverLaunchFailure
 from novel_crawler.browser.models import VerificationStatus
 from novel_crawler.browser.sessions import BrowserSessionLease, BrowserSessionStore, SessionLockTimeout
 
@@ -587,6 +587,89 @@ def test_lease_close_failure_keeps_coordinator_capacity_until_retry(
     with pytest.raises(VerificationRequired, match="verification_capacity"):
         coordinator.begin("https://other.test/a", task_key="other")
     assert coordinator.retry_cleanup(ticket.token)
+
+
+def test_terminal_ledger_failure_never_precedes_lease_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    coordinator = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    monkeypatch.setattr(coordinator._ledger, "finish", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk")))
+    assert coordinator.cancel(ticket.token).status is VerificationStatus.CANCELLED
+    with sessions.acquire("example.test", timeout=0.1):
+        pass
+    assert coordinator._ledger_repairs
+
+
+def test_expire_sweep_retries_deferred_ledger_finish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sessions = BrowserSessionStore(tmp_path)
+    coordinator = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    original = coordinator._ledger.finish
+    failures = 1
+
+    def fail_once(*args: object, **kwargs: object) -> None:
+        nonlocal failures
+        if failures:
+            failures -= 1
+            raise OSError("disk")
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(coordinator._ledger, "finish", fail_once)
+    coordinator.cancel(ticket.token)
+    assert coordinator._ledger_repairs
+    coordinator.expire_sweep()
+    assert not coordinator._ledger_repairs
+
+
+def test_begin_failure_releases_resources_even_when_ledger_finish_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class NavigateCrash(FakeContext):
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            raise RuntimeError("navigation failed")
+
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    coordinator = VerificationCoordinator(sessions, driver=FakeDriver([NavigateCrash([], [])]), safety_policy=PUBLIC_POLICY)
+    monkeypatch.setattr(coordinator._ledger, "finish", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(VerificationRequired, match="verification_start_failed"):
+        coordinator.begin("https://example.test/a", task_key="download")
+    with sessions.acquire("example.test", timeout=0.1):
+        pass
+    assert coordinator._ledger_repairs
+
+
+def test_partial_launch_cleanup_is_quarantined_until_retry_releases_lease(tmp_path: Path) -> None:
+    class Cleanup:
+        attempts = 1
+
+        def close(self) -> None:
+            self.attempts += 1
+
+    cleanup = Cleanup()
+
+    class PartialDriver:
+        def launch(self, **kwargs: object) -> object:
+            raise DriverLaunchFailure(closed_ok=False, cleanup=cleanup)
+
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    coordinator = VerificationCoordinator(sessions, driver=PartialDriver(), max_active=1, safety_policy=PUBLIC_POLICY)
+    with pytest.raises(VerificationRequired, match="verification_start_failed") as caught:
+        coordinator.begin("https://example.test/a", task_key="download")
+    assert caught.value.ticket is not None
+    with pytest.raises(SessionLockTimeout):
+        sessions.acquire("example.test", timeout=0.01)
+    assert coordinator.retry_cleanup(caught.value.ticket.token)
+    assert cleanup.attempts == 2
+    with sessions.acquire("example.test", timeout=0.1):
+        pass
 
 
 def test_browser_acquirer_quarantines_failed_headless_cleanup_with_retry_token(tmp_path: Path) -> None:

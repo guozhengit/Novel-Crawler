@@ -26,7 +26,8 @@ from .models import VerificationOutcome, VerificationStatus, VerificationTicket
 from .sessions import BrowserSessionLease, BrowserSessionStore, _DomainLock
 
 _TASK_KEY = re.compile(r"[a-z][a-z0-9_.-]{0,63}")
-_LEDGER_LIMIT = 64 * 1024
+_LEDGER_RECORD_BYTES = 512
+_REPAIR_LIMIT = 1024
 
 
 class HttpAcquirer(Protocol):
@@ -67,6 +68,7 @@ class _ActiveVerification:
     lease: BrowserSessionLease = field(repr=False)
     worker: BrowserContextWorker = field(repr=False)
     attempt: int = 0
+    lifecycle: str = "pending"
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -106,6 +108,7 @@ class _AttemptLedger:
         self._lock_timeout = sessions._lock_timeout
         self._max_keys = max_keys
         self._max_records = max_records
+        self._byte_limit = max(4096, max_records * _LEDGER_RECORD_BYTES + max_keys * 96)
         lock = _DomainLock(self._lock_path, self._lock_timeout, self._io)
         try:
             lock.acquire()
@@ -185,7 +188,7 @@ class _AttemptLedger:
     def _read(self) -> tuple[dict[str, list[dict[str, str]]], bool]:
         if not self._ledger_path.exists():
             return {}, False
-        raw = json.loads(self._io.read_bounded(self._ledger_path, _LEDGER_LIMIT))
+        raw = json.loads(self._io.read_bounded(self._ledger_path, self._byte_limit))
         if not isinstance(raw, dict) or any(not re.fullmatch(r"[0-9a-f]{64}", str(key)) for key in raw):
             raise ValueError  # pragma: no cover - persistent storage tamper defense
         values: dict[str, list[dict[str, str]]] = {}
@@ -227,7 +230,7 @@ class _AttemptLedger:
     def _write(self) -> None:
         try:
             payload = json.dumps(self._values, sort_keys=True, separators=(",", ":")).encode("ascii")
-            if len(payload) > _LEDGER_LIMIT:  # pragma: no cover - capacity prevents practical growth
+            if len(payload) > self._byte_limit:  # pragma: no cover - capacity prevents practical growth
                 raise ValueError  # pragma: no cover
             self._io.atomic_write(self._ledger_path, payload)
         except Exception:  # pragma: no cover - RegistryIO fault injection is covered in its suite
@@ -270,6 +273,8 @@ class VerificationCoordinator:
         self.clock = clock or (lambda: datetime.now(UTC))
         self._active: dict[str, _ActiveVerification] = {}
         self._failed_closures: dict[str, _ActiveVerification] = {}
+        self._early_terminal: dict[str, tuple[str, bool]] = {}
+        self._ledger_repairs: dict[str, tuple[str, str, bool]] = {}
         self._reserved = 0
         self._guard = threading.Lock()
         self._ledger = _AttemptLedger(sessions, self.clock, attempt_ttl)
@@ -287,14 +292,15 @@ class VerificationCoordinator:
         safe_origin = redact_url(url)
         ledger_key = self._ledger.opaque_key(safe_origin, task_key)
         with self._guard:
-            if len(self._active) + len(self._failed_closures) + self._reserved >= self.max_active:
+            if self._capacity_used() + self._reserved >= self.max_active:
                 raise VerificationRequired("verification_capacity")
             self._reserved += 1
-            try:
-                reservation_id = self._ledger.reserve(ledger_key, self.max_attempts)
-            except Exception:
+        try:
+            reservation_id = self._ledger.reserve(ledger_key, self.max_attempts)
+        except Exception:
+            with self._guard:
                 self._reserved -= 1
-                raise
+            raise
         lease: BrowserSessionLease | None = None
         worker: BrowserContextWorker | None = None
         token = secrets.token_urlsafe(32)
@@ -309,43 +315,44 @@ class VerificationCoordinator:
                 ttl=self.ttl.total_seconds(),
                 terminal_callback=lambda reason, closed_ok: self._worker_terminal(token, reason, closed_ok),
             )
-            worker.start()
-            worker.navigate(url)
             active = _ActiveVerification(
                 token, url, safe_origin, expires_at, domain, ledger_key, reservation_id, lease, worker
             )
             with self._guard:
                 self._reserved -= 1
                 self._active[token] = active
+                early = self._early_terminal.pop(token, None)
+            if early is not None:
+                self._worker_terminal(token, *early)
+                raise RuntimeError("browser_worker_terminal")
+            worker.start()
+            worker.navigate(url)
+            with self._guard:
+                if active.lifecycle != "pending":
+                    raise RuntimeError("browser_worker_terminal")
+                active.lifecycle = "active"
             return VerificationTicket(token, VerificationStatus.WAITING, safe_origin, expires_at, 0)
         except Exception:
-            close_confirmed = worker is None
-            lease_close_failed = False
-            if worker is not None:
-                try:
-                    worker.close()
-                    close_confirmed = True
-                except Exception:
-                    close_confirmed = False
-            if lease is not None and close_confirmed:
-                try:
-                    lease.close()
-                except Exception:  # pragma: no cover - covered through normal finish lease quarantine
-                    lease_close_failed = True  # pragma: no cover
-            with self._guard:
-                self._reserved -= 1
-                self._ledger.finish(ledger_key, reservation_id, consumed=False)
-                if (not close_confirmed or lease_close_failed) and lease is not None and worker is not None:
+            if lease is None or worker is None:
+                with self._guard:
+                    self._reserved -= 1
+                if lease is not None:
                     try:
-                        lease.mark_stale()
-                    except Exception:  # pragma: no cover - quarantine still retains the exclusive lease
-                        pass  # pragma: no cover
-                    failed = _ActiveVerification(
-                        token, url, safe_origin, expires_at, domain, ledger_key, reservation_id, lease, worker
-                    )
-                    self._failed_closures[token] = failed
-                    ticket = VerificationTicket(token, VerificationStatus.FAILED, safe_origin, expires_at, 0)
-                    raise VerificationRequired("verification_start_failed", ticket) from None
+                        lease.close()
+                    except Exception:
+                        pass
+                self._finish_ledger(token, ledger_key, reservation_id, consumed=False)
+                raise VerificationRequired("verification_start_failed") from None
+            with self._guard:
+                registered = self._active.get(token) is active
+                quarantined = token in self._failed_closures
+            if registered and not quarantined and active.lifecycle in {"pending", "active"}:
+                self._finish(active, VerificationStatus.FAILED, ledger_consumed=False)
+            with self._guard:
+                quarantined = token in self._failed_closures
+            if quarantined:
+                ticket = VerificationTicket(token, VerificationStatus.FAILED, safe_origin, expires_at, 0)
+                raise VerificationRequired("verification_start_failed", ticket) from None
             raise VerificationRequired("verification_start_failed") from None
 
     def continue_verification(self, token: str) -> VerificationOutcome:
@@ -402,12 +409,18 @@ class VerificationCoordinator:
                 return False
             with self._guard:
                 self._failed_closures.pop(token, None)
+                self._active.pop(token, None)
+                active.lifecycle = "released"
             return True
 
     def expire_sweep(self) -> int:
+        self._retry_ledger_repairs()
         now = self.clock()
         with self._guard:
-            candidates = [active for active in self._active.values() if now >= active.expires_at]
+            candidates = [
+                active for active in self._active.values()
+                if active.lifecycle == "active" and now >= active.expires_at
+            ]
         expired = 0
         for active in candidates:
             if active.lock.acquire(blocking=False):
@@ -426,7 +439,7 @@ class VerificationCoordinator:
             raise VerificationRequired("verification_token_invalid")
         with self._guard:
             active = self._active.get(token)
-        if active is None:
+        if active is None or active.lifecycle != "active":
             raise VerificationRequired("verification_token_invalid")
         return active
 
@@ -435,32 +448,38 @@ class VerificationCoordinator:
         active: _ActiveVerification,
         status: VerificationStatus,
         page: AcquiredPage | None = None,
+        *,
+        ledger_consumed: bool | None = None,
     ) -> VerificationOutcome:
-        self._ledger.finish(
-            active.ledger_key,
-            active.reservation_id,
-            consumed=status is not VerificationStatus.COMPLETED,
-        )
+        with self._guard:
+            if active.lifecycle in {"terminating", "quarantined", "released"}:
+                return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
+            active.lifecycle = "terminating"
         try:
             active.worker.close()
         except Exception:
-            try:
-                active.lease.mark_stale()
-            except Exception:  # pragma: no cover - lease metadata fault injection is covered separately
-                pass  # pragma: no cover
-            with self._guard:
-                self._active.pop(active.token, None)
-                self._failed_closures[active.token] = active
+            self._quarantine(active)
+            self._finish_ledger(
+                active.token, active.ledger_key, active.reservation_id,
+                consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
+            )
             return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
         try:
             active.lease.close()
         except Exception:
-            with self._guard:
-                self._active.pop(active.token, None)
-                self._failed_closures[active.token] = active
+            self._quarantine(active)
+            self._finish_ledger(
+                active.token, active.ledger_key, active.reservation_id,
+                consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
+            )
             return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
         with self._guard:
             self._active.pop(active.token, None)
+            active.lifecycle = "released"
+        self._finish_ledger(
+            active.token, active.ledger_key, active.reservation_id,
+            consumed=(status is not VerificationStatus.COMPLETED) if ledger_consumed is None else ledger_consumed,
+        )
         return VerificationOutcome(status, active.safe_origin, active.attempt, page if status is VerificationStatus.COMPLETED else None)
 
     def _handle_worker_failure(self, active: _ActiveVerification) -> VerificationOutcome:
@@ -471,43 +490,73 @@ class VerificationCoordinator:
             alive = active.worker.is_alive()
         except Exception:  # pragma: no cover - conservative fallback for a broken worker channel
             alive = True  # pragma: no cover
-        if not alive:  # pragma: no cover - terminal callback owns confirmed crash cleanup
-            self._ledger.finish(active.ledger_key, active.reservation_id, consumed=True)
-            try:
-                active.lease.mark_stale()
-            except Exception:  # pragma: no cover - stale marking failure remains privacy-safe
-                pass  # pragma: no cover
-            try:
-                active.lease.close()
-            except Exception:  # pragma: no cover - dead process permits lock release despite metadata failure
-                pass  # pragma: no cover
-            with self._guard:
-                self._active.pop(active.token, None)
-            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)  # pragma: no cover
+        if not alive:  # pragma: no cover - terminal callback normally owns confirmed crash cleanup
+            self._worker_terminal(active.token, "crash", True)
+            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
         return self._finish(active, VerificationStatus.FAILED)
 
     def _worker_terminal(self, token: str, reason: str, closed_ok: bool) -> None:
         with self._guard:
-            active = self._active.pop(token, None)
+            active = self._active.get(token)
             if active is None:
+                if len(self._early_terminal) >= _REPAIR_LIMIT:
+                    self._early_terminal.pop(next(iter(self._early_terminal)))
+                self._early_terminal[token] = (reason, closed_ok)
                 return
-            self._ledger.finish(active.ledger_key, active.reservation_id, consumed=True)
-            if not closed_ok:
-                try:
-                    active.lease.mark_stale()
-                except Exception:  # pragma: no cover - stale metadata fault remains quarantined
-                    pass  # pragma: no cover
-                self._failed_closures[token] = active
+            if active.lifecycle in {"terminating", "quarantined", "released"}:
                 return
-            if reason == "crash":
-                try:
-                    active.lease.mark_stale()
-                except Exception:  # pragma: no cover - stale metadata fault remains quarantined
-                    pass  # pragma: no cover
+            consumed = active.lifecycle != "pending"
+            active.lifecycle = "terminating"
+        if not closed_ok:
+            self._quarantine(active)
+            self._finish_ledger(token, active.ledger_key, active.reservation_id, consumed=consumed)
+            return
+        if reason == "crash":
             try:
-                active.lease.close()
-            except Exception:  # pragma: no cover - normal finish covers retryable lease failure
-                self._failed_closures[token] = active  # pragma: no cover
+                active.lease.mark_stale()
+            except Exception:
+                pass
+        try:
+            active.lease.close()
+        except Exception:
+            self._quarantine(active)
+        else:
+            with self._guard:
+                self._active.pop(token, None)
+                active.lifecycle = "released"
+        self._finish_ledger(token, active.ledger_key, active.reservation_id, consumed=consumed)
+
+    def _capacity_used(self) -> int:
+        return len(set(self._active) | set(self._failed_closures))
+
+    def _quarantine(self, active: _ActiveVerification) -> None:
+        try:
+            active.lease.mark_stale()
+        except Exception:
+            pass
+        with self._guard:
+            active.lifecycle = "quarantined"
+            self._failed_closures[active.token] = active
+
+    def _finish_ledger(self, token: str, key: str, reservation_id: str, *, consumed: bool) -> None:
+        try:
+            self._ledger.finish(key, reservation_id, consumed=consumed)
+        except Exception:
+            with self._guard:
+                if len(self._ledger_repairs) >= _REPAIR_LIMIT and token not in self._ledger_repairs:
+                    self._ledger_repairs.pop(next(iter(self._ledger_repairs)))
+                self._ledger_repairs[token] = (key, reservation_id, consumed)
+
+    def _retry_ledger_repairs(self) -> None:
+        with self._guard:
+            repairs = tuple(self._ledger_repairs.items())
+        for token, (key, reservation_id, consumed) in repairs:
+            try:
+                self._ledger.finish(key, reservation_id, consumed=consumed)
+            except Exception:
+                continue
+            with self._guard:
+                self._ledger_repairs.pop(token, None)
 
 
 class BrowserAcquirer:

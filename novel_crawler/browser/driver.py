@@ -145,6 +145,55 @@ class Driver(Protocol):
     def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> BrowserContext: ...
 
 
+class LaunchCleanup(Protocol):
+    def close(self) -> None: ...
+
+
+class DriverLaunchFailure(RuntimeError):
+    """Safe launch error retaining any resources that still require cleanup."""
+
+    def __init__(self, *, closed_ok: bool, cleanup: LaunchCleanup | None = None) -> None:
+        self.closed_ok = closed_ok
+        self.cleanup = cleanup
+        super().__init__("browser_launch_failed")
+
+    def __repr__(self) -> str:
+        return "DriverLaunchFailure('browser_launch_failed')"
+
+
+class _PartialLaunchCleanup:
+    def __init__(self, context: Any, playwright: Any, proxy: PinnedSocksProxy) -> None:
+        self._context = context
+        self._playwright = playwright
+        self._proxy: PinnedSocksProxy | None = proxy
+
+    def close(self) -> None:
+        failure: Exception | None = None
+        if self._context is not None:
+            try:
+                self._context.close()
+            except Exception as exc:
+                failure = exc
+            else:
+                self._context = None
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception as exc:
+                failure = failure or exc
+            else:
+                self._playwright = None
+        if self._proxy is not None:
+            try:
+                self._proxy.close()
+            except Exception as exc:
+                failure = failure or exc
+            else:
+                self._proxy = None
+        if failure is not None:
+            raise RuntimeError("browser_launch_cleanup_failed") from None
+
+
 class _PlaywrightContext:
     def __init__(
         self,
@@ -211,7 +260,50 @@ class _PlaywrightContext:
             raise RuntimeError("browser_navigation_blocked")
         self._set_remaining_timeout()
         outer_length = self._page.evaluate(
-            "document.documentElement ? new TextEncoder().encode(document.documentElement.outerHTML).byteLength : 0"
+            """limit => {
+                const root = document.documentElement;
+                if (!root) return 0;
+                const encoder = new TextEncoder();
+                let total = 0;
+                const add = value => {
+                    total += encoder.encode(value).byteLength;
+                    return total <= limit;
+                };
+                const addChunks = (value, mode) => {
+                    for (let offset = 0; offset < value.length; offset += 4096) {
+                        let chunk = value.slice(offset, offset + 4096);
+                        if (mode === 'text') {
+                            chunk = chunk.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+                        } else if (mode === 'attribute') {
+                            chunk = chunk.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+                        }
+                        if (!add(chunk)) return false;
+                    }
+                    return true;
+                };
+                const walker = document.createTreeWalker(
+                    root,
+                    NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT | NodeFilter.SHOW_COMMENT
+                );
+                let node = root;
+                while (node) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (!add('<') || !add(node.tagName)) return limit + 1;
+                        for (const attribute of node.attributes) {
+                            if (!add(' ') || !add(attribute.name) || !add('=\"')) return limit + 1;
+                            if (!addChunks(attribute.value, 'attribute') || !add('\"')) return limit + 1;
+                        }
+                        if (!add('>') || !add('</') || !add(node.tagName) || !add('>')) return limit + 1;
+                    } else if (node.nodeType === Node.TEXT_NODE) {
+                        if (!addChunks(node.nodeValue || '', 'text')) return limit + 1;
+                    } else if (node.nodeType === Node.COMMENT_NODE) {
+                        if (!add('<!--') || !addChunks(node.nodeValue || '', 'comment') || !add('-->')) return limit + 1;
+                    }
+                    node = walker.nextNode();
+                }
+                return total;
+            }""",
+            self._max_body_bytes,
         )
         if not isinstance(outer_length, int) or outer_length > self._max_body_bytes:
             raise ValueError("browser_body_too_large")
@@ -323,15 +415,12 @@ class DefaultPlaywrightDriver:
                 deadline=deadline,
             )
         except Exception:
-            if context is not None:
-                try:
-                    context.close()
-                except Exception:  # pragma: no cover - best-effort cleanup of partial Playwright startup
-                    pass  # pragma: no cover
-            if playwright is not None:
-                playwright.stop()
-            proxy.close()
-            raise
+            cleanup = _PartialLaunchCleanup(context, playwright, proxy)
+            try:
+                cleanup.close()
+            except Exception:
+                raise DriverLaunchFailure(closed_ok=False, cleanup=cleanup) from None
+            raise DriverLaunchFailure(closed_ok=True) from None
 
 
 class BrowserContextWorker:
@@ -362,6 +451,7 @@ class BrowserContextWorker:
         self._expired = False
         self._terminal_callback = terminal_callback
         self._terminal_notified = False
+        self._partial_cleanup: LaunchCleanup | None = None
 
     @property
     def deadline(self) -> float:
@@ -381,6 +471,11 @@ class BrowserContextWorker:
         return self._submit("capture")
 
     def close(self) -> None:
+        if self._partial_cleanup is not None:
+            self._partial_cleanup.close()
+            self._partial_cleanup = None
+            self._closed = True
+            return
         if self._closed:
             return
         self._submit("close", allow_expired=True)
@@ -408,10 +503,16 @@ class BrowserContextWorker:
                 headless=self._headless,
                 policy=self._policy,
             )
-        except Exception as exc:
+        except DriverLaunchFailure as exc:
+            self._partial_cleanup = exc.cleanup
+            self._closed = exc.closed_ok
+            self._notify_terminal("crash", exc.closed_ok)
             self._ready.set_exception(exc)
+            return
+        except Exception as exc:
             self._closed = True
             self._notify_terminal("crash", True)
+            self._ready.set_exception(exc)
             return
         self._ready.set_result(None)
         while True:

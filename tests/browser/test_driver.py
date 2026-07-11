@@ -15,6 +15,7 @@ from novel_crawler.browser.driver import (
     BrowserPageSnapshot,
     BrowserRequestPolicy,
     DefaultPlaywrightDriver,
+    DriverLaunchFailure,
     RequestDecision,
     _PlaywrightContext,
 )
@@ -110,8 +111,10 @@ class FakePage:
     def content(self) -> str:
         return self.content_value
 
-    def evaluate(self, expression: str) -> int:
-        assert "TextEncoder" in expression and "byteLength" in expression
+    def evaluate(self, expression: str, limit: int | None = None) -> int:
+        assert "TextEncoder" in expression and "TreeWalker" in expression
+        assert "outerHTML" not in expression
+        assert limit is not None
         return len(self.content_value.encode())
 
 
@@ -124,6 +127,8 @@ class FakeRawContext:
         self.web_socket_callback: object | None = None
         self.init_scripts: list[str] = []
         self.events: dict[str, object] = {}
+        self.default_timeout = 0
+        self.navigation_timeout = 0
 
     def route(self, pattern: str, callback: object) -> None:
         assert pattern == "**/*"
@@ -143,6 +148,12 @@ class FakeRawContext:
 
     def on(self, event: str, callback: object) -> None:
         self.events[event] = callback
+
+    def set_default_timeout(self, milliseconds: int) -> None:
+        self.default_timeout = milliseconds
+
+    def set_default_navigation_timeout(self, milliseconds: int) -> None:
+        self.navigation_timeout = milliseconds
 
 
 def test_playwright_context_routes_every_request_and_captures_navigation() -> None:
@@ -214,10 +225,61 @@ def test_default_driver_closes_partial_context_when_route_setup_crashes(monkeypa
     monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
     guard = BrowserRequestPolicy(public_policy())
     guard.lock("https://example.test/start")
-    with pytest.raises(RuntimeError, match="route crashed"):
+    with pytest.raises(DriverLaunchFailure, match="browser_launch_failed"):
         DefaultPlaywrightDriver().launch(user_data_dir=tmp_path, headless=True, policy=guard)
     assert raw.closed
     assert runtime.stopped
+
+
+def test_default_driver_retains_every_failed_partial_resource_for_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class RetryContext(FakeRawContext):
+        close_attempts = 0
+
+        def close(self) -> None:
+            self.close_attempts += 1
+            if self.close_attempts == 1:
+                raise RuntimeError("context close failed")
+            self.closed = True
+
+    raw = RetryContext(fail_route=True)
+    stop_attempts = 0
+
+    def stop() -> None:
+        nonlocal stop_attempts
+        stop_attempts += 1
+        if stop_attempts == 1:
+            raise RuntimeError("playwright stop failed")
+
+    runtime = SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=lambda **kwargs: raw), stop=stop)
+    manager = SimpleNamespace(start=lambda: runtime)
+    package = ModuleType("playwright")
+    sync_api = ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = lambda: manager  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "playwright", package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    class FakeProxy:
+        proxy_url = "socks5://127.0.0.1:4321"
+        closed = 0
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed += 1
+
+    proxy = FakeProxy()
+    monkeypatch.setattr("novel_crawler.browser.driver.PinnedSocksProxy", lambda *args, **kwargs: proxy)
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/start")
+    with pytest.raises(DriverLaunchFailure) as caught:
+        DefaultPlaywrightDriver().launch(user_data_dir=tmp_path, headless=True, policy=guard)
+    assert not caught.value.closed_ok and caught.value.cleanup is not None
+    assert proxy.closed == 1
+    caught.value.cleanup.close()
+    assert raw.closed and stop_attempts == 2
 
 
 def test_default_driver_uses_pinned_proxy_and_locked_down_chromium_options(
@@ -267,6 +329,8 @@ def test_default_driver_uses_pinned_proxy_and_locked_down_chromium_options(
     assert "--dns-prefetch-disable" in args
     assert "--disable-preconnect" in args
     assert raw.init_scripts and "unregister" in raw.init_scripts[0]
+    context.capture()
+    assert raw.default_timeout > 0 and raw.navigation_timeout > 0
     context.close()
 
 
@@ -354,6 +418,36 @@ def test_capture_rejects_dom_before_materializing_content() -> None:
     with pytest.raises(ValueError, match="browser_body_too_large"):
         context.capture()
     assert content_calls == 0
+
+
+def test_worker_retries_partial_launch_cleanup_and_reports_real_state(tmp_path: Path) -> None:
+    terminal: list[tuple[str, bool]] = []
+
+    class PartialCleanup:
+        attempts = 1
+
+        def close(self) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("partial cleanup failed")
+
+    cleanup = PartialCleanup()
+
+    class Broken:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> object:
+            raise DriverLaunchFailure(closed_ok=False, cleanup=cleanup)
+
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    worker = BrowserContextWorker(
+        Broken(), user_data_dir=tmp_path, headless=True, policy=guard, ttl=1,
+        terminal_callback=lambda reason, ok: terminal.append((reason, ok)),
+    )
+    with pytest.raises(DriverLaunchFailure, match="browser_launch_failed"):
+        worker.start()
+    assert terminal == [("crash", False)]
+    worker.close()
+    assert cleanup.attempts == 2
 
 
 def test_capture_precheck_uses_encoded_byte_length_not_character_count() -> None:
