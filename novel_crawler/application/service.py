@@ -110,6 +110,10 @@ class ApplicationService:
         options: CrawlOptions | dict[str, Any] | None = None,
     ) -> TaskView:
         parsed = CrawlOptions.parse(options)
+        if parsed.chase:
+            raise ApplicationError("chase_unsupported")
+        if parsed.concurrency != 1:
+            raise ApplicationError("concurrency_unsupported")
         with self._lock:
             self._ensure_open()
             try:

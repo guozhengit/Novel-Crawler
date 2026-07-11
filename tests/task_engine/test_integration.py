@@ -625,11 +625,6 @@ def test_controller_handoff_runs_real_executor_to_ready_and_completed(tmp_path: 
             controller.bind_scheduler(executor.schedule_active)
             assert executor.submit(task.task_id)
             deadline = time.monotonic() + 3
-            while time.monotonic() < deadline and repo.get_task(task.task_id).status is not TaskStatus.READY:
-                time.sleep(0.01)
-            assert repo.get_task(task.task_id).status is TaskStatus.READY
-            assert executor.submit(task.task_id)
-            deadline = time.monotonic() + 3
             while time.monotonic() < deadline and repo.get_task(task.task_id).status is not TaskStatus.COMPLETED:
                 time.sleep(0.01)
             assert repo.get_task(task.task_id).status is TaskStatus.COMPLETED

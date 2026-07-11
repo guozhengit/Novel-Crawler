@@ -153,14 +153,14 @@ def test_create_validates_and_persists_only_bounded_safe_options(app) -> None:
     service, repo, executor, *_ = app
     view = service.create_crawl_task(
         "https://example.com/catalog?secret=query",
-        CrawlOptions(start=2, count=20, max_chapters=10, concurrency=4, export=False, export_format="epub", chase=True),
+        CrawlOptions(start=2, count=20, max_chapters=10, concurrency=1, export=False, export_format="epub", chase=False),
     )
 
     assert isinstance(view, TaskView)
     assert executor.submitted == [view.task_id]
     record = repo.get_task(view.task_id)
     assert record.metadata == {
-        "crawl": {"chase": True, "concurrency": 4, "count": 20, "export": False, "export_format": "epub", "max_chapters": 10, "start": 2}
+        "crawl": {"chase": False, "concurrency": 1, "count": 20, "export": False, "export_format": "epub", "max_chapters": 10, "start": 2}
     }
     assert "example.com" not in repr(view)
     assert "secret" not in str(view.to_safe_dict())
@@ -370,6 +370,19 @@ def test_source_url_and_query_controls_are_mapped_to_stable_codes(app) -> None:
         service.pause_task("missing")
     assert missing_control.value.code == "task_not_found"
     assert repo.list_tasks() == []
+
+
+@pytest.mark.parametrize(
+    ("options", "code"),
+    [({"chase": True}, "chase_unsupported"), ({"concurrency": 2}, "concurrency_unsupported")],
+)
+def test_create_rejects_options_the_pipeline_cannot_honor(app, options, code) -> None:
+    service, repo, executor, *_ = app
+    with pytest.raises(ApplicationError) as caught:
+        service.create_crawl_task("https://example.com/book", options)
+    assert caught.value.code == code
+    assert repo.list_tasks() == []
+    assert executor.submitted == []
 
 
 def test_closed_executor_compensates_and_resume_maps_capacity_errors(app) -> None:

@@ -11,6 +11,7 @@ from novel_crawler.task_engine import (
     CheckpointNotFound,
     ExecutorClosed,
     ExecutorQueueFull,
+    RecoverableTaskError,
     TaskExecutionContext,
     TaskInputError,
     TaskRepository,
@@ -652,7 +653,7 @@ def test_schedule_active_runs_preclaimed_status_and_deduplicates(tmp_path: Path)
         ) as executor:
             assert executor.schedule_active(task.task_id) is True
             assert executor.schedule_active(task.task_id) is False
-            _wait_for_status(repository, task.task_id, TaskStatus.READY)
+            _wait_for_status(repository, task.task_id, TaskStatus.CRAWLING)
         assert calls == [task.task_id]
         assert validating.status is TaskStatus.VALIDATING
 
@@ -701,3 +702,44 @@ def test_generic_resume_cannot_bypass_cleanup_gate(tmp_path: Path) -> None:
                 assert resumed.version == gated.version
                 assert resumed.cleanup_required is True
                 assert resumed.status is TaskStatus.RECOVERABLE_FAILED
+
+
+def test_ready_result_is_immediately_claimed_for_crawling(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "ready-handoff.db") as repository:
+        seen: list[TaskStatus] = []
+        handlers = {
+            TaskStatus.PROBING: lambda _context, _task: TaskStatus.VALIDATING,
+            TaskStatus.VALIDATING: lambda _context, _task: TaskStatus.READY,
+            TaskStatus.CRAWLING: lambda _context, task: seen.append(task.status) or TaskStatus.COMPLETED,
+        }
+        with BackgroundTaskExecutor(repository, handlers, max_workers=1) as executor:
+            task = repository.create_task("https://example.test/book")
+            assert executor.submit(task.task_id)
+            _wait_for_status(repository, task.task_id, TaskStatus.COMPLETED)
+        assert seen == [TaskStatus.CRAWLING]
+
+
+def test_recover_and_schedule_supports_two_phase_startup(tmp_path: Path) -> None:
+    with TaskRepository(tmp_path / "two-phase.db") as repository:
+        task = repository.create_task("https://example.test/book")
+        with BackgroundTaskExecutor(
+            repository,
+            {TaskStatus.PROBING: lambda _context, _task: TaskStatus.TERMINAL_FAILED},
+            max_workers=1,
+            recover_on_start=False,
+        ) as executor:
+            assert repository.get_task(task.task_id).status is TaskStatus.CREATED
+            assert executor.recover_and_schedule() == 1
+            _wait_for_status(repository, task.task_id, TaskStatus.TERMINAL_FAILED)
+
+
+def test_handler_can_report_a_stable_recoverable_failure_code(tmp_path: Path) -> None:
+    def protected(_context, _task):
+        raise RecoverableTaskError("verification_required")
+
+    with TaskRepository(tmp_path / "recoverable-code.db") as repository:
+        with BackgroundTaskExecutor(repository, {TaskStatus.PROBING: protected}, max_workers=1) as executor:
+            task = repository.create_task("https://example.test/book")
+            executor.submit(task.task_id)
+            _wait_for_status(repository, task.task_id, TaskStatus.RECOVERABLE_FAILED)
+            assert repository.get_task(task.task_id).error_code == "verification_required"

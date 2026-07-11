@@ -50,6 +50,13 @@ class TerminalTaskError(TaskExecutorError):
         self.error_code = error_code
 
 
+class RecoverableTaskError(TerminalTaskError):
+    """Request a recoverable transition with a presentation-safe error code."""
+
+    def __repr__(self) -> str:
+        return f"RecoverableTaskError(error_code={self.error_code!r})"
+
+
 @dataclass
 class TaskExecutionContext:
     repository: TaskRepository = field(repr=False)
@@ -113,6 +120,7 @@ class BackgroundTaskExecutor:
         self._scheduled_versions: dict[str, int] = {}
         self._pending_resumes: dict[str, tuple[bool, TaskStatus]] = {}
         self._startup_deferred_count = 0
+        self._startup_recovered = False
         self._closing = threading.Event()
         self._threads = [
             threading.Thread(
@@ -122,20 +130,10 @@ class BackgroundTaskExecutor:
             )
             for index in range(max_workers)
         ]
-        if recover_on_start:
-            self.recover_startup()
         for thread in self._threads:
             thread.start()
         if recover_on_start:
-            safe_tasks = self._repository.list_tasks(
-                statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000
-            )
-            for index, task in enumerate(safe_tasks):
-                try:
-                    self.submit(task.task_id)
-                except ExecutorQueueFull:
-                    self._startup_deferred_count = len(safe_tasks) - index
-                    break
+            self.recover_and_schedule()
 
     def __enter__(self) -> BackgroundTaskExecutor:
         return self
@@ -256,6 +254,24 @@ class BackgroundTaskExecutor:
             if changed == 0:
                 break
         return recovered
+
+    def recover_and_schedule(self) -> int:
+        """Recover interrupted work, then schedule safe tasks after collaborators are bound."""
+        with self._lock:
+            if self._startup_recovered:
+                return 0
+            self._startup_recovered = True
+        self.recover_startup()
+        safe_tasks = self._repository.list_tasks(statuses={TaskStatus.CREATED, TaskStatus.READY}, limit=1000)
+        scheduled = 0
+        for index, task in enumerate(safe_tasks):
+            try:
+                if self.submit(task.task_id):
+                    scheduled += 1
+            except ExecutorQueueFull:
+                self._startup_deferred_count = len(safe_tasks) - index
+                break
+        return scheduled
 
     def shutdown(self, *, wait: bool = True, timeout: float | None = None) -> bool:
         if timeout is not None and timeout < 0:
@@ -384,7 +400,18 @@ class BackgroundTaskExecutor:
                     reason="executor_handler_completed",
                 )
                 context.expected_task_version = current.version
+                if current.status is TaskStatus.READY:
+                    current = self._repository.transition(
+                        current.task_id,
+                        TaskStatus.CRAWLING,
+                        expected_version=current.version,
+                        reason="executor_ready_handoff",
+                    )
+                    context.expected_task_version = current.version
             except TaskControlRequested:
+                return
+            except RecoverableTaskError as exc:
+                self._record_failure(current.task_id, terminal=False, error_code=exc.error_code)
                 return
             except TerminalTaskError as exc:
                 self._record_failure(current.task_id, terminal=True, error_code=exc.error_code)
