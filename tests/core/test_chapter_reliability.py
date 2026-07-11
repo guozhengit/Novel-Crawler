@@ -11,7 +11,7 @@ import pytest
 
 from novel_crawler.core.crawler import CrawlerService
 from novel_crawler.core.models import Book, Chapter
-from novel_crawler.core.storage import ChapterContentConflict, Storage, canonical_chapter_url
+from novel_crawler.core.storage import ChapterClaimConflict, ChapterContentConflict, Storage, canonical_chapter_url
 from novel_crawler.runtime.env import RuntimeContext
 
 
@@ -79,7 +79,11 @@ def test_mark_done_database_failure_never_records_missing_or_partial_file(tmp_pa
         book_id = _book(storage)
         chapter = Chapter(1, "one", "https://example.test/1")
         storage.upsert_chapters(book_id, [chapter])
-        monkeypatch.setattr(storage, "_commit_done", lambda *_args: (_ for _ in ()).throw(sqlite3.OperationalError("boom")))
+        monkeypatch.setattr(
+            storage,
+            "_commit_done",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("boom")),
+        )
         with pytest.raises(sqlite3.OperationalError):
             storage.mark_done(book_id, chapter, "body")
         saved = storage.all_chapters(book_id)[0]
@@ -209,9 +213,38 @@ def test_legacy_mark_failed_records_attempt_without_double_counting_claim(tmp_pa
         storage.upsert_chapters(book_id, [Chapter(1, "one", "https://example.test/1")])
         storage.mark_failed(book_id, 1, "legacy")
         assert storage.conn.execute("SELECT attempt_count FROM chapters").fetchone()[0] == 1
-        assert storage.claim_chapter(book_id, 1, "owner", now=0, lease_seconds=10)
-        storage.mark_failed(book_id, 1, "claimed")
+        lease = storage.claim_chapter(book_id, 1, "owner", now=0, lease_seconds=10)
+        assert lease is not None
+        storage.mark_failed(book_id, 1, "claimed", claim=lease, now=1)
         assert storage.conn.execute("SELECT attempt_count FROM chapters").fetchone()[0] == 2
+
+
+def test_expired_claim_is_fenced_after_new_owner_across_storage_connections(tmp_path: Path) -> None:
+    db = tmp_path / "db.sqlite"
+    first = Storage(db, tmp_path / "data")
+    second = Storage(db, tmp_path / "data")
+    try:
+        book_id = _book(first)
+        chapter = Chapter(1, "one", "https://example.test/1")
+        first.upsert_chapters(book_id, [chapter])
+        owner1 = first.claim_chapter(book_id, 1, "owner-1", now=0, lease_seconds=10)
+        owner2 = second.claim_chapter(book_id, 1, "owner-2", now=11, lease_seconds=10)
+        assert owner1 is not None and owner2 is not None
+        assert owner2.generation > owner1.generation
+        assert "token" not in repr(owner1).casefold()
+        with pytest.raises(ChapterClaimConflict, match="chapter_claim_conflict"):
+            first.mark_done(book_id, chapter, "stale", claim=owner1, now=12)
+        with pytest.raises(ChapterClaimConflict, match="chapter_claim_conflict"):
+            first.mark_failed(book_id, 1, "chapter_processor_failed", claim=owner1, now=12)
+        with pytest.raises(ChapterClaimConflict, match="chapter_claim_conflict"):
+            first.mark_done(book_id, chapter, "bypass", now=12)
+        row = second.conn.execute("SELECT claim_owner,claim_generation FROM chapters").fetchone()
+        assert tuple(row) == ("owner-2", owner2.generation)
+        path = second.mark_done(book_id, chapter, "winner", claim=owner2, now=12)
+        assert path.read_text(encoding="utf-8") == "winner"
+    finally:
+        first.close()
+        second.close()
 
 
 def test_mark_failed_never_persists_credentials_html_body_or_user_paths(tmp_path: Path) -> None:
@@ -812,6 +845,102 @@ def test_irrecoverable_manifest_migration_stays_blocked_under_repeated_force(tmp
             assert tuple(row) == ("blocked", "deletion_manifest_migration_blocked", 0)
     finally:
         reopened.close()
+
+
+def test_duplicate_done_loser_file_is_owned_by_audit_and_deleted_with_book(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    contents = data / "contents" / "legacy"
+    contents.mkdir(parents=True)
+    winner, loser = contents / "winner.txt", contents / "loser.txt"
+    winner.write_text("winner body", encoding="utf-8")
+    loser.write_text("loser body", encoding="utf-8")
+    db = data / "crawler.db"
+    connection = sqlite3.connect(db)
+    connection.executescript(
+        """
+        CREATE TABLE books(id INTEGER PRIMARY KEY, site TEXT, title TEXT, author TEXT, url TEXT UNIQUE, created_at TEXT);
+        INSERT INTO books VALUES(1,'site','book',NULL,'https://example.test/book',CURRENT_TIMESTAMP);
+        CREATE TABLE chapters(id INTEGER PRIMARY KEY,book_id INTEGER,chapter_index INTEGER,title TEXT,url TEXT,status TEXT,
+          content_path TEXT,error TEXT,updated_at TEXT);
+        """
+    )
+    connection.execute(
+        "INSERT INTO chapters VALUES(1,1,1,'winner','https://example.test/shared','done',?,NULL,CURRENT_TIMESTAMP)",
+        (str(winner),),
+    )
+    connection.execute(
+        "INSERT INTO chapters VALUES(2,1,2,'loser','https://EXAMPLE.test:443/shared','done',?,NULL,CURRENT_TIMESTAMP)",
+        (str(loser),),
+    )
+    connection.commit()
+    connection.close()
+    storage = Storage(db, data)
+    audit = storage.conn.execute(
+        "SELECT discarded_content_path,manual_cleanup_required FROM chapter_migration_audit"
+    ).fetchone()
+    assert tuple(audit) == ("legacy/loser.txt", 0)
+    assert str(tmp_path) not in audit["discarded_content_path"]
+    result = storage.delete_book(1)
+    assert result.completed
+    assert not winner.exists() and not loser.exists()
+    assert storage.conn.execute("SELECT COUNT(*) FROM chapter_migration_audit").fetchone()[0] == 0
+    storage.close()
+
+
+def test_unsafe_legacy_audit_path_is_redacted_and_blocks_book_delete(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    book_id = storage.upsert_book(Book(title="book", url="https://example.test/book", site="site"))
+    outside = tmp_path / "private-loser.txt"
+    outside.write_text("private", encoding="utf-8")
+    storage.conn.execute(
+        """INSERT INTO chapter_migration_audit(book_id,kept_chapter_id,discarded_chapter_id,reason,
+           discarded_content_path,discarded_content_hash) VALUES(?,1,2,'canonical_url_conflict',?,NULL)""",
+        (book_id, str(outside)),
+    )
+    storage.conn.commit()
+    storage.close()
+    reopened = Storage(data / "crawler.db", data)
+    try:
+        row = reopened.conn.execute(
+            "SELECT discarded_content_path,manual_cleanup_required FROM chapter_migration_audit"
+        ).fetchone()
+        assert tuple(row) == (None, 1)
+        with pytest.raises(ValueError, match="audit_manual_cleanup_required"):
+            reopened.delete_book(book_id)
+        assert reopened.get_book(book_id).book_id == book_id
+        assert outside.read_text(encoding="utf-8") == "private"
+    finally:
+        reopened.close()
+
+
+def test_audit_owned_file_shared_by_other_book_is_deleted_only_after_last_reference(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    storage = Storage(data / "crawler.db", data)
+    first_id = storage.upsert_book(Book(title="first", url="https://one.example/book", site="site"))
+    second_id = storage.upsert_book(Book(title="second", url="https://two.example/book", site="site"))
+    legacy = data / "contents" / "legacy"
+    legacy.mkdir(parents=True)
+    shared = legacy / "shared.txt"
+    shared.write_text("shared", encoding="utf-8")
+    storage.conn.execute(
+        """INSERT INTO chapter_migration_audit(book_id,kept_chapter_id,discarded_chapter_id,reason,
+           discarded_content_path,discarded_content_hash,manual_cleanup_required)
+           VALUES(?,1,2,'canonical_url_conflict','legacy/shared.txt',NULL,0)""",
+        (first_id,),
+    )
+    storage.conn.execute(
+        """INSERT INTO chapters(book_id,chapter_index,title,url,canonical_url,status,content_path)
+           VALUES(?,1,'x','https://two.example/1','https://two.example/1','done',?)""",
+        (second_id, str(shared)),
+    )
+    storage.conn.commit()
+    assert storage.delete_book(first_id).completed
+    assert shared.read_text(encoding="utf-8") == "shared"
+    assert storage.conn.execute("SELECT COUNT(*) FROM chapter_migration_audit").fetchone()[0] == 0
+    assert storage.delete_book(second_id).completed
+    assert not shared.exists()
+    storage.close()
 
 
 def test_secure_content_delete_rejects_paths_outside_root(tmp_path: Path) -> None:

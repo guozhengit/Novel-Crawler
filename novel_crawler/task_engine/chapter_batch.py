@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 
 from novel_crawler.core.models import Chapter, ChapterStatus
-from novel_crawler.core.storage import Storage
+from novel_crawler.core.storage import ChapterClaimConflict, Storage
 from novel_crawler.task_engine.executor import TaskExecutionContext
 from novel_crawler.task_engine.models import TaskRecord, TaskStatus
 from novel_crawler.task_engine.repository import CheckpointNotFound
@@ -63,20 +62,24 @@ class ChapterBatchRunner:
             final_next = max(final_next, chapter.index + 1)
             if chapter.status == ChapterStatus.DONE:
                 pending_batch += 1
-            elif self._storage.claim_chapter(
+            elif lease := self._storage.claim_chapter(
                 book_id,
                 chapter.index,
                 task.task_id,
-                now=time.time(),
                 lease_seconds=self._claim_lease_seconds,
             ):
                 try:
                     content = self._processor(chapter)
                     if not isinstance(content, str):
                         raise TypeError("chapter_processor_content_invalid")
-                    self._storage.mark_done(book_id, chapter, content)
+                    self._storage.mark_done(book_id, chapter, content, claim=lease)
                 except Exception:
-                    self._storage.mark_failed(book_id, chapter.index, "chapter_processor_failed")
+                    try:
+                        self._storage.mark_failed(
+                            book_id, chapter.index, "chapter_processor_failed", claim=lease
+                        )
+                    except ChapterClaimConflict:
+                        pass
                     retry_indices.append(chapter.index)
                 pending_batch += 1
             else:

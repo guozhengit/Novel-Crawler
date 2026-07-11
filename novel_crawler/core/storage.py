@@ -3,13 +3,15 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
 import tempfile
 import threading
-from collections.abc import Iterable
-from dataclasses import dataclass
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -38,6 +40,20 @@ _MAX_DELETION_MANIFEST_BYTES = 1_048_576
 
 class ChapterContentConflict(RuntimeError):
     pass
+
+
+class ChapterClaimConflict(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ClaimLease:
+    book_id: int
+    chapter_index: int
+    owner: str
+    generation: int
+    expires_at: float
+    token: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -120,12 +136,13 @@ def _safe_error_code(error: object) -> str:
 
 
 class Storage:
-    def __init__(self, db_path: Path, data_dir: Path):
+    def __init__(self, db_path: Path, data_dir: Path, *, clock: Callable[[], float] | None = None):
         self.db_path = db_path
         self.data_dir = data_dir
         ensure_dir(db_path.parent)
         ensure_dir(data_dir)
         self._lock = threading.RLock()
+        self._clock = clock or time.time
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=5000")
@@ -169,6 +186,8 @@ class Storage:
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     claim_owner TEXT,
                     claim_until REAL,
+                    claim_generation INTEGER NOT NULL DEFAULT 0,
+                    claim_token TEXT,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(book_id) REFERENCES books(id)
                 );
@@ -189,6 +208,7 @@ class Storage:
                     reason TEXT NOT NULL,
                     discarded_content_path TEXT,
                     discarded_content_hash TEXT,
+                    manual_cleanup_required INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS deletion_jobs (
@@ -202,6 +222,12 @@ class Storage:
                 );
                 """
             )
+            audit_columns = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(chapter_migration_audit)")}
+            if "manual_cleanup_required" not in audit_columns:
+                self.conn.execute(
+                    "ALTER TABLE chapter_migration_audit ADD COLUMN manual_cleanup_required INTEGER NOT NULL DEFAULT 0"
+                )
+            self._migrate_audit_paths()
             self._migrate_chapters()
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_chapters_status ON chapters(book_id, status)")
             self.conn.execute(
@@ -215,6 +241,40 @@ class Storage:
                 self.conn.execute("ALTER TABLE deletion_jobs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
             self._migrate_deletion_job_manifests()
             self.conn.commit()
+
+    def _migrate_audit_paths(self) -> None:
+        rows = self.conn.execute(
+            "SELECT id,discarded_content_path,manual_cleanup_required FROM chapter_migration_audit"
+        ).fetchall()
+        for row in rows:
+            raw = row["discarded_content_path"]
+            if not raw:
+                continue
+            try:
+                path = Path(str(raw))
+                if path.is_absolute():
+                    relative = self._audit_relative_path(path)
+                elif self._valid_manifest_relative_path(str(raw)):
+                    relative = str(raw)
+                    self._validate_content_path(self.data_dir / "contents", self._join_manifest_path(self.data_dir / "contents", relative))
+                else:
+                    raise ValueError("audit_path_invalid")
+            except ValueError:
+                self.conn.execute(
+                    """UPDATE chapter_migration_audit SET discarded_content_path=NULL,
+                       manual_cleanup_required=1 WHERE id=?""",
+                    (row["id"],),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE chapter_migration_audit SET discarded_content_path=? WHERE id=?",
+                    (relative, row["id"]),
+                )
+
+    def _audit_relative_path(self, path: Path) -> str:
+        root = self.data_dir / "contents"
+        safe_path = self._validate_content_path(root, path)
+        return self._relative_manifest_path(root, safe_path)
 
     def _migrate_deletion_job_manifests(self) -> None:
         content_root = self.data_dir / "contents"
@@ -265,6 +325,8 @@ class Storage:
             "attempt_count": "INTEGER NOT NULL DEFAULT 0",
             "claim_owner": "TEXT",
             "claim_until": "REAL",
+            "claim_generation": "INTEGER NOT NULL DEFAULT 0",
+            "claim_token": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -310,11 +372,19 @@ class Storage:
                         (loser["content_path"], loser["content_hash"], winner["id"]),
                     )
                     winner = self.conn.execute("SELECT * FROM chapters WHERE id=?", (winner["id"],)).fetchone()
+                audit_path: str | None = None
+                audit_manual = 0
+                if loser["content_path"]:
+                    try:
+                        audit_path = self._audit_relative_path(Path(str(loser["content_path"])))
+                    except ValueError:
+                        audit_manual = 1
                 self.conn.execute(
                     """INSERT INTO chapter_migration_audit(
                        book_id, kept_chapter_id, discarded_chapter_id, reason,
-                       discarded_content_path, discarded_content_hash) VALUES(?,?,?,?,?,?)""",
-                    (group["book_id"], winner["id"], loser["id"], reason, loser["content_path"], loser["content_hash"]),
+                       discarded_content_path, discarded_content_hash, manual_cleanup_required)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (group["book_id"], winner["id"], loser["id"], reason, audit_path, loser["content_hash"], audit_manual),
                 )
                 self.conn.execute("DELETE FROM chapters WHERE id=?", (loser["id"],))
 
@@ -392,7 +462,15 @@ class Storage:
             ).fetchall()
         return [self._row_to_chapter(row) for row in rows]
 
-    def mark_done(self, book_id: int, chapter: Chapter, content: str) -> Path:
+    def mark_done(
+        self,
+        book_id: int,
+        chapter: Chapter,
+        content: str,
+        *,
+        claim: ClaimLease | None = None,
+        now: float | None = None,
+    ) -> Path:
         with self._lock:
             try:
                 # The SQLite write reservation is also our cross-process file commit lock.
@@ -402,6 +480,8 @@ class Storage:
                 ).fetchone()
                 if row is None:
                     raise KeyError(f"chapter not found: {book_id}/{chapter.index}")
+                current = self._clock() if now is None else now
+                self._validate_claim(row, claim, current, book_id, chapter.index)
                 digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 if row["status"] == "done":
                     if row["content_hash"] == digest and row["content_path"] and Path(row["content_path"]).is_file():
@@ -423,7 +503,7 @@ class Storage:
                 os.replace(temporary, path)
                 replaced = True
                 self._fsync_directory(content_dir)
-                self._commit_done(book_id, chapter, path, digest)
+                self._commit_done(book_id, chapter, path, digest, claim=claim, now=current)
                 return path
             except BaseException:
                 self.conn.rollback()
@@ -434,16 +514,40 @@ class Storage:
                     self._fsync_directory(content_dir)
                 raise
 
-    def _commit_done(self, book_id: int, chapter: Chapter, path: Path, digest: str) -> None:
+    def _commit_done(
+        self,
+        book_id: int,
+        chapter: Chapter,
+        path: Path,
+        digest: str,
+        *,
+        claim: ClaimLease | None,
+        now: float,
+    ) -> None:
         try:
+            fence = "AND (claim_owner IS NULL OR claim_until<=?)"
+            params: tuple[object, ...] = (chapter.title, str(path), digest, book_id, chapter.index, now)
+            if claim is not None:
+                fence = "AND claim_owner=? AND claim_generation=? AND claim_token=? AND claim_until>?"
+                params = (
+                    chapter.title,
+                    str(path),
+                    digest,
+                    book_id,
+                    chapter.index,
+                    claim.owner,
+                    claim.generation,
+                    claim.token,
+                    now,
+                )
             updated = self.conn.execute(
-                """UPDATE chapters SET title=?, status='done', content_path=?, content_hash=?, error=NULL,
-                   claim_owner=NULL, claim_until=NULL,
-                   updated_at=CURRENT_TIMESTAMP WHERE book_id=? AND chapter_index=? AND status!='done'""",
-                (chapter.title, str(path), digest, book_id, chapter.index),
+                f"""UPDATE chapters SET title=?, status='done', content_path=?, content_hash=?, error=NULL,
+                   claim_owner=NULL, claim_until=NULL, claim_token=NULL,
+                   updated_at=CURRENT_TIMESTAMP WHERE book_id=? AND chapter_index=? AND status!='done' {fence}""",
+                params,
             )
             if updated.rowcount != 1:
-                raise ChapterContentConflict("chapter_content_conflict")
+                raise ChapterClaimConflict("chapter_claim_conflict")
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
@@ -459,34 +563,112 @@ class Storage:
         finally:
             os.close(descriptor)
 
-    def mark_failed(self, book_id: int, chapter_index: int, error: str) -> None:
+    def mark_failed(
+        self,
+        book_id: int,
+        chapter_index: int,
+        error: str,
+        *,
+        claim: ClaimLease | None = None,
+        now: float | None = None,
+    ) -> None:
         error_code = _safe_error_code(error)
         with self._lock:
-            self.conn.execute(
-                """
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                row = self.conn.execute(
+                    "SELECT * FROM chapters WHERE book_id=? AND chapter_index=?", (book_id, chapter_index)
+                ).fetchone()
+                if row is None:
+                    self.conn.commit()
+                    return
+                current = self._clock() if now is None else now
+                self._validate_claim(row, claim, current, book_id, chapter_index)
+                fence = "AND (claim_owner IS NULL OR claim_until<=?)"
+                params: tuple[object, ...] = (error_code, book_id, chapter_index, current)
+                if claim is not None:
+                    fence = "AND claim_owner=? AND claim_generation=? AND claim_token=? AND claim_until>?"
+                    params = (error_code, book_id, chapter_index, claim.owner, claim.generation, claim.token, current)
+                self.conn.execute(
+                    f"""
                 UPDATE chapters SET status='failed', error=?,
                 attempt_count=attempt_count + CASE WHEN claim_owner IS NULL THEN 1 ELSE 0 END,
-                claim_owner=NULL, claim_until=NULL,
+                claim_owner=NULL, claim_until=NULL, claim_token=NULL,
                 updated_at=CURRENT_TIMESTAMP
-                WHERE book_id=? AND chapter_index=? AND status!='done'
-                """,
-                (error_code, book_id, chapter_index),
-            )
-            self.conn.commit()
+                WHERE book_id=? AND chapter_index=? AND status!='done' {fence}
+                    """,
+                    params,
+                )
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
 
-    def claim_chapter(self, book_id: int, chapter_index: int, owner: str, *, now: float, lease_seconds: float) -> bool:
+    def claim_chapter(
+        self,
+        book_id: int,
+        chapter_index: int,
+        owner: str,
+        *,
+        now: float | None = None,
+        lease_seconds: float,
+    ) -> ClaimLease | None:
         if not owner or lease_seconds <= 0:
             raise ValueError("chapter_claim_invalid")
+        current = self._clock() if now is None else now
+        token = secrets.token_urlsafe(32)
         with self._lock:
-            updated = self.conn.execute(
-                """UPDATE chapters SET claim_owner=?, claim_until=?, attempt_count=attempt_count+1,
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                updated = self.conn.execute(
+                    """UPDATE chapters SET claim_owner=?, claim_until=?, claim_token=?,
+                   claim_generation=claim_generation+1, attempt_count=attempt_count+1,
                    updated_at=CURRENT_TIMESTAMP
                    WHERE book_id=? AND chapter_index=? AND status!='done'
                    AND (claim_owner IS NULL OR claim_owner=? OR claim_until<=?)""",
-                (owner, now + lease_seconds, book_id, chapter_index, owner, now),
-            )
-            self.conn.commit()
-            return updated.rowcount == 1
+                    (owner, current + lease_seconds, token, book_id, chapter_index, owner, current),
+                )
+                if updated.rowcount != 1:
+                    self.conn.commit()
+                    return None
+                row = self.conn.execute(
+                    "SELECT claim_generation,claim_until FROM chapters WHERE book_id=? AND chapter_index=?",
+                    (book_id, chapter_index),
+                ).fetchone()
+                lease = ClaimLease(
+                    book_id, chapter_index, owner, int(row["claim_generation"]), float(row["claim_until"]), token
+                )
+                self.conn.commit()
+                return lease
+            except BaseException:
+                self.conn.rollback()
+                raise
+
+    @staticmethod
+    def _validate_claim(
+        row: sqlite3.Row,
+        claim: ClaimLease | None,
+        now: float,
+        book_id: int,
+        chapter_index: int,
+    ) -> None:
+        active = row["claim_owner"] is not None and row["claim_until"] is not None and float(row["claim_until"]) > now
+        if claim is None:
+            if active:
+                raise ChapterClaimConflict("chapter_claim_conflict")
+            return
+        valid = (
+            active
+            and claim.book_id == book_id
+            and claim.chapter_index == chapter_index
+            and row["claim_owner"] == claim.owner
+            and int(row["claim_generation"]) == claim.generation
+            and isinstance(row["claim_token"], str)
+            and secrets.compare_digest(str(row["claim_token"]), claim.token)
+            and claim.expires_at > now
+        )
+        if not valid:
+            raise ChapterClaimConflict("chapter_claim_conflict")
 
     def reset_failed(self, book_id: int) -> None:
         with self._lock:
@@ -545,6 +727,7 @@ class Storage:
                     job_id = int(cursor.lastrowid)
                 self.conn.execute("DELETE FROM chapters WHERE book_id=?", (book_id,))
                 self.conn.execute("DELETE FROM download_logs WHERE book_id=?", (book_id,))
+                self.conn.execute("DELETE FROM chapter_migration_audit WHERE book_id=?", (book_id,))
                 self.conn.execute("DELETE FROM books WHERE id=?", (book_id,))
                 self.conn.commit()
             except BaseException:
@@ -560,15 +743,40 @@ class Storage:
         rows = self.conn.execute(
             "SELECT content_path FROM chapters WHERE book_id=? AND content_path IS NOT NULL", (book_id,)
         ).fetchall()
+        audit_rows = self.conn.execute(
+            """SELECT discarded_content_path,manual_cleanup_required FROM chapter_migration_audit
+               WHERE book_id=?""",
+            (book_id,),
+        ).fetchall()
+        if any(int(row["manual_cleanup_required"]) for row in audit_rows):
+            raise ValueError("audit_manual_cleanup_required")
         other_rows = self.conn.execute(
             "SELECT content_path FROM chapters WHERE book_id!=? AND content_path IS NOT NULL", (book_id,)
         ).fetchall()
+        other_audit_rows = self.conn.execute(
+            """SELECT discarded_content_path FROM chapter_migration_audit
+               WHERE book_id!=? AND discarded_content_path IS NOT NULL""",
+            (book_id,),
+        ).fetchall()
         other_books = self.conn.execute("SELECT title, site FROM books WHERE id!=?", (book_id,)).fetchall()
         paths = [self._validate_content_path(content_root, Path(str(row["content_path"]))) for row in rows]
+        paths.extend(
+            self._validate_content_path(
+                content_root, self._join_manifest_path(content_root, str(row["discarded_content_path"]))
+            )
+            for row in audit_rows
+            if row["discarded_content_path"]
+        )
         shared_keys = {
             key
-            for row in other_rows
-            if (key := self._content_path_key(content_root, Path(str(row["content_path"])))) is not None
+            for raw in [
+                *(str(row["content_path"]) for row in other_rows),
+                *(
+                    str(self._join_manifest_path(content_root, str(row["discarded_content_path"])))
+                    for row in other_audit_rows
+                ),
+            ]
+            if (key := self._content_path_key(content_root, Path(raw))) is not None
         }
         files = sorted(
             {
