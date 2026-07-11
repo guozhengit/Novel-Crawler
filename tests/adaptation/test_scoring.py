@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import FrozenInstanceError, asdict
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,8 +40,8 @@ def test_context_requires_real_snapshot_and_results_do_not_retain_derived_conten
     assert "Private Book Title" not in repr(scored)
     assert "Private Book Title" not in repr(context)
     assert "Private Book Title" not in str(context)
-    with pytest.raises(TypeError):
-        asdict(context)  # type: ignore[arg-type]
+    with pytest.raises(FrozenInstanceError):
+        context.page_kind = PageKind.CHAPTER  # type: ignore[misc]
     assert scored.calibration_id == "heuristic-v1"
     with pytest.raises(TypeError):
         ScoringContext(PageKind.CHAPTER, {})  # type: ignore[arg-type]
@@ -123,9 +123,10 @@ def test_component_weights_form_exact_normalized_mean() -> None:
         rule_id = "title.custom"
         field = FieldKind.TITLE
 
-        def components(self, identity: CandidateIdentity, features: object) -> tuple[ScoreComponent, ...]:
+        def components(self, identity: CandidateIdentity, features: object, config: ScoringConfig) -> tuple[ScoreComponent, ...]:
             assert identity == CandidateIdentity(FieldKind.TITLE, "h1")
             assert not hasattr(identity, "metadata") and not hasattr(identity, "raw_score") and not hasattr(identity, "evidence")
+            assert config.calibration_id == "heuristic-v1"
             del features
             return (ScoreComponent("title.low", 0, 1), ScoreComponent("title.high", 1, 3))
 
@@ -159,8 +160,8 @@ def test_rule_registry_and_malformed_outputs_fail_stably() -> None:
         def __init__(self, result: object) -> None:
             self.result = result
 
-        def components(self, identity: CandidateIdentity, features: object) -> object:
-            del identity, features
+        def components(self, identity: CandidateIdentity, features: object, config: ScoringConfig) -> object:
+            del identity, features, config
             return self.result
 
     with pytest.raises(ValueError, match="duplicate scoring field"):
@@ -206,10 +207,12 @@ def test_chapter_continuity_requires_adjacent_numbers() -> None:
 
     adjacent = "<nav><a href='/1'>Chapter 1</a><a href='/2'>Chapter 2</a><a href='/3'>Chapter 3</a></nav>"
     jumped = "<nav><a href='/1'>Chapter 1</a><a href='/99'>Chapter 99</a></nav>"
-    volume_boundary = "<nav><a href='/1'>Book 1 Chapter 1</a><a href='/2'>Book 2 Chapter 1</a></nav>"
+    volume_boundary = "<nav><a href='/11'>Book 1 Chapter 1</a><a href='/21'>Book 2 Chapter 1</a></nav>"
+    special = "<nav><a href='/1'>Prologue</a><a href='/2'>Interlude</a></nav>"
     assert continuity(adjacent) == 1
     assert continuity(jumped) == 0
-    assert 0 <= continuity(volume_boundary) <= 1
+    assert continuity(volume_boundary) == 0
+    assert continuity(special) == 0
 
 
 def test_remaining_validation_boundaries_are_stable() -> None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, TypeAlias, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
@@ -35,22 +35,24 @@ _NAV_TEXT = {
 _UNSAFE_SELECTOR = re.compile(r"(?:https?://|[?&]|token|secret|session|password)", re.I)
 
 
+@dataclass(frozen=True, repr=False, slots=True)
 class ScoringContext:
     """Ephemeral scoring input whose representation never includes response data."""
 
-    __slots__ = ("page_kind", "_snapshot")
+    page_kind: PageKind
+    snapshot: PageSnapshot = field(repr=False)
 
-    def __init__(self, page_kind: PageKind, snapshot: PageSnapshot) -> None:
-        if not isinstance(page_kind, PageKind) or not isinstance(snapshot, PageSnapshot):
+    def __post_init__(self) -> None:
+        if not isinstance(self.page_kind, PageKind) or not isinstance(self.snapshot, PageSnapshot):
             raise TypeError("ScoringContext requires PageKind and PageSnapshot")
-        self.page_kind = page_kind
-        self._snapshot = snapshot
 
     def __repr__(self) -> str:
-        snapshot = self._snapshot
+        snapshot = self.snapshot
         origin = urlsplit(snapshot.final_url)
         safe_origin = f"{origin.scheme}://{origin.netloc}" if origin.scheme and origin.netloc else "redacted"
         return f"ScoringContext(page_kind={self.page_kind.value!r}, origin={safe_origin!r}, method={snapshot.method!r}, status={snapshot.status_code})"
+
+    __str__ = __repr__
 
 
 @dataclass(frozen=True)
@@ -182,19 +184,18 @@ class ScoringRule(Protocol):
     @property
     def field(self) -> FieldKind: ...
 
-    def components(self, identity: CandidateIdentity, features: FieldFeatures) -> tuple[ScoreComponent, ...]: ...
+    def components(self, identity: CandidateIdentity, features: FieldFeatures, config: ScoringConfig) -> tuple[ScoreComponent, ...]: ...
 
 
 @dataclass(frozen=True)
 class _BuiltinRule:
     field: FieldKind
-    config: ScoringConfig
 
     @property
     def rule_id(self) -> str:
         return f"{self.field.value}.builtin"
 
-    def components(self, identity: CandidateIdentity, features: FieldFeatures) -> tuple[ScoreComponent, ...]:
+    def components(self, identity: CandidateIdentity, features: FieldFeatures, config: ScoringConfig) -> tuple[ScoreComponent, ...]:
         del identity
         prefix = self.field.value
         if self.field is FieldKind.TITLE:
@@ -208,10 +209,10 @@ class _BuiltinRule:
             return (_component(prefix, "semantic", chapter_title.semantic, 4), _component(prefix, "dom", _tag_score(chapter_title.tag, {"h1": 1, "h2": 0.6, "title": 0.5}), 2), _component(prefix, "length", _length_score(chapter_title.text_length, 2, 100), 1))
         if self.field is FieldKind.CHAPTER_LIST:
             chapter_list = features if isinstance(features, ChapterListFeatures) else ChapterListFeatures(False)
-            return (_component(prefix, "count", min(1, chapter_list.count / self.config.target_chapter_links), 2), _component(prefix, "continuity", chapter_list.continuity, 3), _component(prefix, "same_origin", chapter_list.same_origin, 1), _component(prefix, "selector_precision", chapter_list.precision, 4))
+            return (_component(prefix, "count", min(1, chapter_list.count / config.target_chapter_links), 2), _component(prefix, "continuity", chapter_list.continuity, 3), _component(prefix, "same_origin", chapter_list.same_origin, 1), _component(prefix, "selector_precision", chapter_list.precision, 4))
         if self.field is FieldKind.CONTENT:
             content = features if isinstance(features, ContentFeatures) else ContentFeatures(False)
-            return (_component(prefix, "length", min(1, content.text_length / self.config.target_content_chars), 2), _component(prefix, "paragraphs", min(1, content.paragraphs / self.config.target_paragraphs), 2), _component(prefix, "link_density", max(0, 1 - content.link_density * 3) if content.valid else 0, 3), _component(prefix, "cleanliness", content.clean_ratio, 5))
+            return (_component(prefix, "length", min(1, content.text_length / config.target_content_chars), 2), _component(prefix, "paragraphs", min(1, content.paragraphs / config.target_paragraphs), 2), _component(prefix, "link_density", max(0, 1 - content.link_density * 3) if content.valid else 0, 3), _component(prefix, "cleanliness", content.clean_ratio, 5))
         if self.field in _NAV_TEXT:
             navigation = features if isinstance(features, NavigationFeatures) else NavigationFeatures(False)
             return (_component(prefix, "rel", navigation.rel, 3), _component(prefix, "text", navigation.semantic, 2), _component(prefix, "order", navigation.order, 1))
@@ -238,7 +239,7 @@ class CandidateScorer:
 
     def __init__(self, rules: Sequence[ScoringRule] | None = None, config: ScoringConfig | None = None) -> None:
         self.config = config or ScoringConfig()
-        values: tuple[ScoringRule, ...] = tuple(rules) if rules is not None else tuple(_BuiltinRule(field, self.config) for field in FieldKind)
+        values: tuple[ScoringRule, ...] = tuple(rules) if rules is not None else tuple(_BuiltinRule(field) for field in FieldKind)
         if not values or not all(isinstance(rule, ScoringRule) for rule in values):
             raise TypeError("rules must be a nonempty sequence of ScoringRule")
         seen: set[FieldKind] = set()
@@ -256,7 +257,7 @@ class CandidateScorer:
             raise ValueError(f"no scoring rule for field {candidate.field.value}")
         features = self._derive(candidate, context)
         identity = CandidateIdentity(candidate.field, candidate.selector)
-        raw = rule.components(identity, features)
+        raw = rule.components(identity, features, self.config)
         if not isinstance(raw, tuple) or not raw or not all(isinstance(value, ScoreComponent) for value in raw):
             raise ValueError("components must be a nonempty tuple of ScoreComponent")
         ids = [value.rule_id for value in raw]
@@ -274,7 +275,7 @@ class CandidateScorer:
 
     @staticmethod
     def _derive(candidate: Candidate, context: ScoringContext) -> FieldFeatures:
-        soup = BeautifulSoup(context._snapshot.html, "lxml")
+        soup = BeautifulSoup(context.snapshot.html, "lxml")
         try:
             nodes = soup.select(candidate.selector)
         except Exception:
@@ -318,8 +319,8 @@ def _field_features(field: FieldKind, nodes: list[Tag], context: ScoringContext,
         if count == 0:
             return ChapterListFeatures(False)
         precision = count / len(nodes)
-        origins = [urlsplit(urljoin(context._snapshot.final_url, str(node.get("href", "")))).netloc for node in nodes]
-        base = urlsplit(context._snapshot.final_url).netloc
+        origins = [urlsplit(urljoin(context.snapshot.final_url, str(node.get("href", "")))).netloc for node in nodes]
+        base = urlsplit(context.snapshot.final_url).netloc
         same = sum(origin == base for origin in origins) / len(origins)
         continuity = _continuity(nodes, chapter_flags)
         return ChapterListFeatures(True, count, continuity, same, precision)
@@ -358,18 +359,29 @@ def _is_noise(node: Tag) -> bool:
 
 
 def _continuity(nodes: list[Tag], flags: list[bool]) -> float:
+    del flags
     if not nodes:
         return 0.0
-    if not all(flags):
-        return sum(flags) / len(flags)
-    numbers: list[int] = []
-    for node in nodes:
-        match = re.search(r"\d+", node.get_text(" ", strip=True)) or re.search(r"\d+", str(node.get("href", "")))
-        if match:
-            numbers.append(int(match.group()))
+    numbers = [_chapter_number(node) for node in nodes]
     if len(numbers) < 2:
-        return 1.0
+        return 0.0
     # Decimal chapter labels and volume resets are intentionally neutral until
     # a future calibration can distinguish them without content leakage.
-    adjacent = sum(right - left == 1 for left, right in zip(numbers, numbers[1:], strict=False))
+    adjacent = sum(left is not None and right is not None and right - left == 1 for left, right in zip(numbers, numbers[1:], strict=False))
     return adjacent / (len(numbers) - 1)
+
+
+def _chapter_number(node: Tag) -> int | None:
+    text = node.get_text(" ", strip=True)
+    special = re.fullmatch(r"(?:prologue|epilogue|foreword|afterword|interlude|序章|楔子|番外(?:\s*\d+)?)", text, re.I)
+    if special:
+        return None
+    marker = re.search(r"(?:chapter\s+|第\s*)(\d+)(?![\d.])", text, re.I)
+    if marker:
+        return int(marker.group(1))
+    # Word-number and Chinese-number chapter labels may use a stable numeric
+    # href only when there is no competing Book/Volume number in the label.
+    if re.search(r"\b(?:book|volume)\s+\d+", text, re.I):
+        return None
+    href = re.search(r"\d+", str(node.get("href", "")))
+    return int(href.group()) if href else None
