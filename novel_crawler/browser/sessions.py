@@ -151,20 +151,21 @@ class _DomainLock:
 
     def release(self) -> None:
         if self._stream is not None:
-            try:
-                if self._os_locked:
-                    self._stream.seek(0)
-                    if os.name == "nt":
-                        import msvcrt
+            if self._os_locked:
+                self._stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
 
-                        msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:  # pragma: no cover - exercised by POSIX CI
-                        fcntl: Any = importlib.import_module("fcntl")
-                        fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
-            finally:
+                    msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover - exercised by POSIX CI
+                    fcntl: Any = importlib.import_module("fcntl")
+                    fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
                 self._os_locked = False
+            try:
                 self._stream.close()
-            self._stream = None
+            finally:
+                if self._stream.closed:
+                    self._stream = None
         if self._thread_locked:
             self._thread_locked = False
             self._thread_lock.release()
@@ -211,18 +212,15 @@ class BrowserSessionLease:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        failed = False
         try:
             self._store._release(self._info)
         except (BrowserSessionError, RegistryIOError, OSError):
-            failed = True
+            raise BrowserSessionError("release_failed", self.info.domain) from None
         try:
             self._lock.release()
         except (RegistryIOError, OSError):
-            failed = True
-        if failed:
             raise BrowserSessionError("release_failed", self.info.domain) from None
+        self._closed = True
 
     def mark_stale(self) -> BrowserSessionInfo:
         """Mark this still-exclusive lease stale without reacquiring its domain lock."""

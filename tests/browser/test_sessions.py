@@ -233,10 +233,10 @@ def test_metadata_serializer_contains_only_safe_fields(tmp_path: Path) -> None:
 
 def test_session_count_and_profile_size_are_bounded(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "sessions", max_sessions=1, max_profile_bytes=3)
-    with store.acquire("one.example") as lease:
-        (lease.profile_path / "data").write_bytes(b"1234")
-        with pytest.raises(BrowserSessionError, match="release_failed"):
-            lease.close()
+    lease = store.acquire("one.example")
+    (lease.profile_path / "data").write_bytes(b"1234")
+    with pytest.raises(BrowserSessionError, match="release_failed"):
+        lease.close()
     with pytest.raises(SessionLimitError, match="session_count_limit"):
         store.acquire("two.example")
 
@@ -776,7 +776,7 @@ def test_public_storage_errors_have_only_safe_code_and_domain(
     assert caught.value.__suppress_context__
 
 
-def test_lease_release_failure_is_safe_and_still_unlocks(
+def test_lease_release_failure_is_safe_keeps_lock_and_close_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = BrowserSessionStore(tmp_path / "sessions")
@@ -794,6 +794,9 @@ def test_lease_release_failure_is_safe_and_still_unlocks(
     assert str(tmp_path) not in str(caught.value)
     assert caught.value.__suppress_context__
     monkeypatch.undo()
+    with pytest.raises(SessionLockTimeout):
+        store.acquire("release.example", timeout=0.05)
+    lease.close()
     with store.acquire("release.example", timeout=0.5):
         pass
 
@@ -831,11 +834,11 @@ def test_unknown_sensitive_metadata_fields_are_rejected_then_quarantined_under_l
 
 def test_nonquarantining_read_and_profile_escape_fail_safely(tmp_path: Path) -> None:
     store = BrowserSessionStore(tmp_path / "sessions")
-    with store.acquire("corrupt.example") as lease:
-        metadata = next((store.root / "metadata").glob("*.json"))
-        metadata.write_text("{}", encoding="ascii")
-        with pytest.raises(BrowserSessionError, match="release_failed"):
-            lease.close()
+    lease = store.acquire("corrupt.example")
+    metadata = next((store.root / "metadata").glob("*.json"))
+    metadata.write_text("{}", encoding="ascii")
+    with pytest.raises(BrowserSessionError, match="release_failed"):
+        lease.close()
     store._safe_delete_profile(store.root / "profiles" / ("f" * 64))
     with pytest.raises(BrowserSessionError, match="profile_escape"):
         store._verify_profile(store.root)

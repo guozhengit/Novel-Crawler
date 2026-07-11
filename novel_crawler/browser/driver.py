@@ -6,7 +6,7 @@ import queue
 import secrets
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -168,7 +168,7 @@ class _PlaywrightContext:
         self._dead = threading.Event()
         on_event = getattr(context, "on", None)
         if on_event is not None:
-            on_event("close", lambda: self._dead.set())
+            on_event("close", lambda *_: self._dead.set())
         context.route("**/*", self._route)
         route_web_socket = getattr(context, "route_web_socket", None)
         if route_web_socket is None:
@@ -211,7 +211,7 @@ class _PlaywrightContext:
             raise RuntimeError("browser_navigation_blocked")
         self._set_remaining_timeout()
         outer_length = self._page.evaluate(
-            "document.documentElement ? document.documentElement.outerHTML.length : 0"
+            "document.documentElement ? new TextEncoder().encode(document.documentElement.outerHTML).byteLength : 0"
         )
         if not isinstance(outer_length, int) or outer_length > self._max_body_bytes:
             raise ValueError("browser_body_too_large")
@@ -298,7 +298,7 @@ class DefaultPlaywrightDriver:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(user_data_dir),
                 headless=headless,
-                proxy={"server": proxy.proxy_url, "bypass": ""},
+                proxy={"server": proxy.proxy_url, "bypass": "<-loopback>"},
                 service_workers="block",
                 accept_downloads=False,
                 timeout=max(1, int((deadline - time.monotonic()) * 1000)),
@@ -306,6 +306,12 @@ class DefaultPlaywrightDriver:
                     f"--renderer-process-limit={self.renderer_process_limit}",
                     f"--js-flags=--max-old-space-size={self.js_heap_mb}",
                     "--disable-features=ServiceWorker",
+                    "--proxy-bypass-list=<-loopback>",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    "--disable-quic",
+                    "--disable-background-networking",
+                    "--dns-prefetch-disable",
+                    "--disable-preconnect",
                 ],
             )
             return _PlaywrightContext(
@@ -339,6 +345,7 @@ class BrowserContextWorker:
         headless: bool,
         policy: BrowserRequestPolicy,
         ttl: float,
+        terminal_callback: Callable[[str, bool], None] | None = None,
     ) -> None:
         if ttl <= 0:
             raise ValueError("worker ttl must be positive")
@@ -353,6 +360,8 @@ class BrowserContextWorker:
         self._started = False
         self._closed = False
         self._expired = False
+        self._terminal_callback = terminal_callback
+        self._terminal_notified = False
 
     @property
     def deadline(self) -> float:
@@ -402,6 +411,7 @@ class BrowserContextWorker:
         except Exception as exc:
             self._ready.set_exception(exc)
             self._closed = True
+            self._notify_terminal("crash", True)
             return
         self._ready.set_result(None)
         while True:
@@ -411,17 +421,28 @@ class BrowserContextWorker:
                 try:
                     context.close()
                 except Exception:  # pragma: no cover - worker remains quarantinable for explicit retry
-                    pass  # pragma: no cover
+                    self._notify_terminal("deadline", False)
                 else:
                     self._closed = True
+                    self._notify_terminal("deadline", True)
                     return
             try:
                 action, args, future = self._commands.get(timeout=0.1 if self._expired else min(0.1, remaining))
             except queue.Empty:
+                checker = getattr(context, "is_alive", None)
+                if checker is not None:
+                    try:
+                        alive = bool(checker())
+                    except Exception:  # pragma: no cover - conservative process liveness fallback
+                        alive = True  # pragma: no cover
+                    if not alive:
+                        self._closed = True
+                        self._notify_terminal("crash", True)
+                        return
                 continue
-            if self._expired and action not in {"close", "is_alive"}:
+            if self._expired and action not in {"close", "is_alive"}:  # pragma: no cover - command race at deadline
                 future.set_exception(RuntimeError("browser_worker_expired"))
-                continue
+                continue  # pragma: no cover
             try:
                 result: Any
                 if action == "navigate":
@@ -440,5 +461,38 @@ class BrowserContextWorker:
                     raise RuntimeError("browser_worker_command")  # pragma: no cover
             except Exception as exc:
                 future.set_exception(exc)
+                checker = getattr(context, "is_alive", None)
+                if checker is not None:
+                    try:
+                        alive = bool(checker())
+                    except Exception:  # pragma: no cover - conservative process liveness fallback
+                        alive = True  # pragma: no cover
+                    if not alive:
+                        self._closed = True
+                        self._notify_terminal("crash", True)
+                        return
             else:
-                future.set_result(result)
+                if time.monotonic() >= self._deadline and action not in {"close", "is_alive"}:
+                    self._expired = True
+                    try:
+                        context.close()
+                    except Exception:  # pragma: no cover - idle deadline failure path covers quarantine callback
+                        self._notify_terminal("deadline", False)  # pragma: no cover
+                    else:
+                        self._closed = True
+                        self._notify_terminal("deadline", True)
+                    future.set_exception(RuntimeError("browser_worker_expired"))
+                    if self._closed:
+                        return
+                else:
+                    future.set_result(result)
+
+    def _notify_terminal(self, reason: str, closed_ok: bool) -> None:
+        if self._terminal_notified:
+            return
+        self._terminal_notified = True
+        if self._terminal_callback is not None:
+            try:
+                self._terminal_callback(reason, closed_ok)
+            except Exception:  # pragma: no cover - callback failures cannot compromise worker cleanup
+                pass  # pragma: no cover

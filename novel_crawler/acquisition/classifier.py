@@ -68,7 +68,7 @@ class PageClassifier:
         }
         book_index = len(chapter_links) >= 3
 
-        classifiable_error = snapshot.status_code in {403, 429}
+        classifiable_error = snapshot.status_code in {401, 403, 429, 503}
         if (snapshot.status_code < 400 or classifiable_error) and self._challenge_score(soup, title) >= 2:
             return result(PageKind.AUTH_OR_CHALLENGE, 0.96, ("auth.challenge_signals",))
         if (snapshot.status_code < 400 or classifiable_error) and self._login_form(soup, title, primary_heading):

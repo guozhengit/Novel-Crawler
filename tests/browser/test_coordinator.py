@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
 import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,14 +11,34 @@ from typing import Any
 import pytest
 
 from novel_crawler.acquisition.classifier import PageClassifier
+from novel_crawler.acquisition.http import AcquisitionError
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.acquisition.security import UrlSafetyPolicy
-from novel_crawler.browser.coordinator import BrowserAcquirer, VerificationCoordinator, VerificationRequired
+from novel_crawler.browser.coordinator import (
+    BrowserAcquirer,
+    BrowserCleanupRequired,
+    VerificationCoordinator,
+    VerificationRequired,
+    _AttemptLedger,
+)
 from novel_crawler.browser.driver import BrowserPageSnapshot
 from novel_crawler.browser.models import VerificationStatus
-from novel_crawler.browser.sessions import BrowserSessionStore, SessionLockTimeout
+from novel_crawler.browser.sessions import BrowserSessionLease, BrowserSessionStore, SessionLockTimeout
 
 PUBLIC_POLICY = UrlSafetyPolicy(resolver=lambda host, port: ("93.184.216.34",))
+
+
+def _reserve_ledger_in_process(root: str, now_iso: str, output: object) -> None:
+    now = datetime.fromisoformat(now_iso)
+    sessions = BrowserSessionStore(root)
+    ledger = _AttemptLedger(sessions, lambda: now, timedelta(minutes=5))
+    key = ledger.opaque_key("https://example.test/", "download")
+    try:
+        reservation = ledger.reserve(key, 2)
+    except Exception as exc:
+        output.put((False, type(exc).__name__))  # type: ignore[attr-defined]
+    else:
+        output.put((True, reservation))  # type: ignore[attr-defined]
 
 
 def snapshot(html: str, url: str = "https://example.test/private?q=secret") -> PageSnapshot:
@@ -370,7 +392,7 @@ def test_browser_acquirer_passes_limits_and_classifiable_statuses_to_http(tmp_pa
     with pytest.raises(VerificationRequired):
         acquirer.fetch_page("https://example.test/a")
     assert http.calls == ["https://example.test/a"]
-    assert http.options == [{"max_body_bytes": 123, "classifiable_statuses": frozenset({403, 429})}]
+    assert http.options == [{"max_body_bytes": 123, "classifiable_statuses": frozenset({401, 403, 429, 503})}]
 
 
 def test_success_clears_attempt_ledger_for_future_runs(tmp_path: Path) -> None:
@@ -474,3 +496,164 @@ def test_attempt_ledger_is_atomic_across_coordinator_instances(tmp_path: Path) -
     third = VerificationCoordinator(sessions, driver=FakeDriver([]), safety_policy=PUBLIC_POLICY)
     with pytest.raises(VerificationRequired, match="verification_attempts_exhausted"):
         third.begin("https://example.test/a", task_key="download")
+
+
+def test_worker_deadline_callback_releases_confirmed_closed_context_without_sweep(tmp_path: Path) -> None:
+    context = FakeContext([browser_snapshot("<p>x</p>")], [])
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    coordinator = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([context]),
+        ttl=timedelta(seconds=0.1),
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    time.sleep(0.25)
+    with sessions.acquire("example.test", timeout=0.1):
+        pass
+    with pytest.raises(VerificationRequired, match="verification_token_invalid"):
+        coordinator.continue_verification(ticket.token)
+
+
+def test_worker_deadline_failed_close_keeps_capacity_until_retry(tmp_path: Path) -> None:
+    class DeadlineCloseFails(FakeContext):
+        def __init__(self) -> None:
+            super().__init__([browser_snapshot("<p>x</p>")], [])
+            self.failures = 1
+
+        def close(self) -> None:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("close failed")
+
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    coordinator = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([DeadlineCloseFails()]),
+        ttl=timedelta(seconds=0.1),
+        max_active=1,
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    time.sleep(0.25)
+    with pytest.raises(VerificationRequired, match="verification_capacity"):
+        coordinator.begin("https://other.test/a", task_key="other")
+    assert coordinator.retry_cleanup(ticket.token)
+
+
+def test_ledger_success_removes_only_its_reservation_and_purges_expired_records(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 11, tzinfo=UTC)
+    sessions = BrowserSessionStore(tmp_path)
+    first = _AttemptLedger(sessions, lambda: now, timedelta(minutes=1), max_keys=2, max_records=2)
+    second = _AttemptLedger(sessions, lambda: now, timedelta(minutes=1), max_keys=2, max_records=2)
+    key = first.opaque_key("https://example.test/", "download")
+    reservation_a = first.reserve(key, 2)
+    reservation_b = second.reserve(key, 2)
+    first.finish(key, reservation_a, consumed=False)
+    reservation_c = first.reserve(key, 2)
+    with pytest.raises(VerificationRequired, match="verification_attempts_exhausted"):
+        second.reserve(key, 2)
+    first.finish(key, reservation_b, consumed=True)
+    first.finish(key, reservation_c, consumed=True)
+
+    now += timedelta(minutes=2)
+    other = first.opaque_key("https://other.test/", "download")
+    assert first.reserve(other, 2)
+
+
+def test_lease_close_failure_keeps_coordinator_capacity_until_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions = BrowserSessionStore(tmp_path)
+    coordinator = VerificationCoordinator(
+        sessions,
+        driver=FakeDriver([FakeContext([browser_snapshot("<p>x</p>")], [])]),
+        max_active=1,
+        safety_policy=PUBLIC_POLICY,
+    )
+    ticket = coordinator.begin("https://example.test/a", task_key="download")
+    original = BrowserSessionLease.close
+    failed = False
+
+    def fail_once(lease: BrowserSessionLease) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("release failed")
+        original(lease)
+
+    monkeypatch.setattr(BrowserSessionLease, "close", fail_once)
+    assert coordinator.cancel(ticket.token).status is VerificationStatus.FAILED
+    with pytest.raises(VerificationRequired, match="verification_capacity"):
+        coordinator.begin("https://other.test/a", task_key="other")
+    assert coordinator.retry_cleanup(ticket.token)
+
+
+def test_browser_acquirer_quarantines_failed_headless_cleanup_with_retry_token(tmp_path: Path) -> None:
+    class CloseFailsOnce(FakeContext):
+        def __init__(self) -> None:
+            super().__init__([browser_snapshot("<title>Chapter 1</title><article id='content'>ok</article>")], [])
+            self.failures = 1
+
+        def close(self) -> None:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("cookie=secret C:/private")
+
+    sessions = BrowserSessionStore(tmp_path, lock_timeout=0.05)
+    acquirer = BrowserAcquirer(
+        http=FakeHttp("<div id='app'></div>"),
+        driver=FakeDriver([CloseFailsOnce()]),
+        sessions=sessions,
+        safety_policy=PUBLIC_POLICY,
+        max_failed_cleanups=1,
+    )
+    with pytest.raises(BrowserCleanupRequired, match="browser_cleanup_failed") as caught:
+        acquirer.fetch_page("https://example.test/a")
+    assert "secret" not in repr(caught.value)
+    with pytest.raises(SessionLockTimeout):
+        sessions.acquire("example.test", timeout=0.01)
+    with pytest.raises(AcquisitionError, match="browser_cleanup_capacity"):
+        acquirer.fetch_page("https://other.test/a")
+    assert acquirer.retry_cleanup(caught.value.token)
+    with sessions.acquire("example.test", timeout=0.1):
+        pass
+
+
+def test_ledger_key_and_record_capacity_fail_closed(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 11, tzinfo=UTC)
+    sessions = BrowserSessionStore(tmp_path)
+    ledger = _AttemptLedger(sessions, lambda: now, timedelta(minutes=1), max_keys=1, max_records=2)
+    first_key = ledger.opaque_key("https://one.test/", "download")
+    second_key = ledger.opaque_key("https://two.test/", "download")
+    ledger.reserve(first_key, 2)
+    with pytest.raises(VerificationRequired, match="verification_ledger_capacity"):
+        ledger.reserve(second_key, 2)
+
+    other_sessions = BrowserSessionStore(tmp_path / "records")
+    records = _AttemptLedger(other_sessions, lambda: now, timedelta(minutes=1), max_keys=2, max_records=1)
+    records.reserve(first_key, 2)
+    with pytest.raises(VerificationRequired, match="verification_ledger_capacity"):
+        records.reserve(second_key, 2)
+
+
+def test_ledger_process_reservation_survives_other_process_success(tmp_path: Path) -> None:
+    now = datetime(2026, 7, 11, tzinfo=UTC)
+    sessions = BrowserSessionStore(tmp_path)
+    ledger = _AttemptLedger(sessions, lambda: now, timedelta(minutes=5))
+    key = ledger.opaque_key("https://example.test/", "download")
+    reservation_a = ledger.reserve(key, 2)
+    context = multiprocessing.get_context("spawn")
+    output = context.Queue()
+    process = context.Process(target=_reserve_ledger_in_process, args=(str(tmp_path), now.isoformat(), output))
+    process.start()
+    process.join(10)
+    assert process.exitcode == 0
+    ok, reservation_b = output.get(timeout=2)
+    assert ok and reservation_b
+    ledger.finish(key, reservation_a, consumed=False)
+    reservation_c = ledger.reserve(key, 2)
+    with pytest.raises(VerificationRequired, match="verification_attempts_exhausted"):
+        ledger.reserve(key, 2)
+    ledger.finish(key, str(reservation_b), consumed=True)
+    ledger.finish(key, reservation_c, consumed=True)

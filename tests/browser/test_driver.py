@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -110,8 +111,8 @@ class FakePage:
         return self.content_value
 
     def evaluate(self, expression: str) -> int:
-        assert "outerHTML.length" in expression
-        return len(self.content_value)
+        assert "TextEncoder" in expression and "byteLength" in expression
+        return len(self.content_value.encode())
 
 
 class FakeRawContext:
@@ -122,6 +123,7 @@ class FakeRawContext:
         self.fail_route = fail_route
         self.web_socket_callback: object | None = None
         self.init_scripts: list[str] = []
+        self.events: dict[str, object] = {}
 
     def route(self, pattern: str, callback: object) -> None:
         assert pattern == "**/*"
@@ -139,6 +141,9 @@ class FakeRawContext:
     def add_init_script(self, script: str) -> None:
         self.init_scripts.append(script)
 
+    def on(self, event: str, callback: object) -> None:
+        self.events[event] = callback
+
 
 def test_playwright_context_routes_every_request_and_captures_navigation() -> None:
     raw = FakeRawContext()
@@ -146,6 +151,9 @@ def test_playwright_context_routes_every_request_and_captures_navigation() -> No
     guard = BrowserRequestPolicy(public_policy())
     guard.lock("https://example.test/start")
     context = _PlaywrightContext(runtime, raw, guard)
+    assert callable(raw.events["close"])
+    raw.events["close"]("close-event-argument")  # type: ignore[operator]
+    assert context.is_alive() is False
     allowed = SimpleNamespace(
         request=SimpleNamespace(
             url="https://example.test/app.js", resource_type="script", is_navigation_request=lambda: False
@@ -246,12 +254,18 @@ def test_default_driver_uses_pinned_proxy_and_locked_down_chromium_options(
     guard = BrowserRequestPolicy(public_policy())
     guard.lock("https://example.test/start")
     context = DefaultPlaywrightDriver().launch(user_data_dir=tmp_path, headless=True, policy=guard)
-    assert launch_options["proxy"] == {"server": "socks5://127.0.0.1:4321", "bypass": ""}
+    assert launch_options["proxy"] == {"server": "socks5://127.0.0.1:4321", "bypass": "<-loopback>"}
     assert launch_options["service_workers"] == "block"
     assert launch_options["accept_downloads"] is False
     args = launch_options["args"]
     assert "--renderer-process-limit=4" in args
     assert any("max-old-space-size" in value for value in args)
+    assert "--proxy-bypass-list=<-loopback>" in args
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in args
+    assert "--disable-quic" in args
+    assert "--disable-background-networking" in args
+    assert "--dns-prefetch-disable" in args
+    assert "--disable-preconnect" in args
     assert raw.init_scripts and "unregister" in raw.init_scripts[0]
     context.close()
 
@@ -289,6 +303,7 @@ def test_browser_worker_owns_every_context_call_on_one_dedicated_thread(tmp_path
 
 def test_browser_worker_monotonic_deadline_closes_without_coordinator_calls(tmp_path: Path) -> None:
     closed = threading.Event()
+    terminal: list[tuple[str, bool]] = []
 
     class Context:
         def navigate(self, url: str) -> BrowserPageSnapshot:
@@ -306,11 +321,19 @@ def test_browser_worker_monotonic_deadline_closes_without_coordinator_calls(tmp_
 
     guard = BrowserRequestPolicy(public_policy())
     guard.lock("https://example.test/")
-    worker = BrowserContextWorker(DeadlineDriver(), user_data_dir=tmp_path, headless=False, policy=guard, ttl=0.1)
+    worker = BrowserContextWorker(
+        DeadlineDriver(),
+        user_data_dir=tmp_path,
+        headless=False,
+        policy=guard,
+        ttl=0.1,
+        terminal_callback=lambda reason, closed_ok: terminal.append((reason, closed_ok)),
+    )
     worker.start()
     assert closed.wait(1)
     with pytest.raises(RuntimeError, match="browser_worker_expired"):
         worker.capture()
+    assert terminal == [("deadline", True)]
 
 
 def test_capture_rejects_dom_before_materializing_content() -> None:
@@ -331,6 +354,17 @@ def test_capture_rejects_dom_before_materializing_content() -> None:
     with pytest.raises(ValueError, match="browser_body_too_large"):
         context.capture()
     assert content_calls == 0
+
+
+def test_capture_precheck_uses_encoded_byte_length_not_character_count() -> None:
+    raw = FakeRawContext()
+    raw.pages[0].content_value = "汉" * 4
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    context = _PlaywrightContext(SimpleNamespace(stop=lambda: None), raw, guard, max_body_bytes=5)
+    raw.pages[0].url = "https://example.test/"
+    with pytest.raises(ValueError, match="browser_body_too_large"):
+        context.capture()
 
 
 def test_context_requires_websocket_routing_and_worker_close_can_retry(tmp_path: Path) -> None:
@@ -411,3 +445,108 @@ def test_browser_snapshot_falls_back_when_declared_charset_is_invalid() -> None:
     )
     snapshot = raw.to_page_snapshot()
     assert snapshot.html == "plain ascii"
+
+
+def test_worker_reports_confirmed_crash_and_deadline_during_command(tmp_path: Path) -> None:
+    callbacks: list[tuple[str, bool]] = []
+
+    class Crashed:
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def capture(self) -> BrowserPageSnapshot:
+            raise RuntimeError("browser crashed")
+
+        def is_alive(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            raise AssertionError("dead browser must not need close")
+
+    class CrashDriver:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> Crashed:
+            return Crashed()
+
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    worker = BrowserContextWorker(
+        CrashDriver(),
+        user_data_dir=tmp_path,
+        headless=True,
+        policy=guard,
+        ttl=1,
+        terminal_callback=lambda reason, ok: callbacks.append((reason, ok)),
+    )
+    worker.start()
+    with pytest.raises(RuntimeError, match="browser crashed"):
+        worker.capture()
+    assert callbacks == [("crash", True)]
+
+    callbacks.clear()
+
+    class Slow:
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            time.sleep(0.08)
+            return BrowserPageSnapshot(url, url, 200, {}, b"ok")
+
+        def capture(self) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def close(self) -> None:
+            pass
+
+    class SlowDriver:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> Slow:
+            return Slow()
+
+    slow = BrowserContextWorker(
+        SlowDriver(),
+        user_data_dir=tmp_path,
+        headless=True,
+        policy=guard,
+        ttl=0.03,
+        terminal_callback=lambda reason, ok: callbacks.append((reason, ok)),
+    )
+    slow.start()
+    with pytest.raises(RuntimeError, match="browser_worker_expired"):
+        slow.navigate("https://example.test/")
+    assert callbacks == [("deadline", True)]
+
+
+def test_worker_poll_detects_idle_browser_crash(tmp_path: Path) -> None:
+    callbacks: list[tuple[str, bool]] = []
+    alive = True
+
+    class Context:
+        def navigate(self, url: str) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def capture(self) -> BrowserPageSnapshot:
+            raise AssertionError
+
+        def close(self) -> None:
+            raise AssertionError
+
+        def is_alive(self) -> bool:
+            return alive
+
+    class Driver:
+        def launch(self, *, user_data_dir: Path, headless: bool, policy: BrowserRequestPolicy) -> Context:
+            return Context()
+
+    guard = BrowserRequestPolicy(public_policy())
+    guard.lock("https://example.test/")
+    worker = BrowserContextWorker(
+        Driver(),
+        user_data_dir=tmp_path,
+        headless=True,
+        policy=guard,
+        ttl=1,
+        terminal_callback=lambda reason, ok: callbacks.append((reason, ok)),
+    )
+    worker.start()
+    alive = False
+    deadline = time.monotonic() + 1
+    while not callbacks and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert callbacks == [("crash", True)]

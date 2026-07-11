@@ -189,3 +189,40 @@ def test_proxy_rejects_prevalidated_target_binding_mismatch() -> None:
     )
     with pytest.raises(ProxyError, match="proxy_target_rejected"):
         proxy.start()
+
+
+def test_socks_greeting_unsupported_method_returns_exact_no_acceptable_method() -> None:
+    proxy = PinnedSocksProxy(
+        "https://example.test/", policy=UrlSafetyPolicy(resolver=lambda host, port: ("93.184.216.34",))
+    )
+    proxy.start()
+    try:
+        client = socket.create_connection(proxy.address, timeout=1)
+        client.sendall(b"\x05\x01\x02")
+        assert client.recv(2) == b"\x05\xff"
+        assert client.recv(1) == b""
+        client.close()
+    finally:
+        proxy.close()
+
+
+def test_capacity_rejection_parses_variable_length_fragmented_greeting() -> None:
+    proxy = PinnedSocksProxy(
+        "https://example.test/",
+        policy=UrlSafetyPolicy(resolver=lambda host, port: ("93.184.216.34",)),
+        max_connections=1,
+    )
+    proxy.start()
+    try:
+        first = socket.create_connection(proxy.address, timeout=1)
+        first.sendall(b"\x05\x01\x00")
+        assert first.recv(2) == b"\x05\x00"
+        second = socket.create_connection(proxy.address, timeout=1)
+        second.sendall(b"\x05\x02")
+        second.sendall(b"\x02")
+        second.sendall(b"\x00")
+        assert second.recv(2) == b"\x05\xff"
+        first.close()
+        second.close()
+    finally:
+        proxy.close()

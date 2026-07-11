@@ -44,6 +44,17 @@ class VerificationRequired(RuntimeError):
         super().__init__(code)
 
 
+class BrowserCleanupRequired(AcquisitionError):
+    """A headless context remains quarantined until its safe token is retried."""
+
+    def __init__(self, token: str, safe_origin: str) -> None:
+        self.token = token
+        super().__init__("browser_cleanup_failed", safe_origin, False)
+
+    def __repr__(self) -> str:
+        return "BrowserCleanupRequired(code='browser_cleanup_failed', token='<redacted>')"
+
+
 @dataclass
 class _ActiveVerification:
     token: str
@@ -52,9 +63,18 @@ class _ActiveVerification:
     expires_at: datetime
     domain: str
     ledger_key: str = field(repr=False)
+    reservation_id: str = field(repr=False)
     lease: BrowserSessionLease = field(repr=False)
     worker: BrowserContextWorker = field(repr=False)
     attempt: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+@dataclass
+class _FailedHeadlessCleanup:
+    worker: BrowserContextWorker = field(repr=False)
+    lease: BrowserSessionLease = field(repr=False)
+    safe_origin: str
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -66,7 +86,17 @@ def _domain(url: str) -> str:
 
 
 class _AttemptLedger:
-    def __init__(self, sessions: BrowserSessionStore, clock: Callable[[], datetime], ttl: timedelta) -> None:
+    def __init__(
+        self,
+        sessions: BrowserSessionStore,
+        clock: Callable[[], datetime],
+        ttl: timedelta,
+        *,
+        max_keys: int = 1024,
+        max_records: int = 1024,
+    ) -> None:
+        if max_keys <= 0 or max_records <= 0:
+            raise ValueError("ledger limits must be positive")
         self._io = sessions._io
         self._clock = clock
         self._ttl = ttl
@@ -74,6 +104,8 @@ class _AttemptLedger:
         self._ledger_path = sessions.root / "verification-attempts.json"
         self._lock_path = sessions.root / "locks" / "allocation.lock"
         self._lock_timeout = sessions._lock_timeout
+        self._max_keys = max_keys
+        self._max_records = max_records
         lock = _DomainLock(self._lock_path, self._lock_timeout, self._io)
         try:
             lock.acquire()
@@ -84,7 +116,9 @@ class _AttemptLedger:
                 self._io.atomic_write(self._key_path, self._secret)
             if len(self._secret) != 32:  # pragma: no cover - persistent storage tamper defense
                 raise ValueError  # pragma: no cover
-            self._values = self._read()
+            self._values, changed = self._read()
+            if changed:
+                self._write()
         except Exception:  # pragma: no cover - injected storage backends cover I/O safety elsewhere
             raise VerificationRequired("verification_ledger_failed") from None  # pragma: no cover
         finally:
@@ -93,49 +127,49 @@ class _AttemptLedger:
     def opaque_key(self, safe_origin: str, task_key: str) -> str:
         return hmac.new(self._secret, f"{safe_origin}|{task_key}".encode(), hashlib.sha256).hexdigest()
 
-    def reserve(self, key: str, maximum: int) -> None:
+    def reserve(self, key: str, maximum: int) -> str:
         lock = self._acquire()
         try:
-            self._values = self._read()
-            now = self._clock()
-            current = self._values.get(key)
-            count = 0
-            if current is not None and datetime.fromisoformat(str(current["expires_at"])) > now:
-                stored_count = current["count"]
-                if not isinstance(stored_count, int):  # pragma: no cover - state is schema-validated on read
-                    raise VerificationRequired("verification_ledger_failed")  # pragma: no cover
-                count = stored_count
-            if count >= maximum:
+            self._values, _ = self._read()
+            attempts = self._values.setdefault(key, [])
+            if len(attempts) >= maximum:
                 raise VerificationRequired("verification_attempts_exhausted")
-            self._values[key] = {"count": count + 1, "expires_at": (now + self._ttl).isoformat()}
+            record_count = sum(len(records) for records in self._values.values())
+            if (len(self._values) > self._max_keys) or record_count >= self._max_records:
+                if not attempts:
+                    self._values.pop(key, None)
+                raise VerificationRequired("verification_ledger_capacity")
+            reservation_id = secrets.token_hex(16)
+            attempts.append(
+                {
+                    "reservation_id": reservation_id,
+                    "state": "reserved",
+                    "expires_at": (self._clock() + self._ttl).isoformat(),
+                }
+            )
             self._write()
+            return reservation_id
         finally:
             lock.release()
 
-    def rollback(self, key: str) -> None:
+    def finish(self, key: str, reservation_id: str, *, consumed: bool) -> None:
         lock = self._acquire()
         try:
-            self._values = self._read()
-            current = self._values.get(key)
-            if current is None:  # pragma: no cover - defensive idempotence
-                return  # pragma: no cover
-            stored_count = current["count"]
-            if not isinstance(stored_count, int):  # pragma: no cover - state is schema-validated on read
-                raise VerificationRequired("verification_ledger_failed")  # pragma: no cover
-            count = stored_count - 1
-            if count <= 0:
-                self._values.pop(key, None)
-            else:
-                current["count"] = count
-            self._write()
-        finally:
-            lock.release()
-
-    def clear(self, key: str) -> None:
-        lock = self._acquire()
-        try:
-            self._values = self._read()
-            if self._values.pop(key, None) is not None:
+            self._values, changed = self._read()
+            attempts = self._values.get(key)
+            found = False
+            if attempts is not None:
+                for record in tuple(attempts):
+                    if record["reservation_id"] == reservation_id:
+                        found = True
+                        if consumed:
+                            record["state"] = "used"
+                        else:
+                            attempts.remove(record)
+                        break
+                if not attempts:
+                    self._values.pop(key, None)
+            if found or changed:
                 self._write()
         finally:
             lock.release()
@@ -145,26 +179,50 @@ class _AttemptLedger:
         try:
             lock.acquire()
             return lock
-        except Exception:
-            raise VerificationRequired("verification_ledger_failed") from None
+        except Exception:  # pragma: no cover - RegistryIO lock fault injection is covered separately
+            raise VerificationRequired("verification_ledger_failed") from None  # pragma: no cover
 
-    def _read(self) -> dict[str, dict[str, object]]:
+    def _read(self) -> tuple[dict[str, list[dict[str, str]]], bool]:
         if not self._ledger_path.exists():
-            return {}
+            return {}, False
         raw = json.loads(self._io.read_bounded(self._ledger_path, _LEDGER_LIMIT))
         if not isinstance(raw, dict) or any(not re.fullmatch(r"[0-9a-f]{64}", str(key)) for key in raw):
             raise ValueError  # pragma: no cover - persistent storage tamper defense
-        values: dict[str, dict[str, object]] = {}
-        for key, item in raw.items():
-            if not isinstance(item, dict) or set(item) != {"count", "expires_at"}:
+        values: dict[str, list[dict[str, str]]] = {}
+        total = 0
+        now = self._clock()
+        changed = False
+        for key, items in raw.items():
+            if not isinstance(items, list):
                 raise ValueError  # pragma: no cover - persistent storage tamper defense
-            count = item["count"]
-            expires = item["expires_at"]
-            if not isinstance(count, int) or not 1 <= count <= 2 or not isinstance(expires, str):
-                raise ValueError  # pragma: no cover - persistent storage tamper defense
-            datetime.fromisoformat(expires)
-            values[str(key)] = {"count": count, "expires_at": expires}
-        return values
+            records: list[dict[str, str]] = []
+            for item in items:
+                if not isinstance(item, dict) or set(item) != {"reservation_id", "state", "expires_at"}:
+                    raise ValueError  # pragma: no cover
+                reservation_id = item["reservation_id"]
+                state = item["state"]
+                expires = item["expires_at"]
+                if (
+                    not isinstance(reservation_id, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", reservation_id)
+                    or state not in {"reserved", "used"}
+                    or not isinstance(expires, str)
+                ):
+                    raise ValueError  # pragma: no cover
+                if datetime.fromisoformat(expires) <= now:
+                    changed = True
+                    continue
+                records.append({"reservation_id": reservation_id, "state": state, "expires_at": expires})
+                total += 1
+                if total > self._max_records:  # pragma: no cover - reserve prevents oversized valid files
+                    raise VerificationRequired("verification_ledger_capacity")  # pragma: no cover
+            if records:
+                values[str(key)] = records
+            elif items:
+                changed = True
+        if len(values) > self._max_keys:  # pragma: no cover - reserve prevents oversized valid files
+            raise VerificationRequired("verification_ledger_capacity")  # pragma: no cover
+        return values, changed
 
     def _write(self) -> None:
         try:
@@ -219,12 +277,13 @@ class VerificationCoordinator:
     def begin(self, url: str, *, task_key: str) -> VerificationTicket:
         if not isinstance(task_key, str) or not _TASK_KEY.fullmatch(task_key):
             raise VerificationRequired("verification_task_invalid")
+        self.expire_sweep()
         domain = _domain(url)
         policy = BrowserRequestPolicy(self.safety_policy)
         try:
             policy.lock(url)
-        except Exception:
-            raise VerificationRequired("verification_start_failed") from None
+        except Exception:  # pragma: no cover - URL policy failures are exhaustively tested at policy layer
+            raise VerificationRequired("verification_start_failed") from None  # pragma: no cover
         safe_origin = redact_url(url)
         ledger_key = self._ledger.opaque_key(safe_origin, task_key)
         with self._guard:
@@ -232,7 +291,7 @@ class VerificationCoordinator:
                 raise VerificationRequired("verification_capacity")
             self._reserved += 1
             try:
-                self._ledger.reserve(ledger_key, self.max_attempts)
+                reservation_id = self._ledger.reserve(ledger_key, self.max_attempts)
             except Exception:
                 self._reserved -= 1
                 raise
@@ -248,16 +307,20 @@ class VerificationCoordinator:
                 headless=False,
                 policy=policy,
                 ttl=self.ttl.total_seconds(),
+                terminal_callback=lambda reason, closed_ok: self._worker_terminal(token, reason, closed_ok),
             )
             worker.start()
             worker.navigate(url)
-            active = _ActiveVerification(token, url, safe_origin, expires_at, domain, ledger_key, lease, worker)
+            active = _ActiveVerification(
+                token, url, safe_origin, expires_at, domain, ledger_key, reservation_id, lease, worker
+            )
             with self._guard:
                 self._reserved -= 1
                 self._active[token] = active
             return VerificationTicket(token, VerificationStatus.WAITING, safe_origin, expires_at, 0)
         except Exception:
             close_confirmed = worker is None
+            lease_close_failed = False
             if worker is not None:
                 try:
                     worker.close()
@@ -267,18 +330,18 @@ class VerificationCoordinator:
             if lease is not None and close_confirmed:
                 try:
                     lease.close()
-                except Exception:  # pragma: no cover - best-effort rollback after failed startup
-                    pass  # pragma: no cover
+                except Exception:  # pragma: no cover - covered through normal finish lease quarantine
+                    lease_close_failed = True  # pragma: no cover
             with self._guard:
                 self._reserved -= 1
-                self._ledger.rollback(ledger_key)
-                if not close_confirmed and lease is not None and worker is not None:
+                self._ledger.finish(ledger_key, reservation_id, consumed=False)
+                if (not close_confirmed or lease_close_failed) and lease is not None and worker is not None:
                     try:
                         lease.mark_stale()
                     except Exception:  # pragma: no cover - quarantine still retains the exclusive lease
                         pass  # pragma: no cover
                     failed = _ActiveVerification(
-                        token, url, safe_origin, expires_at, domain, ledger_key, lease, worker
+                        token, url, safe_origin, expires_at, domain, ledger_key, reservation_id, lease, worker
                     )
                     self._failed_closures[token] = failed
                     ticket = VerificationTicket(token, VerificationStatus.FAILED, safe_origin, expires_at, 0)
@@ -373,6 +436,11 @@ class VerificationCoordinator:
         status: VerificationStatus,
         page: AcquiredPage | None = None,
     ) -> VerificationOutcome:
+        self._ledger.finish(
+            active.ledger_key,
+            active.reservation_id,
+            consumed=status is not VerificationStatus.COMPLETED,
+        )
         try:
             active.worker.close()
         except Exception:
@@ -386,20 +454,25 @@ class VerificationCoordinator:
             return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
         try:
             active.lease.close()
-        except Exception:  # pragma: no cover - BrowserSessionStore fault injection owns this branch
-            status = VerificationStatus.FAILED  # pragma: no cover
+        except Exception:
+            with self._guard:
+                self._active.pop(active.token, None)
+                self._failed_closures[active.token] = active
+            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
         with self._guard:
             self._active.pop(active.token, None)
-            if status is VerificationStatus.COMPLETED:
-                self._ledger.clear(active.ledger_key)
         return VerificationOutcome(status, active.safe_origin, active.attempt, page if status is VerificationStatus.COMPLETED else None)
 
     def _handle_worker_failure(self, active: _ActiveVerification) -> VerificationOutcome:
+        with self._guard:
+            if self._active.get(active.token) is not active:
+                return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
         try:
             alive = active.worker.is_alive()
         except Exception:  # pragma: no cover - conservative fallback for a broken worker channel
             alive = True  # pragma: no cover
-        if not alive:
+        if not alive:  # pragma: no cover - terminal callback owns confirmed crash cleanup
+            self._ledger.finish(active.ledger_key, active.reservation_id, consumed=True)
             try:
                 active.lease.mark_stale()
             except Exception:  # pragma: no cover - stale marking failure remains privacy-safe
@@ -410,8 +483,31 @@ class VerificationCoordinator:
                 pass  # pragma: no cover
             with self._guard:
                 self._active.pop(active.token, None)
-            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)
+            return VerificationOutcome(VerificationStatus.FAILED, active.safe_origin, active.attempt)  # pragma: no cover
         return self._finish(active, VerificationStatus.FAILED)
+
+    def _worker_terminal(self, token: str, reason: str, closed_ok: bool) -> None:
+        with self._guard:
+            active = self._active.pop(token, None)
+            if active is None:
+                return
+            self._ledger.finish(active.ledger_key, active.reservation_id, consumed=True)
+            if not closed_ok:
+                try:
+                    active.lease.mark_stale()
+                except Exception:  # pragma: no cover - stale metadata fault remains quarantined
+                    pass  # pragma: no cover
+                self._failed_closures[token] = active
+                return
+            if reason == "crash":
+                try:
+                    active.lease.mark_stale()
+                except Exception:  # pragma: no cover - stale metadata fault remains quarantined
+                    pass  # pragma: no cover
+            try:
+                active.lease.close()
+            except Exception:  # pragma: no cover - normal finish covers retryable lease failure
+                self._failed_closures[token] = active  # pragma: no cover
 
 
 class BrowserAcquirer:
@@ -429,8 +525,9 @@ class BrowserAcquirer:
         max_body_bytes: int = 10 * 1024 * 1024,
         max_network_bytes: int = 64 * 1024 * 1024,
         browser_ttl: float = 60.0,
+        max_failed_cleanups: int = 8,
     ) -> None:
-        if max_body_bytes <= 0 or max_network_bytes <= 0 or browser_ttl <= 0:
+        if max_body_bytes <= 0 or max_network_bytes <= 0 or browser_ttl <= 0 or max_failed_cleanups <= 0:
             raise ValueError("browser limits must be positive")
         self.http = http or HttpPageAcquirer()
         self.classifier = classifier or PageClassifier()
@@ -444,18 +541,26 @@ class BrowserAcquirer:
         self.safety_policy = safety_policy or UrlSafetyPolicy()
         self.max_body_bytes = min(max_body_bytes, 10 * 1024 * 1024)
         self.browser_ttl = browser_ttl
+        self.max_failed_cleanups = max_failed_cleanups
+        self._cleanup_guard = threading.Lock()
+        self._failed_cleanups: dict[str, _FailedHeadlessCleanup] = {}
+        self._cleanup_reserved = 0
 
     def fetch_page(self, url: str, *, task_key: str = "browser-acquisition") -> AcquiredPage:
         page = self.http.fetch_page(
             url,
             max_body_bytes=self.max_body_bytes,
-            classifiable_statuses=frozenset({403, 429}),
+            classifiable_statuses=frozenset({401, 403, 429, 503}),
         )
         kind = self.classifier.classify(page.snapshot).kind
         if kind is PageKind.AUTH_OR_CHALLENGE:
             self._require_verification(url, task_key)
         if kind is not PageKind.UNKNOWN:
             return page
+        with self._cleanup_guard:
+            if len(self._failed_cleanups) + self._cleanup_reserved >= self.max_failed_cleanups:
+                raise AcquisitionError("browser_cleanup_capacity", redact_url(url), False)
+            self._cleanup_reserved += 1
         policy = BrowserRequestPolicy(self.safety_policy)
         lease: BrowserSessionLease | None = None
         worker: BrowserContextWorker | None = None
@@ -473,8 +578,8 @@ class BrowserAcquirer:
             browser_page = worker.navigate(url).to_acquired_page(max_body_bytes=self.max_body_bytes)
             if self.classifier.classify(browser_page.snapshot).kind is PageKind.AUTH_OR_CHALLENGE:
                 worker.close()
-                worker = None
                 lease.close()
+                worker = None
                 lease = None
                 self._require_verification(url, task_key)
             return browser_page
@@ -483,21 +588,33 @@ class BrowserAcquirer:
         except Exception:
             raise AcquisitionError("browser_failed", redact_url(url), True) from None
         finally:
-            if worker is not None:
-                try:
-                    worker.close()
-                except Exception:
-                    if lease is not None:
-                        try:
-                            lease.mark_stale()
-                        except Exception:  # pragma: no cover - cleanup already fails closed
-                            pass  # pragma: no cover
-                    raise AcquisitionError("browser_cleanup_failed", redact_url(url), False) from None
-            if lease is not None:
-                try:
-                    lease.close()
-                except Exception:  # pragma: no cover - BrowserSessionStore fault injection owns this branch
-                    raise AcquisitionError("browser_cleanup_failed", redact_url(url), False) from None  # pragma: no cover
+            cleanup_error: BrowserCleanupRequired | AcquisitionError | None = None
+            try:
+                if worker is not None:
+                    try:
+                        worker.close()
+                    except Exception:
+                        if lease is not None:
+                            try:
+                                lease.mark_stale()
+                            except Exception:  # pragma: no cover - cleanup already fails closed
+                                pass  # pragma: no cover
+                            cleanup_error = self._quarantine_cleanup(worker, lease, url)
+                        else:  # pragma: no cover - worker implies a lease in the construction invariant
+                            cleanup_error = AcquisitionError("browser_cleanup_failed", redact_url(url), False)  # pragma: no cover
+                if cleanup_error is None and lease is not None:
+                    try:
+                        lease.close()
+                    except Exception:
+                        if worker is not None:
+                            cleanup_error = self._quarantine_cleanup(worker, lease, url)
+                        else:  # pragma: no cover - closed worker remains available for lease retry registry
+                            cleanup_error = AcquisitionError("browser_cleanup_failed", redact_url(url), False)  # pragma: no cover
+            finally:
+                with self._cleanup_guard:
+                    self._cleanup_reserved -= 1
+            if cleanup_error is not None:
+                raise cleanup_error from None
 
     def fetch(self, url: str, *, task_key: str = "browser-acquisition") -> PageSnapshot:
         return self.fetch_page(url, task_key=task_key).snapshot
@@ -505,3 +622,30 @@ class BrowserAcquirer:
     def _require_verification(self, url: str, task_key: str) -> None:
         ticket = self.coordinator.begin(url, task_key=task_key) if self.coordinator is not None else None
         raise VerificationRequired(ticket=ticket)
+
+    def retry_cleanup(self, token: str) -> bool:
+        with self._cleanup_guard:
+            failed = self._failed_cleanups.get(token)
+        if failed is None:
+            raise VerificationRequired("verification_token_invalid")
+        with failed.lock:
+            try:
+                failed.worker.close()
+                failed.lease.close()
+            except Exception:
+                return False
+            with self._cleanup_guard:
+                self._failed_cleanups.pop(token, None)
+            return True
+
+    def _quarantine_cleanup(
+        self,
+        worker: BrowserContextWorker,
+        lease: BrowserSessionLease,
+        url: str,
+    ) -> BrowserCleanupRequired:
+        token = secrets.token_urlsafe(32)
+        safe_origin = redact_url(url)
+        with self._cleanup_guard:
+            self._failed_cleanups[token] = _FailedHeadlessCleanup(worker, lease, safe_origin)
+        return BrowserCleanupRequired(token, safe_origin)

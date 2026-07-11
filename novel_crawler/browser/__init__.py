@@ -1,6 +1,6 @@
 """Persistent, domain-isolated browser sessions."""
 
-from .coordinator import BrowserAcquirer, VerificationCoordinator, VerificationRequired
+from .coordinator import BrowserAcquirer, BrowserCleanupRequired, VerificationCoordinator, VerificationRequired
 from .driver import (
     BrowserContextWorker,
     BrowserPageSnapshot,
@@ -25,6 +25,7 @@ from .sessions import (
 
 __all__ = [
     "BrowserAcquirer",
+    "BrowserCleanupRequired",
     "BrowserContextWorker",
     "BrowserPageSnapshot",
     "BrowserRequestPolicy",

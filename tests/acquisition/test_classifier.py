@@ -131,9 +131,10 @@ def test_actual_http_error_precedes_auth_but_soft_error_title_does_not() -> None
     assert result.evidence == ("auth.password_input",)
 
 
-def test_challenge_body_on_classifiable_http_status_is_auth() -> None:
+@pytest.mark.parametrize("status", [401, 403, 429, 503])
+def test_challenge_body_on_classifiable_http_status_is_auth(status: int) -> None:
     html = "<title>Verify human</title><form action='/captcha'><input name='captcha'></form>Verify human"
-    result = PageClassifier().classify(snapshot(403, html))
+    result = PageClassifier().classify(snapshot(status, html))
     assert result.kind is PageKind.AUTH_OR_CHALLENGE
 
 

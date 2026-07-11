@@ -184,7 +184,8 @@ class PinnedSocksProxy:
     def _reject_capacity(self, client: socket.socket) -> None:
         try:
             client.settimeout(self._connection_timeout)
-            self._recv_exact(client, 3)
+            _, count = self._recv_exact(client, 2)
+            self._recv_exact(client, count)
             client.sendall(b"\x05\xff")
         except (OSError, ProxyError):  # pragma: no cover - racing capacity client disconnect
             pass  # pragma: no cover
@@ -205,10 +206,17 @@ class PinnedSocksProxy:
             client.setblocking(False)
             upstream.setblocking(False)
             self._relay(client, upstream)
-        except (OSError, ProxyError):
+        except ProxyError as exc:
+            if exc.code == "proxy_method_rejected":
+                return
             try:
                 client.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
             except OSError:  # pragma: no cover - peer may close before rejection reply
+                pass  # pragma: no cover
+        except OSError:
+            try:
+                client.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+            except OSError:  # pragma: no cover
                 pass  # pragma: no cover
         finally:
             self._close_socket(client)
@@ -222,7 +230,8 @@ class PinnedSocksProxy:
         version, count = self._recv_exact(client, 2)
         methods = self._recv_exact(client, count)
         if version != 5 or 0 not in methods:
-            raise ProxyError("proxy_handshake_rejected")
+            client.sendall(b"\x05\xff")
+            raise ProxyError("proxy_method_rejected")
         client.sendall(b"\x05\x00")
         version, command, reserved, atyp = self._recv_exact(client, 4)
         if version != 5 or command != 1 or reserved != 0 or atyp != 3:
