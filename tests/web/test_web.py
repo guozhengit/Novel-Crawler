@@ -5,6 +5,7 @@ import json
 import re
 import socket
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -172,6 +173,7 @@ def test_root_creates_hardened_session_and_safe_dom_ui(web_app) -> None:
     page = body.decode()
     assert "小说抓取任务" in page
     assert all(label in page for label in ("继续验证", "确认配置", "重试清理", "safe_origin"))
+    assert all(label in page for label in ("确认删除", "取消删除", "书籍已删除", "导出已完成"))
 
 
 def test_host_session_origin_and_csrf_are_strict(web_app) -> None:
@@ -266,12 +268,18 @@ def test_application_errors_map_to_stable_safe_status(web_app) -> None:
 
 def test_session_table_is_bounded_and_all_unsafe_methods_are_rejected(web_app) -> None:
     _, server, client = web_app
-    for _ in range(1100):
-        server.sessions.create()
-    assert len(server.sessions._items) == 1024
     client.login()
+    for _ in range(1023):
+        assert server.sessions.create() is not None
+    assert len(server.sessions._items) == 1024
+    previous_cookie, previous_csrf = client.cookie, client.csrf
+    client.login()
+    assert (client.cookie, client.csrf) == (previous_cookie, previous_csrf)
+    assert Client(server).request("GET", "/")[0] == 429
+    assert client.request("GET", "/api/tasks")[0] == 200
     for method in ("OPTIONS", "PUT", "DELETE", "PATCH"):
         assert client.request(method, "/api/tasks", {})[0] == 405
+        assert client.request(method, "/api/tasks", {}, headers={"Host": "evil.test"})[0] == 421
 
 
 def test_paths_nan_and_deep_json_fail_closed(web_app) -> None:
@@ -345,9 +353,12 @@ def test_invalid_route_fields_and_application_failures_are_stable(web_app) -> No
 
 
 def test_sessions_expire_and_safe_serialization_redacts_unknown_values() -> None:
-    sessions = web_server._Sessions(ttl=0)
-    session_id, _ = sessions.create()
+    sessions = web_server._Sessions(ttl=0, maximum=1)
+    created = sessions.create()
+    assert created is not None
+    session_id, _ = created
     assert sessions.get(session_id) is None
+    assert sessions.create() is not None
     assert web_server._safe_value(float("nan")) == 0
     assert web_server._safe_value([object()]) == ["[redacted]"]
     assert web_server._safe_text("token=secret", 100) == "[redacted]"
@@ -406,3 +417,88 @@ def test_rejected_request_body_cannot_be_reinterpreted_on_same_connection(web_ap
     response = raw_request(server, request)
     assert response.count(b"HTTP/1.1") == 1
     assert b"Connection: close" in response
+
+
+def test_slow_clients_are_bounded_and_capacity_recovers() -> None:
+    app = FakeApplication()
+    server = create_web_server(
+        app=app,
+        host="127.0.0.1",
+        port=0,
+        max_connections=4,
+        read_timeout=0.2,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    sockets: list[socket.socket] = []
+    try:
+        for _ in range(32):
+            connection = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=2)
+            connection.settimeout(2)
+            connection.sendall(b"GET / HTTP/1.1\r\nHost:")
+            sockets.append(connection)
+            if len(sockets) == 4:
+                time.sleep(0.05)
+                busy = raw_request(
+                    server,
+                    f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{server.server_address[1]}\r\n\r\n".encode(),
+                )
+                assert busy.startswith(b"HTTP/1.1 503")
+        started = time.monotonic()
+        responses = []
+        for connection in sockets:
+            chunks = []
+            try:
+                while chunk := connection.recv(4096):
+                    chunks.append(chunk)
+            except OSError:
+                pass
+            responses.append(b"".join(chunks))
+        assert time.monotonic() - started < 3
+        assert any(response.startswith(b"HTTP/1.1 503") for response in responses)
+        assert Client(server).request("GET", "/")[0] == 200
+    finally:
+        for connection in sockets:
+            connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+
+
+def test_factory_and_bind_failures_have_bounded_safe_cleanup(monkeypatch) -> None:
+    def broken_factory():
+        raise RuntimeError("token=private")
+
+    with pytest.raises(RuntimeError, match="^application_factory_failed$") as factory_error:
+        create_web_server(app_factory=broken_factory, host="127.0.0.1", port=0)
+    assert "private" not in str(factory_error.value)
+
+    owned = FakeApplication()
+    owned.close = lambda: False
+
+    def broken_server(*_args, **_kwargs):
+        raise OSError("C:\\private\\token.txt")
+
+    monkeypatch.setattr(web_server, "WebServer", broken_server)
+    with pytest.raises(RuntimeError, match="^application_close_failed$") as close_error:
+        create_web_server(app_factory=lambda: owned, host="127.0.0.1", port=0)
+    assert "private" not in str(close_error.value)
+
+
+def test_factory_ownership_and_server_limits_fail_closed() -> None:
+    called = False
+
+    def factory():
+        nonlocal called
+        called = True
+        return FakeApplication()
+
+    with pytest.raises(ValueError, match="factory application must be owned"):
+        create_web_server(app_factory=factory, close_application=False, host="127.0.0.1", port=0)
+    assert called is False
+    for value in (True, 0, 257):
+        with pytest.raises(ValueError, match="invalid web server limits"):
+            create_web_server(app=FakeApplication(), max_connections=value, host="127.0.0.1", port=0)
+    for value in (True, float("nan"), float("inf"), 0.01):
+        with pytest.raises(ValueError, match="invalid web server limits"):
+            create_web_server(app=FakeApplication(), read_timeout=value, host="127.0.0.1", port=0)

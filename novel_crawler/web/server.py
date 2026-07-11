@@ -23,6 +23,7 @@ from novel_crawler.core.domains import canonical_domain
 from .assets import HTML
 
 _MAX_BODY = 65_536
+_BUSY_BODY = b'{"error":{"code":"server_busy","retryable":true}}'
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _SELECTOR_FIELDS = {"title", "author", "chapter_list", "chapter_title", "content"}
 _TASK_FIELDS = {
@@ -78,12 +79,12 @@ class _Sessions:
         self._items: OrderedDict[str, _Session] = OrderedDict()
         self._lock = threading.Lock()
 
-    def create(self) -> tuple[str, str]:
+    def create(self) -> tuple[str, str] | None:
         now = time.monotonic()
         with self._lock:
             self._purge(now)
-            while len(self._items) >= self._maximum:
-                self._items.popitem(last=False)
+            if len(self._items) >= self._maximum:
+                return None
             session_id, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
             self._items[session_id] = _Session(csrf, now + self._ttl)
             return session_id, csrf
@@ -94,6 +95,8 @@ class _Sessions:
             self._purge(now)
             value = self._items.get(session_id)
             if value is not None:
+                value = _Session(value.csrf, now + self._ttl)
+                self._items[session_id] = value
                 self._items.move_to_end(session_id)
             return value
 
@@ -106,11 +109,21 @@ class _Sessions:
 class WebServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], app: Application, *, owns_app: bool) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        app: Application,
+        *,
+        owns_app: bool,
+        max_connections: int,
+        read_timeout: float,
+    ) -> None:
         self.application = app
         self.owns_application = owns_app
         self.sessions = _Sessions()
         self._app_closed = False
+        self._capacity = threading.BoundedSemaphore(max_connections)
+        self._read_timeout = read_timeout
         super().__init__(address, WebHandler)
         port = int(self.server_address[1])
         bound = str(self.server_address[0]).casefold()
@@ -121,12 +134,39 @@ class WebServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         super().server_close()
         if self.owns_application and not self._app_closed:
-            for _ in range(3):
-                if self.application.close():
-                    self._app_closed = True
-                    break
+            self._app_closed = _bounded_close(self.application)
             if not self._app_closed:
                 raise RuntimeError("application_close_failed")
+
+    def get_request(self) -> tuple[socket.socket, object]:
+        request, address = super().get_request()
+        request.settimeout(self._read_timeout)
+        return request, address
+
+    def process_request(self, request: socket.socket, client_address: object) -> None:
+        if not self._capacity.acquire(blocking=False):
+            try:
+                headers = (
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(_BUSY_BODY)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+                ).encode("ascii")
+                request.sendall(headers + _BUSY_BODY)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._capacity.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: object) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._capacity.release()
 
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -140,7 +180,15 @@ class WebHandler(BaseHTTPRequestHandler):
         if path is None:
             return self._error("path_invalid", HTTPStatus.BAD_REQUEST)
         if path == "/":
-            session_id, csrf = self.server.sessions.create()
+            current = self._session_data()
+            if current is None:
+                created = self.server.sessions.create()
+                if created is None:
+                    return self._error("session_capacity", HTTPStatus.TOO_MANY_REQUESTS, retryable=True)
+                session_id, csrf = created
+            else:
+                session_id, session = current
+                csrf = session.csrf
             nonce = secrets.token_urlsafe(24)
             body = HTML.format(csrf=csrf, nonce=nonce).encode("utf-8")
             self._send(
@@ -203,6 +251,9 @@ class WebHandler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None: self._method_not_allowed()
 
     def _method_not_allowed(self) -> None:
+        if not self._valid_host():
+            self._error("host_invalid", HTTPStatus.MISDIRECTED_REQUEST)
+            return
         self._error("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
 
     def _get_api(self, path: str) -> None:
@@ -299,6 +350,10 @@ class WebHandler(BaseHTTPRequestHandler):
         return value
 
     def _session(self) -> _Session | None:
+        current = self._session_data()
+        return current[1] if current is not None else None
+
+    def _session_data(self) -> tuple[str, _Session] | None:
         values = self.headers.get_all("Cookie") or []
         if len(values) != 1 or not values[0] or len(values[0]) > 4096:
             return None
@@ -309,7 +364,10 @@ class WebHandler(BaseHTTPRequestHandler):
         except Exception:
             return None
         item = cookie.get("nc_session")
-        return self.server.sessions.get(item.value) if item is not None else None
+        if item is None:
+            return None
+        session = self.server.sessions.get(item.value)
+        return (item.value, session) if session is not None else None
 
     def _valid_host(self) -> bool:
         values = self.headers.get_all("Host") or []
@@ -389,20 +447,47 @@ def create_web_server(
     port: int = 8765,
     unsafe_non_loopback: bool = False,
     close_application: bool | None = None,
+    max_connections: int = 16,
+    read_timeout: float = 5.0,
 ) -> WebServer:
     if not _is_loopback(host) and not unsafe_non_loopback:
         raise ValueError("non-loopback binding requires unsafe_non_loopback=True")
     if (app is None) == (app_factory is None):
         raise ValueError("provide exactly one application source")
-    application = app if app is not None else app_factory()
-    assert application is not None
-    owns = (app_factory is not None) if close_application is None else close_application
+    if app_factory is not None and close_application is False:
+        raise ValueError("factory application must be owned")
+    if (
+        isinstance(max_connections, bool)
+        or not isinstance(max_connections, int)
+        or not 1 <= max_connections <= 256
+        or isinstance(read_timeout, bool)
+        or not isinstance(read_timeout, int | float)
+        or not math.isfinite(read_timeout)
+        or not 0.1 <= read_timeout <= 60
+    ):
+        raise ValueError("invalid web server limits")
+    if app is not None:
+        application = app
+    else:
+        try:
+            application = app_factory()
+        except Exception:
+            raise RuntimeError("application_factory_failed") from None
+        if application is None:
+            raise RuntimeError("application_factory_failed")
+    owns = app_factory is not None or close_application is True
     try:
-        return WebServer((host, port), application, owns_app=owns)
+        return WebServer(
+            (host, port),
+            application,
+            owns_app=owns,
+            max_connections=max_connections,
+            read_timeout=read_timeout,
+        )
     except Exception:
-        if owns:
-            application.close()
-        raise
+        if owns and not _bounded_close(application):
+            raise RuntimeError("application_close_failed") from None
+        raise RuntimeError("web_server_start_failed") from None
 
 
 def run_web_ui(
@@ -439,6 +524,16 @@ def _is_loopback(host: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _bounded_close(application: Application) -> bool:
+    for _ in range(3):
+        try:
+            if application.close():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _allowed_hosts(configured: str, bound: str, port: int) -> set[str]:
