@@ -63,6 +63,9 @@ def test_safe_url_template_compiles_escaped_linear_regex() -> None:
     assert not pattern.matches("/book/1/2/chapter/x")
     assert SafeUrlPattern.parse("/assets/*", "example.com").matches("/assets/app.js")
     assert SafeUrlPattern.parse("/files/**", "example.com").matches("/files/a/b.txt")
+    assert SafeUrlPattern.parse("/c{int}", "example.com").matches("/c3")
+    assert SafeUrlPattern.parse("/{int}.html", "example.com").matches("/42.html")
+    assert not SafeUrlPattern.parse("/c{int}", "example.com").matches("/cnews")
 
 
 @pytest.mark.parametrize("change", [

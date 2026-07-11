@@ -20,7 +20,7 @@ from .fingerprint import StructureFingerprint
 from .registry import ConfigConflictError, ConfigRegistry, ConfigStatus, RegistryEntry
 from .revalidation import ConfigRevalidator, RevalidationStatus
 from .service import ProbeService
-from .url_paths import canonical_path, path_template
+from .url_paths import canonical_path, path_template, sibling_template
 from .validation import ConfigDraft, ValidationResult
 
 _SAFE_REASON = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
@@ -211,6 +211,8 @@ class ConfigManager:
                 if result.outcome is DecisionKind.REJECT or result.config_draft is None:
                     raise ValueError("selector overrides failed three-page validation")
                 draft = result.config_draft
+                if any(draft.selector(field) != selector for field, selector in validated.items()):
+                    return ConfigResolution(ResolutionKind.REJECTED, reason_ids=("override_not_applied",))
                 rematerialized = self._materialize(pending_url, draft)
                 if rematerialized is None:
                     raise ValueError("pending config is incomplete")
@@ -310,7 +312,13 @@ class ConfigManager:
         canonical_paths = tuple(dict.fromkeys(canonical_path(path) for path in raw_paths))
         if len(canonical_paths) != 3:
             return None
-        patterns = tuple(dict.fromkeys(path_template(path) for path in canonical_paths))
+        inferred = sibling_template(canonical_paths[1], canonical_paths[2])
+        if inferred is not None:
+            inferred_pattern = SafeUrlPattern.parse(inferred, domain)
+            if not all(inferred_pattern.matches(path) for path in canonical_paths[1:]):
+                inferred = None
+        chapter_patterns = (inferred,) if inferred is not None else canonical_paths[1:]
+        patterns = tuple(dict.fromkeys((path_template(canonical_paths[0]), *chapter_patterns)))
         if not all(any(SafeUrlPattern.parse(template, domain).matches(path) for template in patterns) for path in canonical_paths):
             return None
         samples = []

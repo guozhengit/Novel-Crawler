@@ -4,18 +4,21 @@ import json
 import multiprocessing
 import threading
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from novel_crawler.adaptation.config_manager import ConfigManager, ConfigResolution, ResolutionKind
-from novel_crawler.adaptation.decision import DecisionKind
+from novel_crawler.adaptation.decision import DecisionConfig, DecisionKind, DecisionPolicy
 from novel_crawler.adaptation.fingerprint import StructureFingerprint
 from novel_crawler.adaptation.registry import ConfigRegistry, ConfigStatus, RegistryEntry
-from novel_crawler.adaptation.revalidation import RevalidationResult, RevalidationStatus
+from novel_crawler.adaptation.revalidation import ConfigRevalidator, RevalidationResult, RevalidationStatus
+from novel_crawler.adaptation.service import ProbeService
 from novel_crawler.adaptation.url_paths import canonical_path
 from novel_crawler.adaptation.validation import ConfigDraft, ValidationResult
+from tests.adaptation.test_service import FakeAcquirer
 
 
 def _draft(domain: str = "example.test") -> ConfigDraft:
@@ -45,9 +48,21 @@ class Probe:
         self.result = result
         self.calls: list[str] = []
 
-    def probe(self, url: str, *, overrides: object = None) -> ValidationResult:
-        del overrides
+    def probe(self, url: str, *, overrides: Mapping[str, str] | None = None) -> ValidationResult:
         self.calls.append(url)
+        if overrides and self.result.config_draft is not None:
+            draft = self.result.config_draft
+            private = draft.to_config()
+            updated = ConfigDraft(
+                draft.version,
+                draft.domain,
+                draft.scores,
+                {**private["selectors"], **overrides},
+                fingerprints=private["fingerprints"],
+                fingerprint_salt=private["fingerprint_salt"],
+                navigation_paths=private["navigation_paths"],
+            )
+            return _validation(self.result.outcome, updated)
         return self.result
 
 
@@ -69,7 +84,7 @@ class _ProcessProbe:
     def __init__(self, counter: object) -> None:
         self.counter = counter
 
-    def probe(self, url: str, *, overrides: object = None) -> ValidationResult:
+    def probe(self, url: str, *, overrides: Mapping[str, str] | None = None) -> ValidationResult:
         del url, overrides
         lock = self.counter.get_lock()  # type: ignore[attr-defined]
         with lock:
@@ -182,7 +197,7 @@ def test_slow_override_confirmation_does_not_block_unrelated_token_cancel(tmp_pa
     release = threading.Event()
 
     class BlockingProbe(Probe):
-        def probe(self, url: str, *, overrides: object = None) -> ValidationResult:
+        def probe(self, url: str, *, overrides: Mapping[str, str] | None = None) -> ValidationResult:
             entered.set()
             release.wait(timeout=2)
             return super().probe(url, overrides=overrides)
@@ -195,6 +210,21 @@ def test_slow_override_confirmation_does_not_block_unrelated_token_cancel(tmp_pa
     release.set()
     thread.join(timeout=3)
     assert not thread.is_alive()
+
+
+def test_confirmation_rejects_when_probe_does_not_apply_override(tmp_path: Path) -> None:
+    class IgnoringProbe(Probe):
+        def probe(self, url: str, *, overrides: Mapping[str, str] | None = None) -> ValidationResult:
+            del overrides
+            self.calls.append(url)
+            return self.result
+
+    registry = ConfigRegistry(tmp_path)
+    manager = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), IgnoringProbe(_validation(DecisionKind.REQUIRE_CONFIRMATION, _draft())))
+    pending = manager.resolve("https://example.test/book/1")
+    result = manager.confirm(pending.confirmation_token, {"content": "main article"})
+    assert result.kind is ResolutionKind.REJECTED and result.reason_ids == ("override_not_applied",)
+    assert registry.list() == ()
 
 
 def test_reject_and_incomplete_baseline_never_write(tmp_path: Path) -> None:
@@ -255,6 +285,62 @@ def test_materializes_all_verified_canonical_paths_and_percent_encoded_digits_ma
     assert registry.lookup("https://example.test/chapter/2") is not None
     assert canonical_path("/book%2fadmin") == "/book%2Fadmin"
     assert canonical_path("/a/%2e%2e/b") == "/a/%2E%2E/b"
+
+
+@pytest.mark.parametrize(
+    ("chapter_paths", "expected", "third", "matches"),
+    [
+        (("/c1", "/c2"), "/c{int}", "/c3", True),
+        (("/1.html", "/2.html"), "/{int}.html", "/3.html", True),
+        (("/c1", "/news"), None, "/c3", False),
+        (("/a/1/x", "/b/2/x"), None, "/a/3/x", False),
+    ],
+)
+def test_pairwise_sibling_inference_is_conservative(tmp_path: Path, chapter_paths: tuple[str, str], expected: str | None, third: str, matches: bool) -> None:
+    original = _draft()
+    private = original.to_config()
+    draft = ConfigDraft(
+        original.version,
+        original.domain,
+        original.scores,
+        private["selectors"],
+        fingerprints=private["fingerprints"],
+        fingerprint_salt=private["fingerprint_salt"],
+        navigation_paths=("/book", *chapter_paths),
+    )
+    registry = ConfigRegistry(tmp_path)
+    result = ConfigManager(registry, Revalidator(RevalidationStatus.VALID), Probe(_validation(DecisionKind.AUTO_ACCEPT, draft))).resolve("https://example.test/book")
+    assert result.config is not None
+    templates = {pattern.template for pattern in result.config.url_patterns}
+    assert (expected in templates) is (expected is not None)
+    assert (registry.lookup(f"https://example.test{third}") is not None) is matches
+
+
+def test_real_probe_override_materializes_sibling_pattern_and_revalidates_exact_baseline(tmp_path: Path) -> None:
+    pages = {
+        "https://example.test/book": '<h1>Book A</h1><div id="list"><a href="/c1">Chapter 1</a><a href="/c2">Chapter 2</a><a href="/c3">Chapter 3</a></div>',
+        "https://example.test/c1": '<h1>Chapter 1</h1><article class="content"><p>' + "a" * 80 + '</p><p>x</p></article><a rel="next" href="/c2">Next</a>',
+        "https://example.test/c2": '<h1>Chapter 2</h1><article class="content"><p>' + "b" * 90 + "</p><p>y</p></article>",
+    }
+    registry = ConfigRegistry(tmp_path)
+    revalidator = ConfigRevalidator(
+        acquirer=FakeAcquirer(pages),
+        registry=registry,
+        decision=DecisionPolicy(DecisionConfig(high=0.7, medium=0.5)),
+        minimum_score=0.7,
+    )
+    manager = ConfigManager(registry, revalidator, ProbeService(acquirer=FakeAcquirer(pages)))
+    pending = manager.resolve("https://example.test/book")
+    assert pending.kind is ResolutionKind.CONFIRMATION_REQUIRED
+    assert manager._pending[pending.confirmation_token].draft.selector("content") != "article.content"
+    confirmed = manager.confirm(pending.confirmation_token, {"content": "article.content"})
+    assert confirmed.kind is ResolutionKind.REGISTERED and confirmed.config is not None
+    assert confirmed.config.selectors["chapter"]["content"] == "article.content"
+    assert {pattern.template for pattern in confirmed.config.url_patterns} == {"/book", "/c{int}"}
+    assert registry.lookup("https://example.test/c3") is not None
+    reused = manager.resolve("https://example.test/book")
+    assert reused.kind is ResolutionKind.REUSED and reused.config is not None
+    assert reused.config.config_id == confirmed.config.config_id
 
 
 def test_resolution_invariants_and_exact_root_pattern() -> None:

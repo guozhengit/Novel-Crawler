@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -286,14 +286,7 @@ class ConfigRevalidator:
             nodes = soup.select(selector)
             if not nodes:
                 continue
-            scored_clean = next(
-                (
-                    item
-                    for item in page.scored
-                    if item.candidate.field.value == "clean_selector" and item.candidate.selector == selector
-                ),
-                None,
-            )
+            scored_clean = self._equivalent_scored(page, soup, "clean_selector", selector, nodes)
             if scored_clean is None:
                 raise ValueError("saved clean selector is absent from extracted candidates")
             scores["clean_selector"] = min(scores.get("clean_selector", 1.0), scored_clean.score)
@@ -313,18 +306,22 @@ class ConfigRevalidator:
                 not isinstance(nodes[0], Tag) or nodes[0].name != "a" or not nodes[0].get("href")
             ):
                 raise ValueError("navigation selector must match an anchor")
-            scored = next(
-                (
-                    item
-                    for item in page.scored
-                    if item.candidate.field.value == field and item.candidate.selector == selector
-                ),
-                None,
-            )
+            scored = self._equivalent_scored(page, soup, field, selector, nodes)
             if scored is None:
                 raise ValueError("saved selector is absent from extracted candidates")
             score = scored.score
             scores[field] = min(scores.get(field, 1.0), score)
+
+    @staticmethod
+    def _equivalent_scored(page: _AnalyzedPage, soup: BeautifulSoup, field: str, selector: str, selected: Sequence[Tag]) -> ScoredCandidate | None:
+        equivalent = []
+        for item in page.scored:
+            if item.candidate.field.value != field:
+                continue
+            candidate_nodes = soup.select(item.candidate.selector)
+            if len(candidate_nodes) == len(selected) and all(candidate is saved for candidate, saved in zip(candidate_nodes, selected, strict=True)):
+                equivalent.append(item)
+        return max(equivalent, key=lambda item: item.score, default=None)
 
     def _fingerprint_matches(
         self,

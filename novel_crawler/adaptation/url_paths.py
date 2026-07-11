@@ -68,3 +68,29 @@ def path_template(path: str) -> str:
         else:
             output.append(part)
     return "/" + "/".join(output)
+
+
+def sibling_template(first: str, second: str) -> str | None:
+    first_parts = canonical_path(first).split("/")[1:]
+    second_parts = canonical_path(second).split("/")[1:]
+    if len(first_parts) != len(second_parts):
+        return None
+    differences = [index for index, pair in enumerate(zip(first_parts, second_parts, strict=True)) if pair[0] != pair[1]]
+    if len(differences) != 1:
+        return None
+    index = differences[0]
+    left, right = first_parts[index], second_parts[index]
+    prefix_length = 0
+    while prefix_length < min(len(left), len(right)) and left[prefix_length] == right[prefix_length]:
+        prefix_length += 1
+    suffix_length = 0
+    while suffix_length < min(len(left), len(right)) - prefix_length and left[-1 - suffix_length] == right[-1 - suffix_length]:
+        suffix_length += 1
+    left_middle = left[prefix_length : len(left) - suffix_length if suffix_length else None]
+    right_middle = right[prefix_length : len(right) - suffix_length if suffix_length else None]
+    if not re.fullmatch(r"[0-9]+", left_middle) or not re.fullmatch(r"[0-9]+", right_middle):
+        return None
+    suffix = left[len(left) - suffix_length :] if suffix_length else ""
+    merged = [*first_parts]
+    merged[index] = left[:prefix_length] + "{int}" + suffix
+    return "/" + "/".join(merged)

@@ -89,6 +89,13 @@ class SafeUrlPattern:
                 compiled.append("[0-9]+")
             elif part == "{slug}":
                 compiled.append("[A-Za-z0-9][A-Za-z0-9._~-]*")
+            elif "{int}" in part:
+                if part.count("{int}") != 1 or "{" in part.replace("{int}", "") or "}" in part.replace("{int}", ""):
+                    raise ValueError("URL template contains unsafe placeholder syntax")
+                before, after = part.split("{int}")
+                if any(literal and (not _PATH_LITERAL.fullmatch(literal) or re.sub(_PERCENT, "", literal).find("%") >= 0) for literal in (before, after)):
+                    raise ValueError("URL template contains unsafe path syntax")
+                compiled.append(re.escape(before) + "[0-9]+" + re.escape(after))
             else:
                 if not _PATH_LITERAL.fullmatch(part) or re.sub(_PERCENT, "", part).find("%") >= 0:
                     raise ValueError("URL template contains unsafe path syntax")

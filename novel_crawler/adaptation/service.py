@@ -271,12 +271,21 @@ class ProbeService:
                     return None
             elif any(count != 1 for count in counts):
                 return None
-            matched_scores = [
-                item.score
-                for (soup, analysis), count in zip(pairs, counts, strict=True)
-                for item in analysis.scored
-                if count and item.candidate.field is field_kind and item.candidate.selector == selector
-            ]
+            matched_scores = []
+            for (soup, analysis), count in zip(pairs, counts, strict=True):
+                if not count:
+                    continue
+                override_nodes = soup.select(selector)
+                equivalent = [
+                    item.score
+                    for item in analysis.scored
+                    if item.candidate.field is field_kind
+                    and (candidate_nodes := soup.select(item.candidate.selector))
+                    and len(candidate_nodes) == len(override_nodes)
+                    and all(candidate is override for candidate, override in zip(candidate_nodes, override_nodes, strict=True))
+                ]
+                if equivalent:
+                    matched_scores.append(max(equivalent))
             if sum(1 for count in counts if count) != len(matched_scores):
                 return None
             if matched_scores:
