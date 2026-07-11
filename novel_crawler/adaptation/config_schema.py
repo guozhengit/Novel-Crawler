@@ -7,7 +7,7 @@ import math
 import re
 import secrets
 from collections.abc import Mapping, Sequence
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
 from urllib.parse import urlsplit
@@ -15,13 +15,18 @@ from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 from soupsieve.util import SelectorSyntaxError
 
+CURRENT_SCHEMA_VERSION = 1
 SCHEMA_VERSION = 1
-_FIELDS = frozenset({"schema_version", "config_id", "site", "domain", "url_patterns", "selectors", "request_policy", "generated_at", "last_validated", "field_scores", "validation_samples"})
+_V1_FIELDS = frozenset({"schema_version", "config_id", "site", "domain", "url_patterns", "selectors", "request_policy", "generated_at", "last_validated", "field_scores", "validation_samples", "fingerprint_salt"})
+_FIELDS = _V1_FIELDS
 _CONFIG_ID = re.compile(r"cfg_[A-Za-z0-9_-]{16,80}")
 _SCORE_KEY = re.compile(r"[a-z][a-z0-9_.-]{0,79}")
 _SECRET = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|session|authorization)", re.I)
-_NESTED_QUANTIFIER = re.compile(r"\([^)]*[+*][^)]*\)[+*{]")
 _SAMPLE_FIELDS = frozenset({"page_kind", "matched_fields", "node_count_bucket", "selector_match_counts", "success"})
+_LDH_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_PATH_LITERAL = re.compile(r"[A-Za-z0-9._~%-]*")
+_PERCENT = re.compile(r"%(?:[0-9A-Fa-f]{2})")
+_UNSAFE_SELECTOR = re.compile(r"(?::has\s*\(|:contains\s*\(|https?://|@|[?&]|token|secret|password|session)", re.I)
 
 
 def _utc(value: object, field: str) -> str:
@@ -43,37 +48,82 @@ def _domain(value: object) -> str:
         normalized = value.rstrip(".").encode("idna").decode("ascii").lower()
     except UnicodeError as exc:
         raise ValueError("domain is not valid IDNA") from exc
-    if len(normalized) > 253 or "." not in normalized or any(not part or len(part) > 63 or part.startswith("-") or part.endswith("-") for part in normalized.split(".")):
+    if len(normalized) > 253 or "." not in normalized or any(not _LDH_LABEL.fullmatch(part) for part in normalized.split(".")):
         raise ValueError("domain is not a valid hostname")
     return normalized
 
 
-def _pattern(value: object, domain: str) -> str:
-    if not isinstance(value, str) or not value or len(value) > 512 or _SECRET.search(value) or _NESTED_QUANTIFIER.search(value):
-        raise ValueError("URL pattern is unsafe")
-    parsed = urlsplit(value)
-    if parsed.query or parsed.fragment or parsed.username or parsed.password:
-        raise ValueError("URL pattern must not contain query data, fragments or userinfo")
-    if parsed.scheme:
-        if parsed.scheme not in {"http", "https"} or parsed.hostname != domain or parsed.port is not None:
-            raise ValueError("absolute URL patterns must use the configured host")
-    elif parsed.netloc or not value.startswith("/"):
-        raise ValueError("URL pattern must be relative or use the configured host")
-    try:
-        re.compile(parsed.path)
-    except re.error as exc:
-        raise ValueError("URL pattern must be valid regex") from exc
-    return value
+@dataclass(frozen=True)
+class SafeUrlPattern:
+    template: str
+    _regex: re.Pattern[str] = field(repr=False, compare=False)
+
+    @classmethod
+    def parse(cls, value: object, domain: str) -> SafeUrlPattern:
+        if not isinstance(value, str) or not value or len(value) > 512 or _SECRET.search(value):
+            raise ValueError("URL template is unsafe")
+        parsed = urlsplit(value)
+        prefix = ""
+        if parsed.scheme:
+            if parsed.scheme != "https" or parsed.query or parsed.fragment or parsed.username or parsed.password:
+                raise ValueError("absolute URL templates must use https without secrets")
+            try:
+                port = parsed.port
+            except ValueError as exc:
+                raise ValueError("URL template port is invalid") from exc
+            host = _domain(parsed.hostname)
+            if host != domain:
+                raise ValueError("absolute URL template host must match configured domain")
+            prefix = rf"https://{re.escape(host)}" + (rf":{port}" if port is not None else "")
+        elif parsed.netloc or parsed.query or parsed.fragment or not value.startswith("/"):
+            raise ValueError("URL template must be absolute https or relative")
+        parts = parsed.path.split("/")[1:]
+        compiled: list[str] = []
+        for index, part in enumerate(parts):
+            if part == "**":
+                if index != len(parts) - 1:
+                    raise ValueError("** is allowed only as the final path segment")
+                compiled.append(".*")
+            elif part == "*":
+                compiled.append("[^/]+")
+            elif part == "{int}":
+                compiled.append("[0-9]+")
+            elif part == "{slug}":
+                compiled.append("[A-Za-z0-9][A-Za-z0-9._~-]*")
+            else:
+                if not _PATH_LITERAL.fullmatch(part) or re.sub(_PERCENT, "", part).find("%") >= 0:
+                    raise ValueError("URL template contains unsafe path syntax")
+                compiled.append(re.escape(part))
+        return cls(value, re.compile(rf"^{prefix}/{'/'.join(compiled)}$"))
+
+    def matches(self, url: str) -> bool:
+        return bool(self._regex.fullmatch(url))
+
+
+def _pattern(value: object, domain: str) -> SafeUrlPattern:
+    return SafeUrlPattern.parse(value, domain)
 
 
 def _selector(value: object) -> str:
-    if not isinstance(value, str) or not value or len(value) > 512 or _SECRET.search(value) or "http://" in value or "https://" in value:
+    if not isinstance(value, str) or not value or len(value) > 512 or _UNSAFE_SELECTOR.search(value):
         raise ValueError("selector is unsafe")
+    if len(re.findall(r"\s+|[>+~]", value)) > 3:
+        raise ValueError("selector nesting is too deep")
     try:
         BeautifulSoup("", "html.parser").select(value)
     except SelectorSyntaxError as exc:
         raise ValueError("selector syntax is invalid") from exc
     return value
+
+
+def validate_candidate_selectors(value: Mapping[str, str]) -> tuple[str, ...]:
+    if not isinstance(value, Mapping) or len(value) > 20:
+        raise ValueError("at most 20 candidate selectors are allowed")
+    if not all(isinstance(key, str) and _SCORE_KEY.fullmatch(key) and isinstance(selector, str) for key, selector in value.items()):
+        raise TypeError("candidate selectors must map safe names to selectors")
+    if sum(len(selector) for selector in value.values()) > 4096:
+        raise ValueError("candidate selectors exceed total length limit")
+    return tuple(_selector(selector) for selector in value.values())
 
 
 def _selectors(value: object) -> Mapping[str, object]:
@@ -176,6 +226,7 @@ class SiteConfig:
             "request_policy": _request_policy(values["request_policy"]), "generated_at": _utc(values["generated_at"], "generated_at"),
             "last_validated": _utc(values["last_validated"], "last_validated"), "field_scores": _scores(values["field_scores"]),
             "validation_samples": _samples(values["validation_samples"]),
+            "fingerprint_salt": _salt(values["fingerprint_salt"]),
         }
         for name, value in normalized.items():
             object.__setattr__(self, f"_{name}", value)
@@ -194,6 +245,7 @@ class SiteConfig:
     last_validated = property(lambda self: self._last_validated)
     field_scores = property(lambda self: self._field_scores)
     validation_samples = property(lambda self: self._validation_samples)
+    fingerprint_salt = property(lambda self: self._fingerprint_salt)
 
     def _selector_count(self) -> int:
         clean = self.selectors["clean"]
@@ -203,28 +255,32 @@ class SiteConfig:
         return len(clean) + len(book) + len(chapter)
 
     def __repr__(self) -> str:
-        return f"SiteConfig(schema_version={self.schema_version}, config_id={self.config_id!r}, site={self.site!r}, domain_present=True, url_pattern_count={len(self.url_patterns)}, selector_count={self._selector_count()})"
+        return f"SiteConfig(schema_version={self.schema_version}, config_id_present=True, site_present=True, domain_present=True, url_pattern_count={len(self.url_patterns)}, selector_count={self._selector_count()}, fingerprint_salt_present=True)"
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, SiteConfig) and self.to_dict(include_sensitive=True) == other.to_dict(include_sensitive=True)
 
     def to_dict(self, *, include_sensitive: bool = False) -> dict[str, object]:
-        data = {name: _thaw(getattr(self, name)) for name in _FIELDS if name not in {"domain", "url_patterns", "selectors"}}
+        data = {name: _thaw(getattr(self, name)) for name in _FIELDS if name not in {"domain", "url_patterns", "selectors", "fingerprint_salt"}}
         if include_sensitive:
-            data.update(domain=self.domain, url_patterns=list(self.url_patterns), selectors=_thaw(self.selectors))
+            data.update(domain=self.domain, url_patterns=[item.template for item in self.url_patterns], selectors=_thaw(self.selectors), fingerprint_salt=self.fingerprint_salt.hex())
         return data
 
     def to_json(self, *, include_sensitive: bool = False) -> str:
         return json.dumps(self.to_dict(include_sensitive=include_sensitive), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
     def safe_summary(self) -> dict[str, object]:
-        return {"schema_version": self.schema_version, "config_id": self.config_id, "site": self.site, "domain_present": True, "url_pattern_count": len(self.url_patterns), "selector_count": self._selector_count(), "generated_at": self.generated_at, "last_validated": self.last_validated}
+        return {"schema_version": self.schema_version, "config_id_present": True, "site_present": True, "domain_present": True, "url_pattern_count": len(self.url_patterns), "selector_count": self._selector_count(), "generated_at": self.generated_at, "last_validated": self.last_validated, "fingerprint_salt_present": True}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> SiteConfig:
         if not isinstance(value, Mapping):
             raise TypeError("config must be a mapping")
-        return cls(**dict(value))
+        version = value.get("schema_version")
+        parser = _VERSION_PARSERS.get(version) if isinstance(version, int) and not isinstance(version, bool) else None
+        if parser is None:
+            raise ValueError(f"unsupported schema_version: {version!r}")
+        return parser(value)
 
     @classmethod
     def from_json(cls, value: str) -> SiteConfig:
@@ -237,5 +293,27 @@ class SiteConfig:
     @classmethod
     def new(cls, *, site: str, domain: str, url_patterns: Sequence[str], selectors: Mapping[str, object], request_policy: Mapping[str, object] | None = None, generated_at: str | None = None) -> SiteConfig:
         now = generated_at or datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-        return cls(schema_version=SCHEMA_VERSION, config_id=f"cfg_{secrets.token_urlsafe(18)}", site=site, domain=domain, url_patterns=url_patterns, selectors=selectors, request_policy=request_policy or {"timeout_seconds": 15.0, "max_retries": 2, "rate_limit_seconds": 0.5}, generated_at=now, last_validated=now, field_scores={}, validation_samples=[])
+        return cls(schema_version=SCHEMA_VERSION, config_id=f"cfg_{secrets.token_urlsafe(18)}", site=site, domain=domain, url_patterns=url_patterns, selectors=selectors, request_policy=request_policy or {"timeout_seconds": 15.0, "max_retries": 2, "rate_limit_seconds": 0.5}, generated_at=now, last_validated=now, field_scores={}, validation_samples=[], fingerprint_salt=secrets.token_bytes(32))
 
+
+def _salt(value: object) -> bytes:
+    if isinstance(value, bytes) and len(value) == 32:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        return bytes.fromhex(value)
+    raise ValueError("fingerprint_salt must encode exactly 32 bytes")
+
+
+def _parse_v1(value: Mapping[str, object]) -> SiteConfig:
+    if set(value) != _V1_FIELDS:
+        missing, unknown = _V1_FIELDS - set(value), set(value) - _V1_FIELDS
+        raise ValueError(f"invalid v1 config fields; missing={sorted(missing)!r}, unknown={sorted(unknown)!r}")
+    return SiteConfig(**dict(value))
+
+
+_VERSION_PARSERS = {1: _parse_v1}
+
+
+def migrate_v1_to_current(value: Mapping[str, object]) -> SiteConfig:
+    """Parse v1 independently; future migrations can chain from this boundary."""
+    return _parse_v1(value)

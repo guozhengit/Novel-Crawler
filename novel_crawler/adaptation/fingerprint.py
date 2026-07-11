@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 from collections.abc import Mapping
@@ -11,11 +12,13 @@ from dataclasses import dataclass
 from bs4 import BeautifulSoup, Tag
 from soupsieve.util import SelectorSyntaxError
 
+from .config_schema import validate_candidate_selectors
+
 _KINDS = frozenset({"book", "chapter", "catalog"})
 _NOISE_TAGS = frozenset({"script", "style", "noscript", "template", "svg"})
 _NOISE = re.compile(r"(?:^|[-_])(ad|ads|advert|advertisement|banner|cookie|popup|promo|social|tracking)(?:$|[-_])", re.I)
-_SEMANTIC = frozenset({"role", "rel", "itemprop", "itemscope", "type"})
-_SAFE_VALUE = re.compile(r"[a-z][a-z0-9_-]{0,39}", re.I)
+_TAG_BUCKETS = frozenset({"html", "body", "main", "article", "section", "header", "footer", "nav", "aside", "h1", "h2", "h3", "p", "ol", "ul", "li", "a", "form", "input", "button", "table", "tr", "td"})
+_ROLE_BUCKETS = frozenset({"article", "banner", "button", "contentinfo", "form", "heading", "link", "list", "listitem", "main", "navigation", "region", "search"})
 
 
 @dataclass(frozen=True)
@@ -57,28 +60,26 @@ def _is_noise(tag: Tag) -> bool:
 def _node(tag: Tag) -> object | None:
     if _is_noise(tag):
         return None
-    attrs: list[tuple[str, object]] = []
-    for key in sorted(_SEMANTIC & set(tag.attrs)):
-        raw = tag.attrs[key]
-        values = raw if isinstance(raw, list) else [raw]
-        safe = sorted(str(value).lower() for value in values if _SAFE_VALUE.fullmatch(str(value)))
-        attrs.append((key, safe if safe else True))
+    name = tag.name if tag.name in _TAG_BUCKETS else "other"
+    raw_role = tag.get("role")
+    role = str(raw_role).lower() if isinstance(raw_role, str) and raw_role.lower() in _ROLE_BUCKETS else "none"
     children = [node for child in tag.children if isinstance(child, Tag) and (node := _node(child)) is not None]
-    return [tag.name, attrs, children]
+    return [name, role, children]
 
 
-def fingerprint_html(html: str | bytes, page_kind: str, candidate_selectors: Mapping[str, str]) -> StructureFingerprint:
+def fingerprint_html(html: str | bytes, page_kind: str, candidate_selectors: Mapping[str, str], fingerprint_salt: bytes) -> StructureFingerprint:
     if page_kind not in _KINDS:
         raise ValueError("invalid page_kind")
-    if not isinstance(candidate_selectors, Mapping) or not all(isinstance(k, str) and isinstance(v, str) for k, v in candidate_selectors.items()):
-        raise TypeError("candidate_selectors must map names to selectors")
+    if not isinstance(fingerprint_salt, bytes) or len(fingerprint_salt) != 32:
+        raise ValueError("fingerprint_salt must be exactly 32 bytes")
+    selectors = validate_candidate_selectors(candidate_selectors)
     soup = BeautifulSoup(html, "html.parser")
-    counts: list[tuple[str, int]] = []
-    for name, selector in sorted(candidate_selectors.items()):
+    counts: list[int] = []
+    for selector in sorted(selectors):
         try:
-            counts.append((name, len(soup.select(selector))))
+            counts.append(len(soup.select(selector)))
         except SelectorSyntaxError as exc:
             raise ValueError("candidate selector syntax is invalid") from exc
     roots = [node for child in soup.children if isinstance(child, Tag) and (node := _node(child)) is not None]
     canonical = json.dumps({"structure": roots, "selector_match_counts": counts}, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return StructureFingerprint(1, page_kind, hashlib.sha256(canonical.encode("ascii")).hexdigest())
+    return StructureFingerprint(1, page_kind, hmac.new(fingerprint_salt, canonical.encode("ascii"), hashlib.sha256).hexdigest())

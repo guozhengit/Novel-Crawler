@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError, is_dataclass
 
 import pytest
 
-from novel_crawler.adaptation.config_schema import SiteConfig
+from novel_crawler.adaptation.config_schema import SafeUrlPattern, SiteConfig
 
 
 def valid_payload() -> dict[str, object]:
@@ -14,7 +14,7 @@ def valid_payload() -> dict[str, object]:
         "config_id": "cfg_0123456789abcdef",
         "site": "Example Books",
         "domain": "EXAMPLE.com.",
-        "url_patterns": ["/book/[0-9]+", "https://example.com/chapter/[0-9]+"],
+        "url_patterns": ["/book/{int}", "https://example.com/chapter/{slug}"],
         "selectors": {
             "clean": [".advert", "script"],
             "book": {"title": "h1.book-title", "chapter_list": "#chapters a"},
@@ -25,6 +25,7 @@ def valid_payload() -> dict[str, object]:
         "last_validated": "2026-07-11T09:00:00+00:00",
         "field_scores": {"book.title": 0.95, "chapter.content": 1.0},
         "validation_samples": [{"page_kind": "chapter", "matched_fields": 2, "node_count_bucket": "100-999"}],
+        "fingerprint_salt": "11" * 32,
     }
 
 
@@ -37,9 +38,13 @@ def test_sensitive_round_trip_and_safe_summary() -> None:
     assert config.domain == "example.com"
     assert config.generated_at == "2026-07-11T08:00:00Z"
     assert "selectors" not in config.to_dict()
+    assert "fingerprint_salt" not in config.to_dict()
     assert "selectors" not in config.safe_summary()
     assert "/book/" not in json.dumps(config.safe_summary())
     assert "selectors" not in repr(config)
+    assert config.config_id not in repr(config)
+    assert config.site not in repr(config)
+    assert config.config_id not in json.dumps(config.safe_summary())
     assert not is_dataclass(config)
 
 
@@ -51,6 +56,14 @@ def test_config_is_deeply_immutable() -> None:
         config.selectors["book"]["title"] = "body"  # type: ignore[index]
 
 
+def test_safe_url_template_compiles_escaped_linear_regex() -> None:
+    pattern = SafeUrlPattern.parse("/book/{int}/chapter/{slug}", "example.com")
+    assert pattern.matches("/book/12/chapter/hello-world")
+    assert not pattern.matches("/book/1/2/chapter/x")
+    assert SafeUrlPattern.parse("/assets/*", "example.com").matches("/assets/app.js")
+    assert SafeUrlPattern.parse("/files/**", "example.com").matches("/files/a/b.txt")
+
+
 @pytest.mark.parametrize("change", [
     {"extra": True},
     {"schema_version": 2},
@@ -59,6 +72,10 @@ def test_config_is_deeply_immutable() -> None:
     {"domain": "user:pass@example.com"},
     {"url_patterns": ["https://example.com/x?token=secret"]},
     {"url_patterns": ["(a+)+$"]},
+    {"url_patterns": ["/x/[0-9]+"]},
+    {"url_patterns": ["/x/(foo|bar)"]},
+    {"url_patterns": ["/x/(?=secret)"]},
+    {"url_patterns": ["/x/**/tail"]},
     {"selectors": {"clean": [], "book": {"title": "div["}, "chapter": {}}},
     {"validation_samples": [{"page_kind": "chapter", "title": "private prose"}]},
 ])
@@ -76,17 +93,19 @@ def test_rejects_missing_fields_and_generates_safe_id() -> None:
         SiteConfig.from_dict(payload)
 
     generated = SiteConfig.new(
-        site="Example", domain="example.com", url_patterns=("/book/",),
+        site="Example", domain="example.com", url_patterns=("/book/{int}",),
         selectors={"clean": (), "book": {"title": "h1"}, "chapter": {"content": "article"}},
     )
     assert generated.config_id.startswith("cfg_")
     assert len(generated.config_id) >= 20
+    assert len(generated.fingerprint_salt) == 32
 
 
 @pytest.mark.parametrize("field,value", [
     ("config_id", "bad"), ("site", ""), ("domain", "-bad.example"),
     ("url_patterns", "not-a-list"), ("url_patterns", ["ftp://example.com/x"]),
     ("url_patterns", ["https://other.example/x"]), ("url_patterns", ["/["]),
+    ("url_patterns", ["https://exa_mple.com/x"]), ("url_patterns", ["https://example.com:99999/x"]),
     ("request_policy", {}),
     ("request_policy", {"timeout_seconds": 0, "max_retries": 2, "rate_limit_seconds": 0.5}),
     ("request_policy", {"timeout_seconds": 1, "max_retries": True, "rate_limit_seconds": 0.5}),
@@ -120,3 +139,15 @@ def test_json_validation_and_public_json_redaction() -> None:
         SiteConfig.from_json("{")
     with pytest.raises(TypeError):
         SiteConfig.from_dict([])  # type: ignore[arg-type]
+
+
+def test_version_dispatch_is_independent_of_current(monkeypatch: pytest.MonkeyPatch) -> None:
+    import novel_crawler.adaptation.config_schema as schema
+
+    monkeypatch.setattr(schema, "CURRENT_SCHEMA_VERSION", 99)
+    assert SiteConfig.from_dict(valid_payload()).schema_version == 1
+    assert schema.migrate_v1_to_current(valid_payload()).schema_version == 1
+    future = valid_payload()
+    future["schema_version"] = 99
+    with pytest.raises(ValueError, match="unsupported"):
+        SiteConfig.from_dict(future)
