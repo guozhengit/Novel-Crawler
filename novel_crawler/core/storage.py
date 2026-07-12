@@ -36,6 +36,21 @@ _SAFE_ERROR_CODES = frozenset(
 )
 _MAX_DELETION_PATHS = 10_000
 _MAX_DELETION_MANIFEST_BYTES = 1_048_576
+_MAX_CHAPTER_INDEX = 10_000_000
+
+
+def _validate_chapter_range(start: int | None, end: int | None) -> None:
+    if (
+        start is not None
+        and (isinstance(start, bool) or not isinstance(start, int) or not 1 <= start <= _MAX_CHAPTER_INDEX)
+    ):
+        raise ValueError("chapter_range_invalid")
+    if end is not None and (
+        isinstance(end, bool) or not isinstance(end, int) or not 1 <= end <= _MAX_CHAPTER_INDEX
+    ):
+        raise ValueError("chapter_range_invalid")
+    if start is not None and end is not None and start > end:
+        raise ValueError("chapter_range_invalid")
 
 
 class ChapterContentConflict(RuntimeError):
@@ -454,11 +469,26 @@ class Storage:
             ).fetchall()
         return [self._row_to_chapter(row) for row in rows]
 
-    def all_chapters(self, book_id: int) -> list[Chapter]:
+    def all_chapters(
+        self,
+        book_id: int,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> list[Chapter]:
+        _validate_chapter_range(start, end)
+        clauses = ["book_id=?"]
+        params: list[int] = [book_id]
+        if start is not None:
+            clauses.append("chapter_index>=?")
+            params.append(start)
+        if end is not None:
+            clauses.append("chapter_index<=?")
+            params.append(end)
         with self._lock:
             rows = self.conn.execute(
-                "SELECT * FROM chapters WHERE book_id=? ORDER BY chapter_index",
-                (book_id,),
+                f"SELECT * FROM chapters WHERE {' AND '.join(clauses)} ORDER BY chapter_index",
+                params,
             ).fetchall()
         return [self._row_to_chapter(row) for row in rows]
 
@@ -1135,11 +1165,26 @@ class Storage:
                 if Storage._is_reparse_point(descendant):
                     raise ValueError("delete_path_reparse_point")
 
-    def progress(self, book_id: int) -> dict[str, int]:
+    def progress(
+        self,
+        book_id: int,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> dict[str, int]:
+        _validate_chapter_range(start, end)
+        clauses = ["book_id=?"]
+        params: list[int] = [book_id]
+        if start is not None:
+            clauses.append("chapter_index>=?")
+            params.append(start)
+        if end is not None:
+            clauses.append("chapter_index<=?")
+            params.append(end)
         with self._lock:
             rows = self.conn.execute(
-                "SELECT status, COUNT(*) AS c FROM chapters WHERE book_id=? GROUP BY status",
-                (book_id,),
+                f"SELECT status, COUNT(*) AS c FROM chapters WHERE {' AND '.join(clauses)} GROUP BY status",
+                params,
             ).fetchall()
         data = {row["status"]: int(row["c"]) for row in rows}
         data["total"] = sum(data.values())

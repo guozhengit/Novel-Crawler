@@ -15,6 +15,7 @@ from novel_crawler.task_engine import (
     TaskStatus,
 )
 from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
+from novel_crawler.task_engine.executor import TerminalTaskError
 
 
 def _setup(tmp_path: Path, count: int = 100):
@@ -91,7 +92,11 @@ def test_checkpoint_failure_after_file_commit_is_recoverable_and_skips_done(tmp_
 
 @pytest.mark.parametrize(
     "signal",
-    [TaskControlRequested("late_interaction"), RecoverableTaskError("verification_required")],
+    [
+        TaskControlRequested("late_interaction"),
+        RecoverableTaskError("verification_required"),
+        TerminalTaskError("http_404"),
+    ],
 )
 def test_runtime_control_signals_are_never_marked_as_chapter_failures(tmp_path: Path, signal: Exception) -> None:
     storage, repository, task, context = _setup(tmp_path, count=1)
@@ -191,8 +196,76 @@ def test_empty_book_and_non_string_processor_result_are_handled(tmp_path: Path) 
     assert ChapterBatchRunner(storage, lambda _chapter: "body")(context, task) is TaskStatus.COMPLETED
     repository.close()
     storage.close()
-
     storage, repository, task, context = _setup(tmp_path / "other", count=1)
     assert ChapterBatchRunner(storage, lambda _chapter: None)(context, task) is TaskStatus.RECOVERABLE_FAILED  # type: ignore[arg-type]
+    repository.close()
+    storage.close()
+
+
+def test_runner_range_and_restart_checkpoint_never_escape_plan(tmp_path: Path) -> None:
+    storage, repository, task, context = _setup(tmp_path, count=8)
+    calls: list[int] = []
+    crash = True
+
+    def download(chapter: Chapter) -> str:
+        nonlocal crash
+        calls.append(chapter.index)
+        if chapter.index == 5 and crash:
+            crash = False
+            raise KeyboardInterrupt("restart")
+        return "body"
+
+    runner = ChapterBatchRunner(storage, download, batch_size=1, chapter_start=3, chapter_end=6)
+    with pytest.raises(KeyboardInterrupt, match="restart"):
+        runner(context, task)
+    checkpoint = repository.load_checkpoint(task.task_id, "chapter-progress")
+    assert checkpoint.payload["next_index"] == 5
+    lease = storage.claim_chapter(task.metadata["book_id"], 5, "other-task", lease_seconds=30)
+    assert lease is not None
+    storage.release_chapter_claim(task.metadata["book_id"], 5, claim=lease)
+    restarted = TaskRepository(tmp_path / "tasks.sqlite")
+    resumed = restarted.get_task(task.task_id)
+    assert runner(TaskExecutionContext(restarted, task.task_id, resumed.version), resumed) is TaskStatus.COMPLETED
+    assert calls == [3, 4, 5, 5, 6]
+    assert storage.progress(task.metadata["book_id"], start=3, end=6) == {"total": 4, "done": 4}
+    assert storage.progress(task.metadata["book_id"]) == {"total": 8, "done": 4, "pending": 4}
+    assert restarted.load_checkpoint(task.task_id, "chapter-progress").payload == {
+        "failed": 0,
+        "next_index": 7,
+        "succeeded": 4,
+    }
+    restarted.close()
+    repository.close()
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [(0, 2), (True, 2), (3, 2), (1, 10_000_001)],
+)
+def test_runner_rejects_unbounded_or_inverted_chapter_ranges(tmp_path: Path, start: object, end: object) -> None:
+    storage, repository, _task, _context = _setup(tmp_path, count=0)
+    with pytest.raises(ValueError, match="chapter_range_invalid"):
+        ChapterBatchRunner(storage, lambda _chapter: "body", chapter_start=start, chapter_end=end)  # type: ignore[arg-type]
+    repository.close()
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"start": True},
+        {"start": 0},
+        {"end": 0},
+        {"start": 3, "end": 2},
+        {"end": 10_000_001},
+    ],
+)
+def test_storage_range_queries_fail_closed(tmp_path: Path, kwargs: dict[str, object]) -> None:
+    storage, repository, task, _context = _setup(tmp_path, count=3)
+    with pytest.raises(ValueError, match="chapter_range_invalid"):
+        storage.all_chapters(task.metadata["book_id"], **kwargs)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="chapter_range_invalid"):
+        storage.progress(task.metadata["book_id"], **kwargs)  # type: ignore[arg-type]
     repository.close()
     storage.close()

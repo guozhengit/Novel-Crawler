@@ -15,6 +15,7 @@ from novel_crawler.application.errors import ApplicationError
 from novel_crawler.application.pipeline import CrawlTaskPipeline
 from novel_crawler.application.site_adapter import SiteConfigAdapter
 from novel_crawler.browser import BrowserAcquirer, BrowserSessionStore, VerificationRequired
+from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.storage import Storage
 from novel_crawler.task_engine import (
     BackgroundTaskExecutor,
@@ -110,7 +111,10 @@ def test_validating_persists_bounded_plan_and_crawling_completes_and_exports(tmp
     )
     assert pipeline.validating(context(repo, task), task) is TaskStatus.READY
     plan = repo.load_checkpoint(task.task_id, "crawl-plan")
-    assert set(plan.payload) == {"book_id", "export", "export_format"}
+    assert set(plan.payload) == {
+        "book_id", "chapter_start", "chapter_end", "chapter_count", "export", "export_format",
+    }
+    assert (plan.payload["chapter_start"], plan.payload["chapter_end"], plan.payload["chapter_count"]) == (1, 2, 2)
     ready = repo.transition(task.task_id, TaskStatus.READY, expected_version=task.version)
     crawling = repo.transition(task.task_id, TaskStatus.CRAWLING, expected_version=ready.version)
     assert pipeline.crawling(context(repo, crawling), crawling) is TaskStatus.COMPLETED
@@ -386,5 +390,176 @@ def test_static_fixture_runs_end_to_end_and_recovers_failed_chapter_after_restar
     assert len(exports) == 1
     assert storage.progress(repo.load_checkpoint(task.task_id, "crawl-plan").payload["book_id"])["done"] == 1
     assert second.shutdown(timeout=2)
+    repo.close()
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        ({"start": 3}, [3, 4, 5]),
+        ({"count": 2}, [1, 2]),
+        ({"max_chapters": 2}, [1, 2]),
+    ],
+)
+def test_new_task_only_crawls_its_planned_range_for_existing_book(
+    tmp_path: Path,
+    options: dict[str, int],
+    expected: list[int],
+) -> None:
+    url = "https://example.test/books/index.html"
+    index_html = "<h1 class=book>Book</h1><div id=list>" + "".join(
+        f"<a href='{index}.html'>Chapter {index}</a>" for index in range(1, 6)
+    ) + "</div>"
+    pages = {url: index_html}
+    pages.update({
+        f"https://example.test/books/{index}.html": (
+            f"<h1 class=chapter>Chapter {index}</h1><article>Body {index}</article>"
+        )
+        for index in expected
+    })
+    repo = TaskRepository(tmp_path / "tasks.db")
+    storage = Storage(tmp_path / "crawl.db", tmp_path / "data")
+    book_id = storage.upsert_book(Book(title="Book", url=url, site="fixture"))
+    storage.upsert_chapters(
+        book_id,
+        [Chapter(index, f"Old {index}", f"https://example.test/books/{index}.html") for index in range(1, 6)],
+    )
+    acquirer = Acquirer(pages)
+    pipeline = CrawlTaskPipeline(repo, storage, Registry(site_config()), acquirer)
+    task = active_task(repo, url, {"crawl": {**options, "concurrency": 1, "export": False}})
+    assert pipeline.validating(context(repo, task), task) is TaskStatus.READY
+    plan = repo.load_checkpoint(task.task_id, "crawl-plan").payload
+    assert (plan["book_id"], plan["chapter_start"], plan["chapter_end"], plan["chapter_count"]) == (
+        book_id,
+        expected[0],
+        expected[-1],
+        len(expected),
+    )
+    ready = repo.transition(task.task_id, TaskStatus.READY, expected_version=task.version)
+    crawling = repo.transition(task.task_id, TaskStatus.CRAWLING, expected_version=ready.version)
+    assert pipeline.crawling(context(repo, crawling), crawling) is TaskStatus.COMPLETED
+    assert acquirer.task_keys == [task.task_id] * (len(expected) + 1)
+    assert storage.progress(book_id, start=expected[0], end=expected[-1]) == {
+        "total": len(expected),
+        "done": len(expected),
+    }
+    assert repo.load_checkpoint(task.task_id, "chapter-progress").payload["next_index"] == expected[-1] + 1
+    repo.close()
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda plan: {key: value for key, value in plan.items() if key != "chapter_count"},
+        lambda plan: {**plan, "chapter_count": True},
+        lambda plan: {**plan, "chapter_end": plan["chapter_end"] + 1},
+        lambda plan: {**plan, "chapter_start": 10_000_001},
+        lambda plan: {**plan, "private": 1},
+    ],
+)
+def test_crawling_rejects_tampered_or_unbounded_plan(tmp_path: Path, mutate) -> None:
+    url = "https://example.test/books/index.html"
+    html = "<h1 class=book>Book</h1><div id=list><a href='1.html'>One</a></div>"
+    repo = TaskRepository(tmp_path / "tasks.db")
+    storage = Storage(tmp_path / "crawl.db", tmp_path / "data")
+    pipeline = CrawlTaskPipeline(repo, storage, Registry(site_config()), Acquirer({url: html}))
+    task = active_task(repo, url, {"crawl": {"concurrency": 1, "export": False}})
+    assert pipeline.validating(context(repo, task), task) is TaskStatus.READY
+    saved = repo.load_checkpoint(task.task_id, "crawl-plan")
+    repo.save_checkpoint(task.task_id, "crawl-plan", mutate(dict(saved.payload)), expected_version=saved.version)
+    ready = repo.transition(task.task_id, TaskStatus.READY, expected_version=task.version)
+    crawling = repo.transition(task.task_id, TaskStatus.CRAWLING, expected_version=ready.version)
+    with pytest.raises(ValueError, match="crawl_plan_invalid"):
+        pipeline.crawling(context(repo, crawling), crawling)
+    repo.close()
+    storage.close()
+
+
+def test_crawling_rejects_plan_when_range_inventory_is_incomplete(tmp_path: Path) -> None:
+    url = "https://example.test/books/index.html"
+    html = "<h1 class=book>Book</h1><div id=list><a href='1.html'>One</a><a href='2.html'>Two</a></div>"
+    repo = TaskRepository(tmp_path / "tasks.db")
+    storage = Storage(tmp_path / "crawl.db", tmp_path / "data")
+    pipeline = CrawlTaskPipeline(repo, storage, Registry(site_config()), Acquirer({url: html}))
+    task = active_task(repo, url, {"crawl": {"concurrency": 1, "export": False}})
+    assert pipeline.validating(context(repo, task), task) is TaskStatus.READY
+    plan = repo.load_checkpoint(task.task_id, "crawl-plan").payload
+    storage.conn.execute(
+        "DELETE FROM chapters WHERE book_id=? AND chapter_index=?",
+        (plan["book_id"], plan["chapter_end"]),
+    )
+    storage.conn.commit()
+    ready = repo.transition(task.task_id, TaskStatus.READY, expected_version=task.version)
+    crawling = repo.transition(task.task_id, TaskStatus.CRAWLING, expected_version=ready.version)
+    with pytest.raises(ValueError, match="crawl_plan_invalid"):
+        pipeline.crawling(context(repo, crawling), crawling)
+    repo.close()
+    storage.close()
+
+
+@pytest.mark.parametrize(
+    ("code", "recoverable", "expected_status"),
+    [
+        ("http_404", False, TaskStatus.TERMINAL_FAILED),
+        ("timeout", True, TaskStatus.RECOVERABLE_FAILED),
+    ],
+)
+def test_executor_classifies_chapter_acquisition_errors_without_generic_swallowing(
+    tmp_path: Path,
+    code: str,
+    recoverable: bool,
+    expected_status: TaskStatus,
+) -> None:
+    url = "https://example.test/books/index.html"
+    index_html = "<h1 class=book>Book</h1><div id=list><a href='1.html'>One</a></div>"
+
+    class FailingChapter:
+        def fetch(self, requested: str, *, task_key=None, timeout=None):
+            if requested == url:
+                return Page(index_html)
+            raise AcquisitionError(code, "https://example.test", recoverable)
+
+    repo = TaskRepository(tmp_path / "tasks.db")
+    storage = Storage(tmp_path / "crawl.db", tmp_path / "data")
+    pipeline = CrawlTaskPipeline(repo, storage, Registry(site_config()), FailingChapter())
+    executor = BackgroundTaskExecutor(
+        repo,
+        {TaskStatus.PROBING: lambda _context, _task: TaskStatus.VALIDATING, **pipeline.handlers},
+        max_workers=1,
+    )
+    task = repo.create_task(url, metadata={"crawl": {"concurrency": 1, "export": False}})
+    executor.submit(task.task_id)
+    wait_status(repo, task.task_id, expected_status)
+    failed = repo.get_task(task.task_id)
+    assert failed.error_code == code
+    if expected_status is TaskStatus.TERMINAL_FAILED:
+        assert executor.resume(task.task_id).status is TaskStatus.TERMINAL_FAILED
+    assert executor.shutdown(timeout=2)
+    repo.close()
+    storage.close()
+
+
+def test_executor_classifies_nonrecoverable_validation_fetch_as_terminal(tmp_path: Path) -> None:
+    class MissingIndex:
+        def fetch(self, _requested: str, *, task_key=None, timeout=None):
+            raise AcquisitionError("http_404", "https://example.test", False)
+
+    url = "https://example.test/books/index.html"
+    repo = TaskRepository(tmp_path / "tasks.db")
+    storage = Storage(tmp_path / "crawl.db", tmp_path / "data")
+    pipeline = CrawlTaskPipeline(repo, storage, Registry(site_config()), MissingIndex())
+    executor = BackgroundTaskExecutor(
+        repo,
+        {TaskStatus.PROBING: lambda _context, _task: TaskStatus.VALIDATING, **pipeline.handlers},
+        max_workers=1,
+    )
+    task = repo.create_task(url, metadata={"crawl": {"concurrency": 1, "export": False}})
+    executor.submit(task.task_id)
+    wait_status(repo, task.task_id, TaskStatus.TERMINAL_FAILED)
+    assert repo.get_task(task.task_id).error_code == "http_404"
+    assert executor.resume(task.task_id).status is TaskStatus.TERMINAL_FAILED
+    assert executor.shutdown(timeout=2)
     repo.close()
     storage.close()

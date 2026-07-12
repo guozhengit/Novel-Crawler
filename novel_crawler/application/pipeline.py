@@ -17,7 +17,12 @@ from novel_crawler.browser import BrowserCleanupRequired, VerificationRequired
 from novel_crawler.core.models import Chapter
 from novel_crawler.core.storage import Storage
 from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
-from novel_crawler.task_engine.executor import RecoverableTaskError, TaskControlRequested, TaskExecutionContext
+from novel_crawler.task_engine.executor import (
+    RecoverableTaskError,
+    TaskControlRequested,
+    TaskExecutionContext,
+    TerminalTaskError,
+)
 from novel_crawler.task_engine.models import TaskRecord, TaskStatus
 from novel_crawler.task_engine.repository import CheckpointNotFound, TaskRepository
 
@@ -94,10 +99,23 @@ class CrawlTaskPipeline:
             chapters = chapters[: options.max_chapters]
         if not chapters:
             raise ValueError("chapter_list_empty")
+        chapter_start = chapters[0].index
+        chapter_count = len(chapters)
+        chapter_end = chapters[-1].index
+        if (
+            not 1 <= chapter_start <= chapter_end <= 10_000_000
+            or not 1 <= chapter_count <= 1_000_000
+            or chapter_count != chapter_end - chapter_start + 1
+            or any(chapter.index != chapter_start + offset for offset, chapter in enumerate(chapters))
+        ):
+            raise ValueError("chapter_range_invalid")
         book_id = self._storage.upsert_book(book)
         self._storage.upsert_chapters(book_id, chapters)
         payload: dict[str, object] = {
             "book_id": book_id,
+            "chapter_start": chapter_start,
+            "chapter_end": chapter_end,
+            "chapter_count": chapter_count,
             "export": options.export,
             "export_format": options.export_format,
         }
@@ -112,8 +130,9 @@ class CrawlTaskPipeline:
 
     def crawling(self, context: TaskExecutionContext, task: TaskRecord) -> TaskStatus:
         plan = self._repository.load_checkpoint(task.task_id, "crawl-plan").payload
-        book_id = plan.get("book_id")
-        if isinstance(book_id, bool) or not isinstance(book_id, int) or book_id < 1:
+        book_id, chapter_start, chapter_end, chapter_count, should_export, fmt = self._plan(plan)
+        inventory = self._storage.progress(book_id, start=chapter_start, end=chapter_end)
+        if inventory.get("total") != chapter_count:
             raise ValueError("crawl_plan_invalid")
         config = self._registry.load_active(task.source_url)
         if config is None:
@@ -128,16 +147,18 @@ class CrawlTaskPipeline:
                 chapter.title = title
             return f"{chapter.title}\n\n{body}"
 
-        runner = ChapterBatchRunner(self._storage, process, batch_size=self._batch_size)
+        runner = ChapterBatchRunner(
+            self._storage,
+            process,
+            batch_size=self._batch_size,
+            chapter_start=chapter_start,
+            chapter_end=chapter_end,
+        )
         ephemeral = replace(task, metadata={**task.metadata, "book_id": book_id})
         outcome = runner(context, ephemeral)
         if outcome is not TaskStatus.COMPLETED:
             return outcome
-        should_export = plan.get("export") is True
-        fmt = plan.get("export_format")
         if should_export:
-            if not isinstance(fmt, str) or fmt not in {"txt", "epub", "md", "jsonl"}:
-                raise ValueError("crawl_plan_invalid")
             if self._exporter is None:
                 raise ValueError("exporter_unavailable")
             self._exporter(book_id, fmt)
@@ -176,9 +197,48 @@ class CrawlTaskPipeline:
                     raise TaskControlRequested("late_browser_interaction") from None
                 raise RecoverableTaskError("verification_required") from None
             except AcquisitionError as exc:
-                if not exc.recoverable or attempt + 1 >= options.retries:
-                    raise
+                if not exc.recoverable:
+                    raise TerminalTaskError(exc.code) from None
+                if attempt + 1 >= options.retries:
+                    raise RecoverableTaskError(exc.code) from None
         raise RecoverableTaskError("source_fetch_failed")  # pragma: no cover
+
+    @staticmethod
+    def _plan(plan: Mapping[str, object]) -> tuple[int, int, int, int, bool, str]:
+        if set(plan) != {
+            "book_id",
+            "chapter_start",
+            "chapter_end",
+            "chapter_count",
+            "export",
+            "export_format",
+        }:
+            raise ValueError("crawl_plan_invalid")
+        book_id = plan["book_id"]
+        start = plan["chapter_start"]
+        end = plan["chapter_end"]
+        count = plan["chapter_count"]
+        export = plan["export"]
+        fmt = plan["export_format"]
+        if (
+            isinstance(book_id, bool)
+            or not isinstance(book_id, int)
+            or not 1 <= book_id <= 2_147_483_647
+            or isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= start <= end <= 10_000_000
+            or not 1 <= count <= 1_000_000
+            or count != end - start + 1
+            or not isinstance(export, bool)
+            or not isinstance(fmt, str)
+            or fmt not in {"txt", "epub", "md", "jsonl"}
+        ):
+            raise ValueError("crawl_plan_invalid")
+        return book_id, start, end, count, export, fmt
 
     def _wait_rate_limit(self, task: TaskRecord, interval: float) -> None:
         with self._rate_lock:
