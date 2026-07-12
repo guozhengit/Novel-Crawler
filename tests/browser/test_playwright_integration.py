@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 from playwright.sync_api import Error as PlaywrightError
 
+from novel_crawler.acquisition.models import AcquiredPage
 from novel_crawler.acquisition.security import UrlSafetyPolicy
+from novel_crawler.adaptation.service import ProbeService
 from novel_crawler.browser.driver import BrowserRequestPolicy, DefaultPlaywrightDriver
 from novel_crawler.browser.sessions import BrowserSessionStore
 
@@ -103,6 +108,90 @@ def _launch(tmp_path: Path, url: str, *, resolver=lambda host, port: ("127.0.0.1
         headless=True,
         policy=_guard(url, resolver),
     )
+
+
+class _ChromiumAcquirer:
+    def __init__(self, context: Any) -> None:
+        self.context = context
+        self.calls: list[str] = []
+
+    def fetch_page(
+        self,
+        url: str,
+        *,
+        max_body_bytes: int | None = None,
+        locked_origin: str | None = None,
+    ) -> AcquiredPage:
+        del locked_origin
+        self.calls.append(url)
+        snapshot = self.context.navigate(url)
+        return snapshot.to_acquired_page(max_body_bytes=max_body_bytes or 20 * 1024)
+
+
+def _javascript_site_responses(cases: list[dict[str, object]]) -> Iterator[tuple[str, tuple[bytes, dict[str, str], float]]]:
+    headers = {"Content-Type": "text/html; charset=utf-8"}
+    for case in cases:
+        case_id = str(case["id"])
+        wrapper = str(case["wrapper"])
+        content_tag = str(case["content"])
+        paragraph_count = int(case["paragraphs"])
+        prefix = f"/{case_id}"
+        book = f"Fixture Book {case_id}"
+        index_script = f"""<!doctype html><body><script>
+const meta=document.createElement('meta');meta.name='book_name';meta.content='{book}';document.head.append(meta);
+const title=document.createElement('h1');title.className='book-title';title.textContent='{book}';document.body.append(title);
+const list=document.createElement('div');list.id='list';list.className='{wrapper}';document.body.append(list);
+for(let n=1;n<=3;n++){{const link=document.createElement('a');link.href='{prefix}/chapter-'+n;link.textContent='Chapter '+n;list.append(link);}}
+</script>"""
+        yield f"{prefix}/book", (index_script.encode(), headers, 0)
+        for chapter in (1, 2):
+            next_script = ""
+            if chapter == 1:
+                next_script = (
+                    f"const next=document.createElement('a');next.rel='next';"
+                    f"next.href='{prefix}/chapter-2';next.textContent='Next';document.body.append(next);"
+                )
+            chapter_script = f"""<!doctype html><body><script>
+const meta=document.createElement('meta');meta.name='book_name';meta.content='{book}';document.head.append(meta);
+document.body.className='{wrapper}';
+const title=document.createElement('h1');title.textContent='Chapter {chapter}';document.body.append(title);
+const content=document.createElement('{content_tag}');content.className='chapter-content';document.body.append(content);
+for(let n=1;n<={paragraph_count};n++){{const p=document.createElement('p');p.textContent='{case_id} chapter {chapter} paragraph '+n+' '+('content '.repeat(18));content.append(p);}}
+{next_script}
+</script>"""
+            yield f"{prefix}/chapter-{chapter}", (chapter_script.encode(), headers, 0)
+
+
+def test_real_chromium_javascript_adaptation_benchmark(tmp_path: Path) -> None:
+    fixture_dir = Path(__file__).parents[1] / "release" / "fixtures"
+    manifest = json.loads((fixture_dir / "benchmark_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["license"] == "CC0-1.0"
+    fixture_path = fixture_dir / "adaptation_cases.json"
+    cases = [case for case in json.loads(fixture_path.read_text(encoding="utf-8")) if case["kind"] == "javascript"]
+    assert len(cases) >= 10
+    responses = dict(_javascript_site_responses(cases))
+    raw_bodies = [body.decode() for body, _headers, _delay in responses.values()]
+    assert len(responses) == len(cases) * 3
+    assert all(marker not in body for body in raw_bodies for marker in ("<h1", "<a", "<article", "<p"))
+
+    with _RunningServer(responses) as target:
+        origin = f"http://example.test:{target.server_address[1]}"
+        context = _launch(tmp_path, f"{origin}/{cases[0]['id']}/book", operation_timeout=60)
+        acquirer = _ChromiumAcquirer(context)
+        try:
+            runs = []
+            for _ in range(2):
+                outcomes = [ProbeService(acquirer=acquirer).probe(f"{origin}/{case['id']}/book") for case in cases]
+                runs.append([(outcome.ok, outcome.reason_ids or ("ok",)) for outcome in outcomes])
+        finally:
+            context.close()
+
+    success_rate = sum(ok for ok, _reasons in runs[0]) / len(runs[0])
+    assert success_rate >= 0.70, runs[0]
+    assert runs[0] == runs[1], "outcomes and stable reason codes must repeat under real Chromium"
+    assert all(reasons == ("ok",) for ok, reasons in runs[0] if ok)
+    assert len(acquirer.calls) == len(cases) * 3 * 2
+    assert set(target.hits) == set(responses)
 
 
 def test_real_chromium_routes_all_network_and_blocks_active_escape_surfaces(tmp_path: Path) -> None:
