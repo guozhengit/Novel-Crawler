@@ -193,9 +193,14 @@ def test_playwright_context_routes_every_request_and_captures_navigation() -> No
     context.close()
     assert raw.closed and runtime.stopped
     assert callable(raw.web_socket_callback)
-    web_socket = SimpleNamespace(closed=False, close=lambda **kwargs: setattr(web_socket, "closed", kwargs))
+    web_socket = SimpleNamespace(
+        closed=False,
+        connected=False,
+        close=lambda **kwargs: setattr(web_socket, "closed", kwargs),
+        connect_to_server=lambda: setattr(web_socket, "connected", True),
+    )
     raw.web_socket_callback(web_socket)  # type: ignore[operator]
-    assert web_socket.closed
+    assert not web_socket.connected and not web_socket.closed
 
 
 def test_playwright_capture_rejects_unexpected_cross_origin_final_page() -> None:

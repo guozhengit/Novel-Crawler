@@ -242,7 +242,10 @@ class _PlaywrightContext:
 
     @staticmethod
     def _route_web_socket(web_socket: Any) -> None:
-        web_socket.close(code=1008, reason="blocked")
+        # A routed Playwright WebSocket remains local unless the route calls
+        # connect_to_server().  Returning without connecting blocks all
+        # upstream I/O and avoids a sync-API close deadlock during construction.
+        del web_socket
 
     def navigate(self, url: str) -> BrowserPageSnapshot:
         if self._policy.decide(url, resource_type="document", is_navigation=True) is RequestDecision.BLOCK:
