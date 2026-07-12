@@ -222,6 +222,15 @@ class BrowserSessionLease:
             raise BrowserSessionError("release_failed", self.info.domain) from None
         self._closed = True
 
+    def __del__(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        try:
+            self._lock.release()
+        except Exception:
+            pass
+        self._closed = True
+
     def mark_stale(self) -> BrowserSessionInfo:
         """Mark this still-exclusive lease stale without reacquiring its domain lock."""
         if self._closed:

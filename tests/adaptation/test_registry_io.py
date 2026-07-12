@@ -61,6 +61,20 @@ def test_windows_atomic_write_orders_acl_flush_and_write_through_move(tmp_path: 
     assert target.read_bytes() == b"payload"
 
 
+def test_windows_successful_publish_relinquishes_temporary_cleanup(tmp_path: Path) -> None:
+    class PublishedTemporaryAPI(FakeWindowsAPI):
+        def delete_private_path(self, path: Path) -> None:
+            raise RegistryIOError("published temporary must not be deleted")
+
+    io = WindowsRegistryIO(api=PublishedTemporaryAPI())
+    target = tmp_path / "value.json"
+    io.ensure_directory(tmp_path)
+
+    io.atomic_write(target, b"payload")
+
+    assert target.read_bytes() == b"payload"
+
+
 def test_same_handle_bounded_read_rejects_oversize_and_non_regular(tmp_path: Path) -> None:
     io = default_registry_io()
     root = tmp_path / "private"

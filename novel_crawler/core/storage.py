@@ -158,6 +158,7 @@ class Storage:
         ensure_dir(data_dir)
         self._lock = threading.RLock()
         self._clock = clock or time.time
+        self._closed = False
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA busy_timeout=5000")
@@ -167,7 +168,15 @@ class Storage:
 
     def close(self) -> None:
         with self._lock:
-            self.conn.close()
+            if not self._closed:
+                self.conn.close()
+                self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self

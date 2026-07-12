@@ -819,7 +819,7 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
 
         access = 0x80000000 | ((0x40000000 | 0x00060000) if write else 0)
         creation = (1 if exclusive else 4) if create else 3
-        handle = self._kernel32.CreateFileW(str(path), access, 0x3, None, creation, 0x80 | 0x00200000, None)
+        handle = self._kernel32.CreateFileW(str(path), access, 0x7, None, creation, 0x80 | 0x00200000, None)
         invalid = ctypes.c_void_p(-1).value
         if handle == invalid:
             raise RegistryIOError("registry file handle cannot be opened safely")
@@ -1002,6 +1002,7 @@ class WindowsRegistryIO:
         self.ensure_directory(path.parent)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         descriptor = -1
+        published = False
         try:
             with self._guard(path.parent):
                 try:
@@ -1035,6 +1036,7 @@ class WindowsRegistryIO:
                         mover(temporary, path)
                     else:
                         mover(temporary, path, replace=False)
+                    published = True
                     self._api.verify_private_acl(path)
                 finally:
                     try:
@@ -1042,7 +1044,8 @@ class WindowsRegistryIO:
                             os.close(descriptor)
                             descriptor = -1
                     finally:
-                        self._api.delete_private_path(temporary)
+                        if not published:
+                            self._api.delete_private_path(temporary)
         except RegistryIOExistsError:
             raise
         except OSError as exc:

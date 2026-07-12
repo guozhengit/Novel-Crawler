@@ -217,6 +217,12 @@ class TaskRepository:
                 self._connection.close()
                 self._closed = True
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def __enter__(self) -> TaskRepository:
         return self
 
