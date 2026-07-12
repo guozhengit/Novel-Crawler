@@ -30,6 +30,25 @@ def test_private_one_off_root_artifacts_are_not_distributed():
     assert present == []
 
 
+def test_gitignore_blocks_private_runtime_artifacts():
+    ignored = set((ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())
+    for pattern in (
+        ".env",
+        ".env.*",
+        "data/",
+        "cache/",
+        "contents/",
+        "output/",
+        "browser-sessions/",
+        "config-registry/",
+        "*.db",
+        "*.db-*",
+        "*.sqlite",
+        "*.sqlite-*",
+    ):
+        assert pattern in ignored
+
+
 def test_dockerfile_installs_matching_chromium_and_runs_as_non_root():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
