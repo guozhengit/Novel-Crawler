@@ -4,12 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "novel-crawler"
-version = "0.1.0"
+version = "0.2.0"
 description = "可解释、可恢复的多站点小说抓取工具"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "MIT"
 authors = [{ name = "Novel Crawler contributors" }]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "requests>=2.31,<3",
   "urllib3>=2.2,<3",
@@ -38,6 +46,10 @@ dev = [
 [project.scripts]
 novel-crawler = "novel_crawler.cli:main"
 
+[project.urls]
+Repository = "https://github.com/guozhengit/Novel-Crawler"
+Issues = "https://github.com/guozhengit/Novel-Crawler/issues"
+
 [tool.setuptools.packages.find]
 include = ["novel_crawler*"]
 
@@ -47,7 +59,10 @@ novel_crawler = ["configs/*.json", "configs/*.yaml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-markers = ["integration: optional tests requiring locally installed external runtimes"]
+markers = [
+  "integration: tests requiring locally installed external runtimes",
+  "release: release-scale acceptance tests",
+]
 
 [tool.coverage.run]
 branch = true

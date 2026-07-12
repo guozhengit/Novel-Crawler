@@ -4,7 +4,7 @@ import novel_crawler
 
 
 def test_version_is_exposed():
-    assert novel_crawler.__version__ == "0.1.0"
+    assert novel_crawler.__version__ == "0.2.0"
 
 
 def test_installed_distribution_version_matches_package():

@@ -1,111 +1,136 @@
-# Novel Crawler - 通用小说爬虫系统
+# Novel Crawler
 
-跨平台、多站点、模块化的小说爬虫框架。
+Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工具。它会先尝试安全的静态页面解析；结构不稳定或需要 JavaScript 时，才进入受限的 Chromium 流程；无法自动确认的配置会暂停任务，等待用户验证后继续。
 
-## 快速开始
+当前版本：**0.2.0**。支持 Python 3.11、3.12 和 3.13。
+
+## 主要能力
+
+- 自动识别目录页、章节页、标题、正文和翻页结构
+- 版本化站点配置、结构指纹、重验证和人工确认
+- 后台任务状态机：暂停、恢复、取消、失败重试和崩溃恢复
+- SQLite CAS、checkpoint、章节 claim、幂等正文写入和安全删除
+- 静态 HTTP 与隔离 Chromium 双通道获取
+- TXT、EPUB、Markdown 和 JSONL 导出
+- 本机安全 Web 控制台与稳定 JSON CLI 输出
+- URL、路径、正文、Cookie 和验证令牌默认不进入公开 DTO 或错误消息
+
+## 安装
 
 ```bash
 python -m pip install .
-playwright install chromium
+python -m playwright install chromium
 novel-crawler env
 ```
 
-Development installation:
+开发安装：
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest
+python -m pytest -q
 ```
 
-## Data directory
+## 快速开始
 
-By default, runtime data is stored in the operating system's application-data directory (`LOCALAPPDATA` on Windows, `~/Library/Application Support` on macOS, and `XDG_DATA_HOME` or `~/.local/share` on Linux).
+创建后台抓取任务：
 
-Existing installations remain compatible: when `<project>/data` already contains `crawler.db`, `cache`, `contents`, or `output`, that legacy directory continues to be used. Pass the global option `--data-dir PATH` before the command to override both locations, for example:
+```bash
+novel-crawler crawl "https://example.test/books/demo"
+```
+
+等待任务结束，或等待进入人工验证状态：
+
+```bash
+novel-crawler crawl "https://example.test/books/demo" --wait --timeout 600
+```
+
+查看和控制任务：
+
+```bash
+novel-crawler tasks
+novel-crawler task TASK_ID
+novel-crawler task-events TASK_ID
+novel-crawler task-pause TASK_ID
+novel-crawler task-resume TASK_ID
+novel-crawler task-cancel TASK_ID
+```
+
+遇到浏览器验证或自动配置确认时：
+
+```bash
+novel-crawler task-continue TASK_ID
+novel-crawler task-confirm TASK_ID --selector content=article
+novel-crawler task-retry-cleanup TASK_ID
+```
+
+启动本机 Web 控制台：
+
+```bash
+novel-crawler web
+```
+
+默认只监听 `127.0.0.1:8765`。`--unsafe-remote` 没有身份认证或 TLS，不能直接暴露到公网。
+
+## 任务状态
+
+```text
+created -> probing -> validating -> ready -> crawling -> completed
+                   \-> waiting_for_user
+                   \-> paused / recoverable_failed
+                   \-> terminal_failed / cancelled
+```
+
+任务数据保存在 `tasks.db`；书籍和章节数据保存在 `crawler.db`。恢复时会沿用持久化 crawl plan，不会因为同一本书的历史章节而越过本任务的 `start`、`count` 或 `max_chapters` 范围。
+
+## 数据目录
+
+默认位置：
+
+- Windows：`%LOCALAPPDATA%/novel-crawler`
+- macOS：`~/Library/Application Support/novel-crawler`
+- Linux：`$XDG_DATA_HOME/novel-crawler` 或 `~/.local/share/novel-crawler`
+
+可显式指定私有目录：
 
 ```bash
 novel-crawler --data-dir /srv/novel-crawler env
 ```
 
-## CLI 命令
-
-| 命令 | 说明 |
-|---|---|
-| `env` | 显示运行环境检测报告 |
-| `books` | 列出所有已抓取的小说 |
-| `delete ID` | 删除一本书及其所有数据 |
-| `crawl URL` | 抓取小说 |
-| `inspect URL` | 探测未知站点并输出配置草案 |
-| `wizard URL` | 交互式站点配置向导 |
-| `resume ID` | 继续未完成的下载 |
-| `progress ID` | 查看下载进度 |
-| `validate ID` | 校验抓取质量 |
-| `fix-titles ID` | 自动修正章节标题编号 |
-| `dedup ID` | 检测/去除重复章节 |
-| `logs` | 查看任务日志 |
-| `report ID` | 生成任务报告 |
-| `retry-failed ID` | 重试失败章节 |
-| `retry-all` | 重试所有书的失败章节 |
-| `export ID` | 导出（txt/epub/md/jsonl） |
-| `export-all` | 批量导出所有书籍 |
-| `decode-font FONT` | 破解混淆字体映射 |
-| `web` | 启动 Web UI 管理界面 |
-
-## crawl 参数
-
-```
---start N          起始章节序号
---count N          下载章节数量
---concurrency N    并发抓取数（默认1）
---max-chapters N   本次最多下载章节数（暂停控制）
---chase            递推抓取模式
---proxy-file FILE  代理列表文件
---no-export        只下载不导出
-```
-
-## 架构
-
-```
-novel_crawler/
-  core/          核心：请求器、存储、校验、去重、标题修正、代理池
-  runtime/       跨平台运行时检测
-  sites/         站点适配器（专用/配置/自动兜底）
-  decoders/      字体混淆解码
-  exporters/     TXT/EPUB/Markdown/JSONL 导出
-  configs/       站点配置文件
-  web/           Web UI 管理界面
-tests/           单元测试
-```
-
-## 支持能力
-
-- 跨平台（Windows/macOS/Linux）
-- 多站点适配（专用 + 配置 + 自动探测兜底）
-- 字体混淆破解
-- SQLite 断点续传
-- 并发限速下载
-- Playwright 浏览器渲染 fallback
-- 代理池轮换
-- 缓存优先
-- 质量校验
-- 内容去重
-- 标题编号修正
-- 4 种格式导出
-- Web UI 管理
-- Docker 支持
+其中可能包含数据库、章节正文、导出文件、配置注册表和浏览器 profile。请勿提交这些内容。详见 [PRIVACY.md](PRIVACY.md)。
 
 ## Docker
 
-The image fixes the runtime data directory at `/app/data`. Mount a volume there to persist the database, cache, downloaded contents, and exports:
-
 ```bash
-docker build -t novel-crawler .
-docker run --rm -v ./data:/app/data novel-crawler env
-docker run --rm -v ./data:/app/data novel-crawler crawl "https://example.com/book/1"
+docker build -t novel-crawler:0.2.0 .
+docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 env
+docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://example.test/books/demo"
 ```
 
-## 测试
+镜像包含与 Python Playwright 匹配的 Chromium。持久化数据固定挂载到 `/app/data`。
 
-```bash
-python -m pytest tests/ -v
-```
+## 安全边界
+
+- 所有网络目标在连接前执行协议、域名、DNS 和 IP 校验；每次重定向重新校验。
+- HTTP 连接使用已批准 IP，TLS SNI/证书仍绑定原始主机名。
+- 浏览器阻断非代理出口、WebSocket、Service Worker、下载和非必要协议。
+- Web 修改接口只接受同源、带 CSRF 的 JSON `POST`。
+- 浏览器验证令牌只保存在内存中；清理失败会阻止任务恢复。
+
+安全问题请参阅 [SECURITY.md](SECURITY.md)。抓取前请确认目标网站条款、robots 规则和内容许可；本项目不授予复制或再分发第三方内容的权利。
+
+## 文档
+
+- [CLI 命令](docs/CLI.md)
+- [Web API](docs/API.md)
+- [系统架构](docs/ARCHITECTURE.md)
+- [自动适配配置](docs/CONFIG.md)
+- [配置注册表](docs/REGISTRY.md)
+- [开发与测试](docs/DEVELOPMENT.md)
+- [隐私与本地数据](PRIVACY.md)
+- [支持范围](SUPPORT.md)
+- [贡献指南](CONTRIBUTING.md)
+- [变更记录](CHANGELOG.md)
+
+## 许可证
+
+代码以 [MIT License](LICENSE) 发布。第三方网站、字体和抓取内容仍受各自条款与版权约束。
