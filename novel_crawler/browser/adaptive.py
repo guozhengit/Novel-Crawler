@@ -6,13 +6,19 @@ import json
 import secrets
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+from urllib.parse import urlparse
+
 from novel_crawler.acquisition.security import redact_url
 from novel_crawler.adaptation.config_manager import ConfigResolution, ResolutionKind
+from novel_crawler.adaptation.config_schema import SiteConfig
+from novel_crawler.core.domains import canonical_domain
+from novel_crawler.sites.base import SiteAdapter
 from novel_crawler.verification import BrowserCleanupRequired
 
 from .coordinator import BrowserAcquirer, VerificationCoordinator, VerificationRequired
@@ -140,10 +146,13 @@ class AdaptiveBrowserService:
         config_manager: _Manager,
         browser_acquirer: BrowserAcquirer | _Acquirer,
         verification_coordinator: VerificationCoordinator | _Coordinator,
+        *,
+        legacy_adapter: Callable[[str], SiteAdapter] | None = None,
     ) -> None:
         self.config_manager = config_manager
         self.browser_acquirer = browser_acquirer
         self.verification_coordinator = verification_coordinator
+        self._legacy_adapter = legacy_adapter
         self._guard = threading.RLock()
         self._contexts: dict[str, _ResumeContext] = {}
         self._requests: dict[tuple[str, str], str] = {}
@@ -190,6 +199,24 @@ class AdaptiveBrowserService:
         return result
 
     def _resolve_once(self, url: str, task_key: str, key: tuple[str, str]) -> AdaptiveResult:
+        # Check if legacy adapter can handle this URL
+        if self._legacy_adapter is not None:
+            try:
+                adapter = self._legacy_adapter(url)
+                if adapter.match(url):
+                    # Use legacy adapter directly, skip probing
+                    domain = canonical_domain(urlparse(url).hostname or "")
+                    placeholder = SiteConfig.new(
+                        site=domain,
+                        domain=domain,
+                        url_patterns=["/**"],
+                        selectors={"clean": (), "book": {}, "chapter": {}},
+                    )
+                    return AdaptiveResult(
+                        ConfigResolution(ResolutionKind.REUSED, config=placeholder, reason_ids=("legacy_adapter",))
+                    )
+            except Exception:
+                pass
         try:
             return AdaptiveResult(self._resolve_manager(url, task_key))
         except (BrowserCleanupRequired, VerificationRequired) as signal:

@@ -9,6 +9,9 @@ from novel_crawler.acquisition.models import AcquiredPage
 from novel_crawler.adaptation import ConfigManager, ConfigRegistry, ConfigRevalidator, ProbeService
 from novel_crawler.application.pipeline import CrawlTaskPipeline
 from novel_crawler.application.service import ApplicationService
+from novel_crawler.sites.base import SiteAdapter
+from novel_crawler.sites.bqg import BqgAdapter
+from novel_crawler.sites.twbook import TwbookAdapter
 from novel_crawler.browser import (
     AdaptiveBrowserService,
     BrowserAcquirer,
@@ -53,7 +56,32 @@ def build_application(
         probe = ProbeService(acquirer=browser_acquirer)
         revalidator = ConfigRevalidator(acquirer=browser_acquirer, registry=registry)
         manager = ConfigManager(registry, revalidator, probe)
-        adaptive = AdaptiveBrowserService(manager, browser_acquirer, coordinator)
+
+        def _legacy_adapter_factory(url: str) -> SiteAdapter:
+            """Select a dedicated SiteAdapter for known sites, or fall back to AutoAdapter."""
+            adapters: list[SiteAdapter] = [
+                BqgAdapter(),
+                TwbookAdapter(ctx.project_dir),
+            ]
+            for adapter in adapters:
+                try:
+                    if adapter.match(url):
+                        adapter.set_fetcher(browser_acquirer)
+                        return adapter
+                except Exception:
+                    continue
+            # Fall back to AutoAdapter for unknown sites
+            from novel_crawler.sites.auto import AutoAdapter
+            fallback = AutoAdapter()
+            fallback.set_fetcher(browser_acquirer)
+            return fallback
+
+        adaptive = AdaptiveBrowserService(
+            manager,
+            browser_acquirer,
+            coordinator,
+            legacy_adapter=_legacy_adapter_factory,
+        )
         # Task CAS/events are intentionally isolated from ctx.db_path's book
         # content schema; both databases remain private under the same data_dir.
         repository = TaskRepository(ctx.data_dir / "tasks.db")
@@ -75,6 +103,7 @@ def build_application(
             registry,
             browser_acquirer,
             exporter=lambda book_id, fmt: crawler.export(book_id, fmt),
+            legacy_adapter=_legacy_adapter_factory,
             interaction_handler=adopt_late_interaction,
             access_preparer=adaptive.prepare_task_access,
         )

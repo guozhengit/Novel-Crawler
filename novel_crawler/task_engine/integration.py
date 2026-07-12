@@ -721,7 +721,21 @@ class AdaptiveTaskController:
         try:
             scheduler(task.task_id)
             return task
-        except Exception:
+        except Exception as exc:
+            import logging
+            logger = logging.getLogger(__name__)
+            # If the executor is closed, the task will be recovered on next startup
+            # Don't mark it as failed - just return the current state
+            if "executor_closed" in str(exc).lower() or "ExecutorClosed" in type(exc).__name__:
+                logger.info(
+                    "Executor closed while scheduling task %s (status=%s), task will be recovered on next startup",
+                    task.task_id, task.status
+                )
+                return task
+            logger.warning(
+                "schedule_active failed for task %s (status=%s, version=%s): %s: %s",
+                task.task_id, task.status, task.version, type(exc).__name__, exc
+            )
             try:
                 return self._repository.transition(
                     task.task_id,

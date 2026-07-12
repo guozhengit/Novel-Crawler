@@ -14,6 +14,8 @@ from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.application.models import CrawlOptions
 from novel_crawler.application.site_adapter import SiteConfigAdapter
 from novel_crawler.browser import BrowserCleanupRequired, VerificationRequired
+from novel_crawler.core.fetcher import FetchOptions
+from novel_crawler.sites.base import SiteAdapter
 from novel_crawler.core.models import Chapter
 from novel_crawler.core.storage import Storage
 from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
@@ -52,7 +54,7 @@ class CrawlTaskPipeline:
         acquirer: _Acquirer,
         *,
         exporter: Callable[[int, str], object] | None = None,
-        legacy_adapter: Callable[[str], SiteConfigAdapter] | None = None,
+        legacy_adapter: Callable[[str], SiteAdapter] | None = None,
         interaction_handler: Callable[
             [TaskRecord, str, BrowserCleanupRequired | VerificationRequired], object
         ]
@@ -136,8 +138,11 @@ class CrawlTaskPipeline:
             raise ValueError("crawl_plan_invalid")
         config = self._registry.load_active(task.source_url)
         if config is None:
-            raise ValueError("active_config_missing")
-        adapter = SiteConfigAdapter(config)
+            if self._legacy_adapter is None:
+                raise ValueError("active_config_missing")
+            adapter = self._legacy_adapter(task.source_url)
+        else:
+            adapter = SiteConfigAdapter(config)
 
         def process(chapter: Chapter) -> str:
             context.check_control(force=True)
@@ -176,8 +181,8 @@ class CrawlTaskPipeline:
             raise ValueError("concurrency_unsupported")
         return options
 
-    def _fetch_html(self, url: str, task: TaskRecord, adapter: SiteConfigAdapter) -> str:
-        options = adapter.fetch_options
+    def _fetch_html(self, url: str, task: TaskRecord, adapter: SiteAdapter) -> str:
+        options = getattr(adapter, "fetch_options", FetchOptions())
         for attempt in range(options.retries):
             self._wait_rate_limit(task, options.delay_min)
             if self._access_preparer is not None:
