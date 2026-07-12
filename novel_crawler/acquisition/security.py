@@ -95,6 +95,12 @@ def _is_unsafe(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return not address.is_global
 
 
+def _render_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return f"::ffff:{address.ipv4_mapped.compressed}"
+    return address.compressed
+
+
 class UrlSafetyPolicy:
     """Validate URL syntax and all resolver answers before network access.
 
@@ -146,7 +152,7 @@ class UrlSafetyPolicy:
         literal = self._parse_ip(host)
         if literal is not None:
             self._require_public(literal, safe_url)
-            return ResolvedTarget(host, port, (literal.compressed,))
+            return ResolvedTarget(host, port, (_render_address(literal),))
 
         try:
             answers = tuple(dict.fromkeys(self._resolve(host, port, timeout)))
@@ -163,7 +169,7 @@ class UrlSafetyPolicy:
             except ValueError as exc:
                 raise UrlSafetyError("dns_resolution_failed", safe_url) from exc
             self._require_public(address, safe_url)
-            normalized.append(address.compressed)
+            normalized.append(_render_address(address))
         return ResolvedTarget(host, port, tuple(normalized))
 
     def validate_redirect(

@@ -553,6 +553,8 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         self._advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
         self._owner_sid = self._current_owner_sid()
         self._owner_sid_pointer = self._sid_pointer(self._owner_sid)
+        self._default_owner_sid = self._current_owner_sid(information_class=4)
+        self._default_owner_sid_pointer = self._sid_pointer(self._default_owner_sid)
         self._system_sid_pointer = self._sid_pointer("S-1-5-18")
 
     def _sid_pointer(self, value: str) -> wintypes.LPVOID:
@@ -561,17 +563,19 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             raise RegistryIOError("security SID construction failed")
         return pointer
 
-    def _current_owner_sid(self) -> str:
+    def _current_owner_sid(self, *, information_class: int = 1) -> str:
         token = wintypes.HANDLE()
         if not self._advapi32.OpenProcessToken(self._kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
             raise RegistryIOError("current owner SID lookup failed")
         try:
             needed = wintypes.DWORD()
-            self._advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+            self._advapi32.GetTokenInformation(token, information_class, None, 0, ctypes.byref(needed))
             if not needed.value:
                 raise RegistryIOError("current owner SID lookup failed")
             buffer = ctypes.create_string_buffer(needed.value)
-            if not self._advapi32.GetTokenInformation(token, 1, buffer, needed.value, ctypes.byref(needed)):
+            if not self._advapi32.GetTokenInformation(
+                token, information_class, buffer, needed.value, ctypes.byref(needed)
+            ):
                 raise RegistryIOError("current owner SID lookup failed")
             sid = ctypes.cast(buffer, ctypes.POINTER(wintypes.LPVOID))[0]
             rendered = wintypes.LPWSTR()
@@ -770,7 +774,9 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         )
         if result != 0 or not descriptor:
             raise RegistryIOError("private ACL verification failed")
-        if not owner or not self._advapi32.EqualSid(owner, self._owner_sid_pointer):
+        owner_is_user = bool(owner and self._advapi32.EqualSid(owner, self._owner_sid_pointer))
+        owner_is_token_default = bool(owner and self._advapi32.EqualSid(owner, self._default_owner_sid_pointer))
+        if not owner_is_user and not owner_is_token_default:
             self._kernel32.LocalFree(descriptor)
             raise RegistryIOError("private ACL verification failed")
         control = ctypes.c_ushort()
@@ -827,7 +833,8 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         flag_text = "OICI" if expected_ace_flags else ""
         owner_ace = f"(A;{flag_text};FA;;;{self._owner_sid})"
         system_ace = f"(A;{flag_text};FA;;;SY)"
-        if f"O:{self._owner_sid}" not in sddl or "D:P" not in sddl or sddl.count("(A;") != 2:
+        allowed_owners = (f"O:{self._owner_sid}", f"O:{self._default_owner_sid}")
+        if not any(owner_text in sddl for owner_text in allowed_owners) or "D:P" not in sddl or sddl.count("(A;") != 2:
             raise RegistryIOError("private ACL verification failed")
         if owner_ace not in sddl or system_ace not in sddl:
             raise RegistryIOError("private ACL verification failed")
