@@ -11,6 +11,8 @@ from novel_crawler.exporters.txt import TxtExporter
 from novel_crawler.task_engine import TaskExecutionContext, TaskRepository, TaskStatus
 from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
 
+pytestmark = pytest.mark.release
+
 
 def test_1200_chapter_restart_is_idempotent_and_file_database_consistent(tmp_path: Path) -> None:
     now = [0.0]

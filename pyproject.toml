@@ -60,7 +60,7 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
   "integration: tests requiring locally installed external runtimes",
-  "release: release-scale acceptance tests",
+  "release: deterministic release reliability and quality gates",
 ]
 
 [tool.coverage.run]

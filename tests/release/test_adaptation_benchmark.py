@@ -5,9 +5,13 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from novel_crawler.acquisition.models import AcquiredPage, PageSnapshot
 from novel_crawler.adaptation.service import ProbeService
 from novel_crawler.browser import BrowserPageSnapshot
+
+pytestmark = pytest.mark.release
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -102,3 +106,4 @@ def test_redistributable_adaptation_benchmark_meets_release_thresholds() -> None
         assert rate >= manifest["thresholds"][kind]
         assert first[kind] == second[kind], "outcomes and reason codes must be stable"
         assert all(reasons == ("ok",) for ok, reasons in first[kind] if ok)
+pytestmark = pytest.mark.release
