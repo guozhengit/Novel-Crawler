@@ -40,7 +40,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest --ignore=tests/test_distribution.py -W error::DeprecationWarning -W error::PendingDeprecationWarning -q
+      - run: python -m pytest --ignore=tests/test_distribution.py -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning -W error::DeprecationWarning -W error::PendingDeprecationWarning -q
 
   coverage:
     runs-on: ubuntu-latest
@@ -51,7 +51,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest --ignore=tests/test_distribution.py -W error::DeprecationWarning -W error::PendingDeprecationWarning --cov=novel_crawler --cov-report=term-missing --cov-report=xml --cov-fail-under=80 -q
+      - run: python -m pytest --ignore=tests/test_distribution.py -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning -W error::DeprecationWarning -W error::PendingDeprecationWarning --cov=novel_crawler --cov-report=term-missing --cov-report=xml --cov-fail-under=80 -q
       - run: python -m coverage report --include="novel_crawler/core/*" --fail-under=85
 
   chromium-integration:
@@ -64,7 +64,7 @@ jobs:
           cache: pip
       - run: python -m pip install -e ".[dev]"
       - run: python -m playwright install --with-deps chromium
-      - run: RUN_PLAYWRIGHT_INTEGRATION=1 python -m pytest -W error::DeprecationWarning -W error::PendingDeprecationWarning tests/browser/test_playwright_integration.py -q
+      - run: RUN_PLAYWRIGHT_INTEGRATION=1 python -m pytest -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning -W error::DeprecationWarning -W error::PendingDeprecationWarning tests/browser/test_playwright_integration.py -q
 
   release-recovery:
     runs-on: ubuntu-latest
@@ -75,7 +75,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -W error::DeprecationWarning -W error::PendingDeprecationWarning -m release -q
+      - run: python -m pytest -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning -W error::DeprecationWarning -W error::PendingDeprecationWarning -m release -q
 
   privacy-version-license:
     runs-on: ubuntu-latest
