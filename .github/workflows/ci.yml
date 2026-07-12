@@ -6,33 +6,14 @@ on:
   pull_request:
     branches: [main, master]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.11', '3.12', '3.13']
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Install project
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install -e ".[dev]"
-
-    - name: Compile check
-      run: python -m compileall -q novel_crawler main.py
-
-    - name: Run tests
-      run: python -m pytest -q
-
   quality:
     runs-on: ubuntu-latest
     steps:
@@ -40,7 +21,92 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m ruff check novel_crawler tests main.py
+      - run: python -m ruff check novel_crawler tests
       - run: python -m mypy novel_crawler
-      - run: python -m pytest --cov=novel_crawler.cli --cov=novel_crawler.runtime --cov-report=term-missing --cov-fail-under=80 -q
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest --ignore=tests/test_distribution.py -W error::DeprecationWarning -W error::PendingDeprecationWarning -q
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest --ignore=tests/test_distribution.py -W error::DeprecationWarning -W error::PendingDeprecationWarning --cov=novel_crawler --cov-report=term-missing --cov-report=xml --cov-fail-under=80 -q
+      - run: python -m coverage report --include="novel_crawler/core/*" --fail-under=85
+
+  chromium-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m playwright install --with-deps chromium
+      - run: RUN_PLAYWRIGHT_INTEGRATION=1 python -m pytest -W error::DeprecationWarning -W error::PendingDeprecationWarning tests/browser/test_playwright_integration.py -q
+
+  release-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest -W error::DeprecationWarning -W error::PendingDeprecationWarning -m release -q
+
+  privacy-version-license:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Require release metadata and a clean public tree
+        shell: bash
+        run: |
+          test -f LICENSE
+          python - <<'PY'
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path.cwd()
+          REMOVED_ROOT_ARTIFACTS = {
+              "calibrate.py", "decode_font.py", "download_novel.py",
+              "font_decode_map.json", "main.py", "merge_final.py", "verify_parts.py",
+          }
+          present = sorted(name for name in REMOVED_ROOT_ARTIFACTS if (root / name).exists())
+          if present:
+              raise SystemExit(f"private or one-off root artifacts are tracked: {present}")
+          project_version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          namespace = {}
+          exec((root / "novel_crawler" / "__init__.py").read_text(encoding="utf-8"), namespace)
+          if namespace["__version__"] != project_version:
+              raise SystemExit("package and project versions differ")
+          PY
+          if git grep -I -n -E '(AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{30,}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)' -- . ':!tests'; then
+            echo "credential-like material found in tracked release files" >&2
+            exit 1
+          fi
