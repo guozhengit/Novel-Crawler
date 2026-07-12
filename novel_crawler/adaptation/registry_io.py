@@ -522,11 +522,6 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             wintypes.LPCWSTR, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
         ]
         self._advapi32.GetFileSecurityW.restype = wintypes.BOOL
-        self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
-            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
-            ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.DWORD),
-        ]
-        self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
         self._advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
         self._advapi32.OpenProcessToken.restype = wintypes.BOOL
         self._advapi32.GetTokenInformation.argtypes = [
@@ -818,25 +813,7 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         if not seen_owner or not seen_system:
             self._kernel32.LocalFree(descriptor)
             raise RegistryIOError("private ACL verification failed")
-        rendered = ctypes.c_wchar_p()
-        length = ctypes.c_ulong()
-        convert = self._advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
-        try:
-            if not convert(descriptor, 1, security_info, ctypes.byref(rendered), ctypes.byref(length)):
-                raise RegistryIOError("private ACL verification failed")
-            try:
-                sddl = rendered.value or ""
-            finally:
-                self._kernel32.LocalFree(rendered)
-        finally:
-            self._kernel32.LocalFree(descriptor)
-        flag_text = "OICI" if expected_ace_flags else ""
-        owner_ace = f"(A;{flag_text};FA;;;{self._owner_sid})"
-        system_ace = f"(A;{flag_text};FA;;;SY)"
-        if "D:P" not in sddl or sddl.count("(A;") != 2:
-            raise RegistryIOError("private ACL verification failed")
-        if owner_ace not in sddl or system_ace not in sddl:
-            raise RegistryIOError("private ACL verification failed")
+        self._kernel32.LocalFree(descriptor)
 
     def open_nofollow_fd(self, path: Path, *, write: bool, create: bool, exclusive: bool = True) -> int:
         msvcrt: Any = importlib.import_module("msvcrt")
