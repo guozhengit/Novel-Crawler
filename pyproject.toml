@@ -7,7 +7,7 @@ name = "novel-crawler"
 version = "0.2.0"
 description = "可解释、可恢复的多站点小说抓取工具"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = "MIT"
 authors = [{ name = "Novel Crawler contributors" }]
 classifiers = [
@@ -16,6 +16,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
   "requests>=2.31,<3",
