@@ -142,7 +142,7 @@ class _DomainLock:
         assert self._stream is not None
         self._stream.seek(0)
         if os.name == "nt":
-            import msvcrt
+            msvcrt: Any = importlib.import_module("msvcrt")
 
             msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
         else:  # pragma: no cover - exercised by POSIX CI
@@ -154,7 +154,7 @@ class _DomainLock:
             if self._os_locked:
                 self._stream.seek(0)
                 if os.name == "nt":
-                    import msvcrt
+                    msvcrt: Any = importlib.import_module("msvcrt")
 
                     msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
                 else:  # pragma: no cover - exercised by POSIX CI

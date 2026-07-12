@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ctypes
+import errno
+import importlib
 import os
 import stat
 import uuid
@@ -15,6 +17,7 @@ from typing import Any, Protocol
 
 _GETUID: Any = getattr(os, "getuid", lambda: -1)
 _FCHMOD: Any = getattr(os, "fchmod", None)
+_WINDOWS_CTYPES: Any = ctypes
 
 
 class _ByHandleFileInformation(ctypes.Structure):
@@ -270,6 +273,8 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
             self._verify_directory_fd(parent_fd)
             os.fsync(parent_fd)
         except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise RegistryIOError("registry path is not a directory or contains a symlink") from exc
             raise RegistryIOError("private registry directory setup failed") from exc
         finally:
             os.close(parent_fd)
@@ -452,8 +457,8 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
     def __init__(self) -> None:
         if os.name != "nt":
             raise RegistryIOError("Windows security APIs are unavailable")
-        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        self._kernel32 = _WINDOWS_CTYPES.WinDLL("kernel32", use_last_error=True)
+        self._advapi32 = _WINDOWS_CTYPES.WinDLL("advapi32", use_last_error=True)
         self._kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
         self._kernel32.GetFileAttributesW.restype = ctypes.c_ulong
         self._kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
@@ -574,10 +579,10 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             raise RegistryIOError("registry path must not be a symlink or reparse point")
 
     def is_reparse(self, path: Path) -> bool:
-        ctypes.set_last_error(0)
+        _WINDOWS_CTYPES.set_last_error(0)
         attributes = self._kernel32.GetFileAttributesW(str(path))
         if attributes == self._INVALID_ATTRIBUTES:
-            error = ctypes.get_last_error()
+            error = _WINDOWS_CTYPES.get_last_error()
             if error not in {2, 3}:
                 raise RegistryIOError("reparse-point verification failed")
             return False
@@ -591,7 +596,7 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             self._kernel32.CloseHandle(handle)
 
     def apply_private_fd(self, descriptor: int) -> None:
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         self._apply_private_handle(msvcrt.get_osfhandle(descriptor))
 
@@ -726,7 +731,7 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, 0)
         try:
             if not self._kernel32.CreateDirectoryW(str(path), ctypes.byref(attributes)):
-                if ctypes.get_last_error() != 183:
+                if _WINDOWS_CTYPES.get_last_error() != 183:
                     raise RegistryIOError("private registry directory creation failed")
         finally:
             self._kernel32.LocalFree(descriptor)
@@ -815,7 +820,7 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
             raise RegistryIOError("private ACL verification failed")
 
     def open_nofollow_fd(self, path: Path, *, write: bool, create: bool, exclusive: bool = True) -> int:
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         access = 0x80000000 | ((0x40000000 | 0x00060000) if write else 0)
         creation = (1 if exclusive else 4) if create else 3
@@ -840,12 +845,12 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
                 self._kernel32.CloseHandle(handle)
 
     def verify_private_fd(self, descriptor: int, path: Path) -> None:
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         self._verify_private_handle(msvcrt.get_osfhandle(descriptor))
 
     def flush_file(self, descriptor: int) -> None:
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         handle = msvcrt.get_osfhandle(descriptor)
         if not self._kernel32.FlushFileBuffers(handle):
@@ -853,21 +858,21 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
 
     def move_write_through(self, source: Path, destination: Path, *, replace: bool = True) -> None:
         flags = 0x8 | (0x1 if replace else 0)
-        ctypes.set_last_error(0)
+        _WINDOWS_CTYPES.set_last_error(0)
         if not self._kernel32.MoveFileExW(str(source), str(destination), flags):
-            error = ctypes.get_last_error()
+            error = _WINDOWS_CTYPES.get_last_error()
             if not replace and error in {80, 183}:
                 raise RegistryIOExistsError("registry revision already exists")
             raise RegistryIOError("write-through atomic move failed")
 
     def delete_private_path(self, path: Path) -> None:
-        ctypes.set_last_error(0)
+        _WINDOWS_CTYPES.set_last_error(0)
         handle = self._kernel32.CreateFileW(
             str(path), 0x00030000, 0x3, None, 3, 0x80 | 0x00200000, None
         )
         invalid = ctypes.c_void_p(-1).value
         if handle == invalid:
-            if ctypes.get_last_error() in {2, 3}:
+            if _WINDOWS_CTYPES.get_last_error() in {2, 3}:
                 return
             raise RegistryIOError("registry temporary file cannot be opened for deletion")
         try:

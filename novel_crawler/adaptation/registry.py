@@ -135,7 +135,7 @@ class _FileLock:
         assert self._stream is not None
         self._stream.seek(0)
         if os.name == "nt":
-            import msvcrt
+            msvcrt: Any = importlib.import_module("msvcrt")
 
             msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
         else:
@@ -148,7 +148,7 @@ class _FileLock:
         try:
             self._stream.seek(0)
             if os.name == "nt":
-                import msvcrt
+                msvcrt: Any = importlib.import_module("msvcrt")
 
                 msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
             else:
