@@ -25,6 +25,7 @@ All notable changes to this project are documented here.
 - Correctly distinguishes recoverable acquisition failures from terminal HTTP errors.
 - Prevented same-book history from expanding a task's `start`, `count` or `max_chapters` range.
 - Preserved task identity and partial-success accounting when secondary view construction or queue submission fails.
+- Fixed Windows atomic registry publication cleanup and added deterministic resource finalization for SQLite and browser-session handles.
 
 ### Removed
 
