@@ -412,7 +412,9 @@ def test_deep_profile_deletion_is_iterative(tmp_path: Path) -> None:
         session_id = lease.info.session_id
     previous = sys.getrecursionlimit()
     try:
-        sys.setrecursionlimit(50)
+        # Keep the ceiling below a recursive 60-directory walk while leaving
+        # enough headroom for Python 3.11's deeper ctypes argument conversion.
+        sys.setrecursionlimit(80)
         assert store.clear("deep.example", session_id, confirmation=True)
     finally:
         sys.setrecursionlimit(previous)
