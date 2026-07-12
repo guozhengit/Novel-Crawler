@@ -3,6 +3,7 @@ name: Release build
 on:
   pull_request:
   push:
+    branches: [main, master]
     tags: ["v*"]
 
 permissions:

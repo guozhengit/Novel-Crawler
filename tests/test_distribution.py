@@ -47,7 +47,10 @@ def test_dockerfile_installs_matching_chromium_and_runs_as_non_root():
 
 
 def test_build_workflow_builds_packages_and_smoke_tests_docker_browser():
-    workflow = yaml.safe_load(Path(".github/workflows/build.yml").read_text(encoding="utf-8"))
+    workflow_text = Path(".github/workflows/build.yml").read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    assert "branches: [main, master]" in workflow_text
+    assert 'tags: ["v*"]' in workflow_text
     commands = [
         step["run"]
         for job in workflow["jobs"].values()
