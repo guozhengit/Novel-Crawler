@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "license": "CC0-1.0",
+  "source": "synthetic, generated locally without third-party page content",
+  "fixture_file": "adaptation_cases.json",
+  "thresholds": {
+    "static": 0.90,
+    "javascript": 0.70
+  },
+  "execution": {
+    "static": "page-snapshot",
+    "javascript": "synthetic-browser-page-snapshot",
+    "javascript_note": "Rendered DOM is passed through BrowserPageSnapshot; no installed Chromium is required."
+  }
+}

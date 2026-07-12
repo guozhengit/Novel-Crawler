@@ -1,0 +1,22 @@
+[
+  {"id":"static-01","kind":"static","wrapper":"layout-a","content":"article","paragraphs":2},
+  {"id":"static-02","kind":"static","wrapper":"layout-b","content":"article","paragraphs":3},
+  {"id":"static-03","kind":"static","wrapper":"reader-a","content":"article","paragraphs":4},
+  {"id":"static-04","kind":"static","wrapper":"reader-b","content":"article","paragraphs":2},
+  {"id":"static-05","kind":"static","wrapper":"novel-a","content":"article","paragraphs":3},
+  {"id":"static-06","kind":"static","wrapper":"novel-b","content":"article","paragraphs":4},
+  {"id":"static-07","kind":"static","wrapper":"page-a","content":"article","paragraphs":2},
+  {"id":"static-08","kind":"static","wrapper":"page-b","content":"article","paragraphs":3},
+  {"id":"static-09","kind":"static","wrapper":"book-a","content":"article","paragraphs":4},
+  {"id":"static-10","kind":"static","wrapper":"book-b","content":"article","paragraphs":2},
+  {"id":"js-01","kind":"javascript","wrapper":"app-a","content":"article","paragraphs":2},
+  {"id":"js-02","kind":"javascript","wrapper":"app-b","content":"article","paragraphs":3},
+  {"id":"js-03","kind":"javascript","wrapper":"hydrate-a","content":"article","paragraphs":4},
+  {"id":"js-04","kind":"javascript","wrapper":"hydrate-b","content":"article","paragraphs":2},
+  {"id":"js-05","kind":"javascript","wrapper":"shell-a","content":"article","paragraphs":3},
+  {"id":"js-06","kind":"javascript","wrapper":"shell-b","content":"article","paragraphs":4},
+  {"id":"js-07","kind":"javascript","wrapper":"client-a","content":"article","paragraphs":2},
+  {"id":"js-08","kind":"javascript","wrapper":"client-b","content":"article","paragraphs":3},
+  {"id":"js-09","kind":"javascript","wrapper":"render-a","content":"article","paragraphs":4},
+  {"id":"js-10","kind":"javascript","wrapper":"render-b","content":"article","paragraphs":2}
+]
