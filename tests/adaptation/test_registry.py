@@ -73,7 +73,7 @@ def _process_crash_after_revision(root: str) -> None:
     registry.register(config())
 
 
-def _process_crash_before_revision_replace(root: str) -> None:
+def _process_crash_before_revision_publish(root: str) -> None:
     registry = ConfigRegistry(root)
     if os.name == "nt":
         api = registry._io._api  # type: ignore[attr-defined]
@@ -86,14 +86,14 @@ def _process_crash_before_revision_replace(root: str) -> None:
 
         api.move_write_through = crash
     else:
-        original_replace = os.replace
+        original_link = os.link
 
-        def crash_replace(source: object, destination: object, **kwargs: object) -> None:
+        def crash_link(source: object, destination: object, **kwargs: object) -> None:
             if str(destination).startswith("rev-"):
                 os._exit(78)
-            original_replace(source, destination, **kwargs)  # type: ignore[arg-type]
+            original_link(source, destination, **kwargs)  # type: ignore[arg-type]
 
-        os.replace = crash_replace  # type: ignore[assignment]
+        os.link = crash_link  # type: ignore[assignment]
     registry.register(config())
 
 
@@ -812,9 +812,9 @@ def test_abrupt_crash_after_revision_before_manifest_recovers_complete_config(tm
     assert recovered.load(recovered.list()[0]) == config()
 
 
-def test_abrupt_crash_before_revision_replace_leaves_only_ignored_temp(tmp_path: Path) -> None:
+def test_abrupt_crash_before_revision_publish_leaves_only_ignored_temp(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
-    process = context.Process(target=_process_crash_before_revision_replace, args=(str(tmp_path),))
+    process = context.Process(target=_process_crash_before_revision_publish, args=(str(tmp_path),))
     process.start()
     process.join(timeout=10)
     assert process.exitcode == 78

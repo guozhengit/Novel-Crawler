@@ -255,16 +255,25 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
                 try:
                     child_fd = os.open(name, flags, dir_fd=parent_fd)
                 except FileNotFoundError:
-                    os.mkdir(name, 0o700, dir_fd=parent_fd)
+                    created = False
+                    try:
+                        os.mkdir(name, 0o700, dir_fd=parent_fd)
+                        created = True
+                    except FileExistsError:
+                        # Another trusted initializer may have won the mkdir
+                        # race. Re-open with O_NOFOLLOW below and verify the
+                        # resulting handle instead of trusting the path entry.
+                        pass
                     os.fsync(parent_fd)
                     child_fd = os.open(name, flags, dir_fd=parent_fd)
-                    try:
-                        _FCHMOD(child_fd, 0o700)
-                        self._verify_directory_fd(child_fd)
-                        os.fsync(child_fd)
-                    except Exception:
-                        os.close(child_fd)
-                        raise
+                    if created:
+                        try:
+                            _FCHMOD(child_fd, 0o700)
+                            self._verify_directory_fd(child_fd)
+                            os.fsync(child_fd)
+                        except Exception:
+                            os.close(child_fd)
+                            raise
                 try:
                     os.close(parent_fd)
                 finally:
@@ -388,6 +397,8 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
                 raise RegistryIOSizeError("file exceeds maximum bytes")
             return _read_limit(descriptor, limit)
         except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise RegistryIOError("registry input path is not a regular file or contains a symlink") from exc
             raise RegistryIOError("registry input cannot be opened safely") from exc
         finally:
             if descriptor >= 0:
@@ -428,6 +439,8 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
             descriptor = -1
             return stream
         except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise RegistryIOError("registry lock path is not a regular file or contains a symlink") from exc
             raise RegistryIOError("registry lock cannot be opened safely") from exc
         finally:
             if descriptor >= 0:
