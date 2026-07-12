@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import math
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
-from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -69,41 +72,64 @@ class Application(Protocol):
 @dataclass(frozen=True)
 class _Session:
     csrf: str
-    expires: float
+    expires: int
 
 
-class _Sessions:
-    def __init__(self, *, ttl: float = 3600, maximum: int = 1024) -> None:
+class _SessionCodec:
+    def __init__(
+        self,
+        *,
+        secret: bytes | None = None,
+        ttl: int = 3600,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._secret = secret or secrets.token_bytes(32)
         self._ttl = ttl
-        self._maximum = maximum
-        self._items: OrderedDict[str, _Session] = OrderedDict()
-        self._lock = threading.Lock()
+        self._clock = clock
 
-    def create(self) -> tuple[str, str] | None:
-        now = time.monotonic()
-        with self._lock:
-            self._purge(now)
-            if len(self._items) >= self._maximum:
-                return None
-            session_id, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-            self._items[session_id] = _Session(csrf, now + self._ttl)
-            return session_id, csrf
+    def issue(self) -> tuple[str, str]:
+        issued = int(self._clock())
+        csrf = secrets.token_urlsafe(32)
+        payload = json.dumps(
+            {"csrf": csrf, "issued": issued, "expiry": issued + self._ttl, "nonce": secrets.token_urlsafe(16)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        encoded = _b64encode(payload)
+        signature = _b64encode(hmac.digest(self._secret, encoded.encode("ascii"), hashlib.sha256))
+        return f"{encoded}.{signature}", csrf
 
-    def get(self, session_id: str) -> _Session | None:
-        now = time.monotonic()
-        with self._lock:
-            self._purge(now)
-            value = self._items.get(session_id)
-            if value is not None:
-                value = _Session(value.csrf, now + self._ttl)
-                self._items[session_id] = value
-                self._items.move_to_end(session_id)
-            return value
-
-    def _purge(self, now: float) -> None:
-        for key in tuple(self._items):
-            if self._items[key].expires <= now:
-                self._items.pop(key, None)
+    def verify(self, token: str) -> _Session | None:
+        if not 100 <= len(token) <= 1024 or token.count(".") != 1:
+            return None
+        encoded, supplied = token.split(".", 1)
+        expected = _b64encode(hmac.digest(self._secret, encoded.encode("ascii", "ignore"), hashlib.sha256))
+        if not hmac.compare_digest(supplied, expected):
+            return None
+        try:
+            payload = json.loads(_b64decode(encoded), object_pairs_hook=_unique_object)
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or set(payload) != {"csrf", "issued", "expiry", "nonce"}:
+            return None
+        csrf, nonce = payload["csrf"], payload["nonce"]
+        issued, expiry = payload["issued"], payload["expiry"]
+        now = int(self._clock())
+        if (
+            not isinstance(csrf, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{40,64}", csrf) is None
+            or not isinstance(nonce, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{20,32}", nonce) is None
+            or isinstance(issued, bool)
+            or not isinstance(issued, int)
+            or isinstance(expiry, bool)
+            or not isinstance(expiry, int)
+            or expiry - issued != self._ttl
+            or issued > now + 5
+            or expiry < now
+        ):
+            return None
+        return _Session(csrf, expiry)
 
 
 class WebServer(ThreadingHTTPServer):
@@ -117,13 +143,19 @@ class WebServer(ThreadingHTTPServer):
         owns_app: bool,
         max_connections: int,
         read_timeout: float,
+        handler_drain_timeout: float,
     ) -> None:
         self.application = app
         self.owns_application = owns_app
-        self.sessions = _Sessions()
+        self.session_codec = _SessionCodec()
         self._app_closed = False
         self._capacity = threading.BoundedSemaphore(max_connections)
         self._read_timeout = read_timeout
+        self._handler_drain_timeout = handler_drain_timeout
+        self._handlers = threading.Condition()
+        self._active_handlers = 0
+        self._error_lock = threading.Lock()
+        self.error_counts = {"socket_error": 0, "request_error": 0}
         super().__init__(address, WebHandler)
         port = int(self.server_address[1])
         bound = str(self.server_address[0]).casefold()
@@ -133,6 +165,8 @@ class WebServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         super().server_close()
+        if not self._drain_handlers(self._handler_drain_timeout):
+            raise RuntimeError("close_incomplete")
         if self.owns_application and not self._app_closed:
             self._app_closed = _bounded_close(self.application)
             if not self._app_closed:
@@ -146,6 +180,14 @@ class WebServer(ThreadingHTTPServer):
     def process_request(self, request: socket.socket, client_address: object) -> None:
         if not self._capacity.acquire(blocking=False):
             try:
+                request.setblocking(False)
+                try:
+                    while request.recv(4096):
+                        pass
+                except OSError:
+                    pass
+                request.setblocking(True)
+                request.settimeout(self._read_timeout)
                 headers = (
                     "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
                     f"Content-Length: {len(_BUSY_BODY)}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
@@ -156,17 +198,48 @@ class WebServer(ThreadingHTTPServer):
             finally:
                 self.shutdown_request(request)
             return
+        with self._handlers:
+            self._active_handlers += 1
         try:
             super().process_request(request, client_address)
         except Exception:
-            self._capacity.release()
+            self._handler_finished()
             raise
 
     def process_request_thread(self, request: socket.socket, client_address: object) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._capacity.release()
+            self._handler_finished()
+
+    def handle_error(self, request: object, client_address: object) -> None:
+        del request, client_address
+        error = sys.exc_info()[1]
+        code = "socket_error" if isinstance(
+            error,
+            (TimeoutError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError),
+        ) else "request_error"
+        self._record_error(code)
+
+    def _record_error(self, code: str) -> None:
+        with self._error_lock:
+            self.error_counts[code] += 1
+
+    def _handler_finished(self) -> None:
+        self._capacity.release()
+        with self._handlers:
+            self._active_handlers -= 1
+            self._handlers.notify_all()
+
+    def _drain_handlers(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._handlers:
+            while self._active_handlers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._handlers.wait(remaining)
+            return True
 
 
 class WebHandler(BaseHTTPRequestHandler):
@@ -182,10 +255,7 @@ class WebHandler(BaseHTTPRequestHandler):
         if path == "/":
             current = self._session_data()
             if current is None:
-                created = self.server.sessions.create()
-                if created is None:
-                    return self._error("session_capacity", HTTPStatus.TOO_MANY_REQUESTS, retryable=True)
-                session_id, csrf = created
+                session_id, csrf = self.server.session_codec.issue()
             else:
                 session_id, session = current
                 csrf = session.csrf
@@ -366,8 +436,16 @@ class WebHandler(BaseHTTPRequestHandler):
         item = cookie.get("nc_session")
         if item is None:
             return None
-        session = self.server.sessions.get(item.value)
+        session = self.server.session_codec.verify(item.value)
         return (item.value, session) if session is not None else None
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        except (TimeoutError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.server._record_error("socket_error")
+        except Exception:
+            self.server._record_error("request_error")
 
     def _valid_host(self) -> bool:
         values = self.headers.get_all("Host") or []
@@ -449,6 +527,7 @@ def create_web_server(
     close_application: bool | None = None,
     max_connections: int = 16,
     read_timeout: float = 5.0,
+    handler_drain_timeout: float = 10.0,
 ) -> WebServer:
     if not _is_loopback(host) and not unsafe_non_loopback:
         raise ValueError("non-loopback binding requires unsafe_non_loopback=True")
@@ -464,6 +543,10 @@ def create_web_server(
         or not isinstance(read_timeout, int | float)
         or not math.isfinite(read_timeout)
         or not 0.1 <= read_timeout <= 60
+        or isinstance(handler_drain_timeout, bool)
+        or not isinstance(handler_drain_timeout, int | float)
+        or not math.isfinite(handler_drain_timeout)
+        or not 0.01 <= handler_drain_timeout <= 300
     ):
         raise ValueError("invalid web server limits")
     if app is not None:
@@ -483,6 +566,7 @@ def create_web_server(
             owns_app=owns,
             max_connections=max_connections,
             read_timeout=read_timeout,
+            handler_drain_timeout=handler_drain_timeout,
         )
     except Exception:
         if owns and not _bounded_close(application):
@@ -514,7 +598,13 @@ def run_web_ui(
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        while True:
+            try:
+                server.server_close()
+                break
+            except RuntimeError as exc:
+                if str(exc) != "close_incomplete":
+                    raise
 
 
 def _is_loopback(host: str) -> bool:
@@ -726,6 +816,15 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError("duplicate JSON key")
         result[key] = value
     return result
+
+
+def _b64encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.b64decode(value + padding, altchars=b"-_", validate=True)
 
 
 __all__ = ["WebServer", "create_web_server", "run_web_ui"]

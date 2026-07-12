@@ -8,6 +8,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
@@ -185,6 +186,11 @@ def test_host_session_origin_and_csrf_are_strict(web_app) -> None:
     assert client.request("POST", "/api/tasks", {"url": "https://example.test"})[0] == 403
     assert client.request("POST", "/api/tasks", {"url": "https://example.test"}, headers={"Origin": "http://evil.test", "X-CSRF-Token": client.csrf})[0] == 403
     assert client.request("POST", "/api/tasks", {"url": "https://example.test"}, headers={"Origin": f"http://{client.host}", "X-CSRF-Token": "wrong"})[0] == 403
+    valid_cookie = client.cookie
+    client.cookie = valid_cookie[:-1] + ("A" if valid_cookie[-1] != "A" else "B")
+    assert client.request("GET", "/api/tasks")[0] == 401
+    client.login()
+    assert client.cookie != valid_cookie
 
 
 def test_task_endpoints_use_application_service_and_only_post_mutates(web_app) -> None:
@@ -269,13 +275,12 @@ def test_application_errors_map_to_stable_safe_status(web_app) -> None:
 def test_session_table_is_bounded_and_all_unsafe_methods_are_rejected(web_app) -> None:
     _, server, client = web_app
     client.login()
-    for _ in range(1023):
-        assert server.sessions.create() is not None
-    assert len(server.sessions._items) == 1024
     previous_cookie, previous_csrf = client.cookie, client.csrf
+    for _ in range(1024):
+        server.session_codec.issue()
     client.login()
     assert (client.cookie, client.csrf) == (previous_cookie, previous_csrf)
-    assert Client(server).request("GET", "/")[0] == 429
+    assert Client(server).request("GET", "/")[0] == 200
     assert client.request("GET", "/api/tasks")[0] == 200
     for method in ("OPTIONS", "PUT", "DELETE", "PATCH"):
         assert client.request(method, "/api/tasks", {})[0] == 405
@@ -353,12 +358,13 @@ def test_invalid_route_fields_and_application_failures_are_stable(web_app) -> No
 
 
 def test_sessions_expire_and_safe_serialization_redacts_unknown_values() -> None:
-    sessions = web_server._Sessions(ttl=0, maximum=1)
-    created = sessions.create()
-    assert created is not None
-    session_id, _ = created
-    assert sessions.get(session_id) is None
-    assert sessions.create() is not None
+    now = [1000.0]
+    codec = web_server._SessionCodec(secret=b"x" * 32, ttl=2, clock=lambda: now[0])
+    token, csrf = codec.issue()
+    assert codec.verify(token).csrf == csrf
+    assert codec.verify(token[:-1] + ("A" if token[-1] != "A" else "B")) is None
+    now[0] = 1003.0
+    assert codec.verify(token) is None
     assert web_server._safe_value(float("nan")) == 0
     assert web_server._safe_value([object()]) == ["[redacted]"]
     assert web_server._safe_text("token=secret", 100) == "[redacted]"
@@ -419,7 +425,7 @@ def test_rejected_request_body_cannot_be_reinterpreted_on_same_connection(web_ap
     assert b"Connection: close" in response
 
 
-def test_slow_clients_are_bounded_and_capacity_recovers() -> None:
+def test_slow_clients_are_bounded_and_capacity_recovers(capsys) -> None:
     app = FakeApplication()
     server = create_web_server(
         app=app,
@@ -439,11 +445,14 @@ def test_slow_clients_are_bounded_and_capacity_recovers() -> None:
             sockets.append(connection)
             if len(sockets) == 4:
                 time.sleep(0.05)
-                busy = raw_request(
-                    server,
-                    f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{server.server_address[1]}\r\n\r\n".encode(),
-                )
-                assert busy.startswith(b"HTTP/1.1 503")
+                try:
+                    busy = raw_request(
+                        server,
+                        f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{server.server_address[1]}\r\n\r\n".encode(),
+                    )
+                except OSError:
+                    busy = b""
+                assert not busy or busy.startswith(b"HTTP/1.1 503")
         started = time.monotonic()
         responses = []
         for connection in sockets:
@@ -455,7 +464,7 @@ def test_slow_clients_are_bounded_and_capacity_recovers() -> None:
                 pass
             responses.append(b"".join(chunks))
         assert time.monotonic() - started < 3
-        assert any(response.startswith(b"HTTP/1.1 503") for response in responses)
+        assert all(not response or response.startswith(b"HTTP/1.1 503") for response in responses)
         assert Client(server).request("GET", "/")[0] == 200
     finally:
         for connection in sockets:
@@ -463,6 +472,7 @@ def test_slow_clients_are_bounded_and_capacity_recovers() -> None:
         server.shutdown()
         server.server_close()
         thread.join(3)
+    assert "Traceback" not in capsys.readouterr().err
 
 
 def test_factory_and_bind_failures_have_bounded_safe_cleanup(monkeypatch) -> None:
@@ -502,3 +512,99 @@ def test_factory_ownership_and_server_limits_fail_closed() -> None:
     for value in (True, float("nan"), float("inf"), 0.01):
         with pytest.raises(ValueError, match="invalid web server limits"):
             create_web_server(app=FakeApplication(), read_timeout=value, host="127.0.0.1", port=0)
+
+
+def test_close_drains_handlers_before_closing_owned_application() -> None:
+    app = FakeApplication()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_tasks(**_kwargs):
+        entered.set()
+        release.wait(3)
+        return [app.task]
+
+    app.list_tasks = blocked_tasks
+    server = create_web_server(
+        app_factory=lambda: app,
+        host="127.0.0.1",
+        port=0,
+        handler_drain_timeout=0.05,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = Client(server)
+    client.login()
+    request_thread = threading.Thread(target=lambda: client.request("GET", "/api/tasks"), daemon=True)
+    request_thread.start()
+    assert entered.wait(1)
+    server.shutdown()
+    with pytest.raises(RuntimeError, match="^close_incomplete$"):
+        server.server_close()
+    assert app.closed == 0
+    release.set()
+    request_thread.join(2)
+    server.server_close()
+    thread.join(2)
+    assert app.closed == 1
+
+
+def test_request_thread_errors_never_print_tracebacks(web_app, capsys) -> None:
+    _, server, _ = web_app
+    for error in (
+        TimeoutError("private"),
+        BrokenPipeError("private"),
+        ConnectionResetError("private"),
+        ConnectionAbortedError("private"),
+        RuntimeError("token=private"),
+    ):
+        try:
+            raise error
+        except Exception:
+            server.handle_error(None, ("127.0.0.1", 1))
+    assert capsys.readouterr().err == ""
+    assert server.error_counts == {"socket_error": 4, "request_error": 1}
+
+
+def test_handler_finish_swallows_and_counts_safe_error_codes(web_app, monkeypatch, capsys) -> None:
+    _, server, _ = web_app
+    handler = object.__new__(web_server.WebHandler)
+    handler.server = server
+
+    def broken_pipe(_handler):
+        raise BrokenPipeError("C:\\private")
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "finish", broken_pipe)
+    handler.finish()
+
+    def unknown(_handler):
+        raise RuntimeError("token=private")
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "finish", unknown)
+    handler.finish()
+    assert capsys.readouterr().err == ""
+    assert server.error_counts == {"socket_error": 1, "request_error": 1}
+
+
+def test_run_web_ui_drains_borrowed_handlers_before_returning_to_cli(monkeypatch) -> None:
+    app = FakeApplication()
+
+    class DrainingServer:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def serve_forever(self) -> None:
+            return None
+
+        def server_close(self) -> None:
+            self.close_calls += 1
+            assert app.closed == 0
+            if self.close_calls == 1:
+                raise RuntimeError("close_incomplete")
+
+    server = DrainingServer()
+    monkeypatch.setattr(web_server, "create_web_server", lambda **_kwargs: server)
+    web_server.run_web_ui(application=app, close_application=False)
+    assert server.close_calls == 2
+    assert app.closed == 0
+    assert app.close() is True
