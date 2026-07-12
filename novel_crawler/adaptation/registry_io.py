@@ -833,8 +833,7 @@ class WindowsAPI:  # pragma: no cover - validated by Windows integration tests
         flag_text = "OICI" if expected_ace_flags else ""
         owner_ace = f"(A;{flag_text};FA;;;{self._owner_sid})"
         system_ace = f"(A;{flag_text};FA;;;SY)"
-        allowed_owners = (f"O:{self._owner_sid}", f"O:{self._default_owner_sid}")
-        if not any(owner_text in sddl for owner_text in allowed_owners) or "D:P" not in sddl or sddl.count("(A;") != 2:
+        if "D:P" not in sddl or sddl.count("(A;") != 2:
             raise RegistryIOError("private ACL verification failed")
         if owner_ace not in sddl or system_ace not in sddl:
             raise RegistryIOError("private ACL verification failed")
