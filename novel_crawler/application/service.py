@@ -14,7 +14,9 @@ from urllib.parse import urlsplit
 
 from novel_crawler.application.errors import ApplicationError
 from novel_crawler.application.models import CrawlOptions, InteractionView, TaskEventView, TaskView
+from novel_crawler.compliance import decide_third_party_access
 from novel_crawler.core.domains import canonical_domain
+from novel_crawler.easyvoice import EasyVoiceOptions
 from novel_crawler.task_engine import (
     ExecutorClosed,
     ExecutorQueueFull,
@@ -67,6 +69,16 @@ class _Crawler(Protocol):
     def progress(self, book_id: int) -> dict[str, int]: ...
     def report(self, book_id: int) -> str: ...
     def export(self, book_id: int, fmt: str = "txt", output: Path | None = None) -> Path: ...
+    storage: object
+    def export_easyvoice(self, book_id: int, output: Path | None = None) -> object: ...
+    def convert_easyvoice(
+        self,
+        book_id: int,
+        *,
+        export_path: Path | None = None,
+        output_dir: Path | None = None,
+        options: EasyVoiceOptions | None = None,
+    ) -> object: ...
     def delete_book(self, book_id: int) -> _SafeSerializable: ...
     def validate(self, book_id: int) -> object: ...
     def fix_titles(self, book_id: int, dry_run: bool = False) -> object: ...
@@ -127,6 +139,10 @@ class ApplicationService:
             raise ApplicationError("chase_unsupported")
         if parsed.concurrency != 1:
             raise ApplicationError("concurrency_unsupported")
+        _validate_source_url_shape(url)
+        decision = decide_third_party_access(url)
+        if not decision.allowed:
+            raise ApplicationError(decision.code)
         with self._lock:
             self._ensure_open()
             try:
@@ -286,6 +302,81 @@ class ApplicationService:
                 return {"completed": True, "format": fmt}
             except Exception:
                 raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def export_easyvoice_book(self, book_id: int, output: Path | None = None) -> dict[str, object]:
+        with self._operation():
+            crawler = self._require_crawler()
+            _positive_id(book_id, "book_id_invalid")
+            if output is not None and not isinstance(output, Path):
+                raise ApplicationError("output_path_invalid")
+            try:
+                self._ensure_book_content_export_allowed(crawler, book_id)
+                result = crawler.export_easyvoice(book_id, output)
+                return {
+                    "completed": True,
+                    "book_id": book_id,
+                    "chapters": _safe_count(getattr(result, "chapter_count", 0)),
+                    "export_path": str(getattr(result, "export_path", "")),
+                }
+            except ApplicationError:
+                raise
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    def convert_easyvoice_book(
+        self,
+        book_id: int,
+        options: EasyVoiceOptions,
+        *,
+        export_path: Path | None = None,
+        output_dir: Path | None = None,
+    ) -> dict[str, object]:
+        with self._operation():
+            crawler = self._require_crawler()
+            _positive_id(book_id, "book_id_invalid")
+            if not isinstance(options, EasyVoiceOptions):
+                raise ApplicationError("easyvoice_options_invalid")
+            if export_path is not None and not isinstance(export_path, Path):
+                raise ApplicationError("output_path_invalid")
+            if output_dir is not None and not isinstance(output_dir, Path):
+                raise ApplicationError("output_path_invalid")
+            try:
+                self._ensure_book_content_export_allowed(crawler, book_id)
+                result = crawler.convert_easyvoice(
+                    book_id,
+                    export_path=export_path,
+                    output_dir=output_dir,
+                    options=options,
+                )
+                return {
+                    "completed": getattr(result, "completed", False) is True,
+                    "incomplete": getattr(result, "incomplete", False) is True,
+                    "book_id": book_id,
+                    "returncode": _safe_count(getattr(result, "returncode", 0)),
+                    "export_path": str(getattr(result, "export_path", "")),
+                    "output_dir": str(getattr(result, "output_dir", "")),
+                    "manifest_path": str(getattr(result, "manifest_path", "")),
+                    "stdout_tail": _safe_text(str(getattr(result, "stdout", ""))[-4000:], maximum=4000),
+                    "stderr_tail": _safe_text(str(getattr(result, "stderr", ""))[-4000:], maximum=4000),
+                }
+            except ApplicationError:
+                raise
+            except Exception:
+                raise ApplicationError("crawler_operation_failed", retryable=True) from None
+
+    @staticmethod
+    def _ensure_book_content_export_allowed(crawler: _Crawler, book_id: int) -> None:
+        storage = getattr(crawler, "storage", None)
+        get_book = getattr(storage, "get_book", None)
+        if not callable(get_book):
+            return
+        book = get_book(book_id)
+        url = getattr(book, "url", "")
+        if not isinstance(url, str):
+            return
+        decision = decide_third_party_access(url)
+        if not decision.allowed:
+            raise ApplicationError(decision.code)
 
     def delete_book(self, book_id: int) -> dict[str, object]:
         with self._operation():
@@ -783,6 +874,19 @@ class ApplicationService:
 def _repository_input_code(exc: TaskInputError) -> str:
     value = str(exc).strip("'\"")
     return value if value in {"source_url_invalid", "metadata_invalid"} else "task_input_invalid"
+
+
+def _validate_source_url_shape(url: object) -> None:
+    if not isinstance(url, str) or len(url) > 2048:
+        raise ApplicationError("source_url_invalid")
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ApplicationError("source_url_invalid")
 
 
 def _positive_id(value: object, code: str) -> None:

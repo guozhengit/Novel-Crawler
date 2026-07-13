@@ -22,6 +22,7 @@ from novel_crawler.application import (
 from novel_crawler.browser.adaptive import AdaptiveResult
 from novel_crawler.browser.models import VerificationStatus, VerificationTicket
 from novel_crawler.core.storage import BookDeletionResult
+from novel_crawler.easyvoice import EasyVoiceConversionResult, EasyVoiceExportResult
 from novel_crawler.task_engine import (
     AdaptiveTaskController,
     BackgroundTaskExecutor,
@@ -132,6 +133,31 @@ class FakeCrawler:
         self.export_args = (book_id, fmt)
         return Path("C:/Users/private/output/secret.txt")
 
+    def export_easyvoice(self, book_id: int, output: Path | None = None):
+        return EasyVoiceExportResult(
+            book_id=book_id,
+            export_path=output or Path("C:/Users/private/output/book.json"),
+            chapter_count=2,
+        )
+
+    def convert_easyvoice(
+        self,
+        book_id: int,
+        *,
+        export_path: Path | None = None,
+        output_dir: Path | None = None,
+        options=None,
+    ):
+        return EasyVoiceConversionResult(
+            book_id=book_id,
+            export_path=export_path or Path("C:/Users/private/output/book.json"),
+            output_dir=output_dir or Path("C:/Users/private/audio"),
+            manifest_path=Path("C:/Users/private/audio/book-4/manifest.json"),
+            returncode=0,
+            stdout="completed",
+            stderr="",
+        )
+
     def delete_book(self, book_id: int):
         return BookDeletionResult(3, "pending", "deletion_cleanup_retryable")
 
@@ -212,6 +238,46 @@ def test_create_validates_and_persists_only_bounded_safe_options(app) -> None:
     }
     assert "example.com" not in repr(view)
     assert "secret" not in str(view.to_safe_dict())
+
+
+def test_create_blocks_third_party_public_urls_by_default(app, monkeypatch) -> None:
+    service, repo, executor, *_ = app
+    monkeypatch.delenv("NOVEL_CRAWLER_ALLOW_THIRD_PARTY", raising=False)
+
+    with pytest.raises(ApplicationError) as caught:
+        service.create_crawl_task("https://www.qidian.com/chapter/1/2/", {})
+
+    assert caught.value.code == "third_party_crawl_disabled"
+    assert repo.list_tasks() == []
+    assert executor.submitted == []
+
+
+def test_create_allows_third_party_public_urls_when_explicitly_enabled(app, monkeypatch) -> None:
+    service, _repo, executor, *_ = app
+    monkeypatch.setenv("NOVEL_CRAWLER_ALLOW_THIRD_PARTY", "1")
+
+    view = service.create_crawl_task("https://www.qidian.com/chapter/1/2/", {})
+
+    assert executor.submitted == [view.task_id]
+
+
+def test_easyvoice_export_blocks_third_party_book_content_by_default(tmp_path: Path, monkeypatch) -> None:
+    class Storage:
+        def get_book(self, book_id: int):
+            return SimpleNamespace(url="https://www.qidian.com/chapter/1/2/")
+
+    class StoredCrawler(FakeCrawler):
+        storage = Storage()
+
+    monkeypatch.delenv("NOVEL_CRAWLER_ALLOW_THIRD_PARTY", raising=False)
+    repo = TaskRepository(tmp_path / "tts-compliance.db")
+    service = ApplicationService(repo, FakeExecutor(repo), crawler=StoredCrawler())
+
+    with pytest.raises(ApplicationError) as caught:
+        service.export_easyvoice_book(1)
+
+    assert caught.value.code == "third_party_crawl_disabled"
+    service.close()
 
 
 def test_admin_book_facade_allowlists_and_redacts_legacy_results(app) -> None:

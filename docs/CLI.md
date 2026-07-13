@@ -3,10 +3,12 @@
 安装后使用 `novel-crawler`。开发环境通过 `python -m pip install -e ".[dev]"` 安装同一入口。
 
 ```bash
-novel-crawler [--data-dir PATH] COMMAND [ARGS]
+novel-crawler [--data-dir PATH] [--allow-third-party] COMMAND [ARGS]
 ```
 
 CLI 只通过 `ApplicationService` 访问任务与书籍；标准输出为稳定 JSON，错误只包含安全中文提示和稳定 `code`。
+
+`--allow-third-party` 默认关闭。只有在确认目标网站授权、`robots.txt`、服务条款、版权许可和速率限制允许后，才可显式开启第三方线上站点访问。开启时 CLI 会在标准错误输出合规免责声明；完整说明见 [../COMPLIANCE.md](../COMPLIANCE.md)。
 
 ## 抓取任务
 
@@ -19,6 +21,7 @@ novel-crawler crawl URL \
 ```
 
 命令创建后台任务并立即返回安全任务视图。`--wait` 会轮询到终态、人工操作、暂停或可恢复失败。任务范围会被写入持久化 crawl plan；恢复时不会抓取同一本书范围之外的历史章节。
+第三方线上站点会被默认拒绝并返回 `third_party_crawl_disabled`；本机、私有网络和测试/文档域名不需要该开关。
 
 当前限制：
 

@@ -43,6 +43,8 @@
 
 以下情况立即停止探索并返回稳定错误：JavaScript-only shell、验证码/挑战页、登录或付费要求、跨域章节跳转、响应体超限、目录与章节关系不确定。结构可以静态解析但评分不足时，可请求用户确认 CSS selector；确认后仍需重新执行静态验证。
 
+需要使用真实站点样本判断阻断原因、浏览器渲染、network API 或验证码时，先按 [EXPLORATORY_CRAWLING.md](EXPLORATORY_CRAWLING.md) 生成探索报告。探索失败也应记录为有效结果，不得直接把 WAF、验证码或登录墙问题改写成 selector 适配问题。
+
 ## 选择哪种方式
 
 | 情况 | 方式 |

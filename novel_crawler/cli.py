@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from novel_crawler.application import ApplicationError, CrawlOptions, build_application
+from novel_crawler.compliance import ALLOW_THIRD_PARTY_ENV, DISCLAIMER
+from novel_crawler.easyvoice import EasyVoiceOptions
 from novel_crawler.runtime.env import RuntimeContext, create_runtime_context, format_runtime_report
 from novel_crawler.task_engine import TaskStatus
 
@@ -30,6 +33,9 @@ _ERROR_MESSAGES = {
     "crawler_operation_failed": "书籍操作失败",
     "book_id_invalid": "书籍编号无效",
     "export_format_invalid": "导出格式无效",
+    "easyvoice_options_invalid": "EasyVoice 参数无效",
+    "output_path_invalid": "输出路径无效",
+    "third_party_crawl_disabled": "第三方线上站点抓取默认禁用；仅在确认授权、robots、条款和版权许可后再显式开启",
     "service_closing": "服务正在关闭，请稍后重试",
     "service_closed": "服务已关闭",
     "chase_unsupported": "当前版本不支持递推抓取",
@@ -65,6 +71,11 @@ def _bounded_float(minimum: float, maximum: float) -> Callable[[str], float]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="novel-crawler", description="通用小说爬虫系统")
     parser.add_argument("--data-dir", type=Path, default=None, help="私有运行数据目录")
+    parser.add_argument(
+        "--allow-third-party",
+        action="store_true",
+        help="显式允许本次进程访问第三方线上站点；仅限已获授权且遵守 robots/条款/版权许可的目标",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("env", help="显示运行环境检测报告")
@@ -139,6 +150,27 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("book_id", type=int)
     export.add_argument("--format", choices=["txt", "epub", "md", "jsonl"], default="txt")
     export.add_argument("--output", type=Path, default=None, help="兼容参数（输出目录由应用统一管理）")
+    tts_export = sub.add_parser("tts-export", help="导出 EasyVoice 交换 JSON")
+    tts_export.add_argument("book_id", type=int)
+    tts_export.add_argument("--output", type=Path, default=None, help="交换 JSON 输出路径")
+    tts_convert = sub.add_parser("tts-convert", help="调用 EasyVoice 转换章节音频")
+    tts_convert.add_argument("book_id", type=int)
+    tts_convert.add_argument("--export-path", type=Path, default=None, help="交换 JSON 输出路径")
+    tts_convert.add_argument("--output-dir", type=Path, default=None, help="EasyVoice 音频输出目录")
+    tts_convert.add_argument("--base-url", default="http://localhost:9549", help="EasyVoice 服务地址")
+    tts_convert.add_argument("--voice", default="zh-CN-YunxiNeural")
+    tts_convert.add_argument("--rate", default="+0%")
+    tts_convert.add_argument("--pitch", default="+0Hz")
+    tts_convert.add_argument("--volume", default="+0%")
+    tts_convert.add_argument("--use-llm", action="store_true")
+    tts_convert.add_argument("--poll-interval", type=_bounded_float(0.05, 60), default=3.0)
+    tts_convert.add_argument("--task-timeout", type=_bounded_float(1, 86_400), default=3600.0)
+    tts_convert.add_argument("--retries", type=int, default=3)
+    tts_convert.add_argument("--assemble", action="store_true")
+    tts_convert.add_argument("--media-container", default=None)
+    tts_convert.add_argument("--media-host-root", type=Path, default=None)
+    tts_convert.add_argument("--media-container-root", type=Path, default=None)
+    tts_convert.add_argument("--pipeline", type=Path, default=None, help="novel_tts_pipeline.py 路径")
     decode_font = sub.add_parser("decode-font", help="根据系统字体解码混淆字体")
     decode_font.add_argument("font", type=Path)
     decode_font.add_argument("--output", type=Path, default=Path("font_decode_map.json"))
@@ -176,36 +208,47 @@ def main(
 ) -> int:
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
     args = build_parser().parse_args(argv)
-    ctx = create_runtime_context((project_dir or Path.cwd()).resolve(), args.data_dir)
-    if args.command == "env":
-        print(format_runtime_report(ctx))
-        return 0
-    if args.command == "decode-font":
-        return _decode_font(ctx, args)
-    app: _Application | None = None
-    result = 3
+    previous_allow = os.environ.get(ALLOW_THIRD_PARTY_ENV)
+    if args.allow_third_party:
+        os.environ[ALLOW_THIRD_PARTY_ENV] = "1"
+        print(f"合规免责声明：{DISCLAIMER}", file=sys.stderr)
     try:
-        app = application_factory(ctx)
-        result = _dispatch(app, args, ctx)
-    except ApplicationError as exc:
-        result = _application_error(exc)
-    except KeyboardInterrupt:
-        print("操作已中断。", file=sys.stderr)
-        result = 130
-    except Exception:
-        print("操作失败（code=internal_error）。", file=sys.stderr)
+        ctx = create_runtime_context((project_dir or Path.cwd()).resolve(), args.data_dir)
+        if args.command == "env":
+            print(format_runtime_report(ctx))
+            return 0
+        if args.command == "decode-font":
+            return _decode_font(ctx, args)
+        app: _Application | None = None
         result = 3
+        try:
+            app = application_factory(ctx)
+            result = _dispatch(app, args, ctx)
+        except ApplicationError as exc:
+            result = _application_error(exc)
+        except KeyboardInterrupt:
+            print("操作已中断。", file=sys.stderr)
+            result = 130
+        except Exception:
+            print("操作失败（code=internal_error）。", file=sys.stderr)
+            result = 3
+        finally:
+            if app is not None:
+                try:
+                    closed = app.close()
+                except Exception:
+                    closed = False
+                if not closed:
+                    print("资源未能安全关闭（code=close_incomplete），请稍后重试。", file=sys.stderr)
+                    if result == 0:
+                        result = 7
+        return result
     finally:
-        if app is not None:
-            try:
-                closed = app.close()
-            except Exception:
-                closed = False
-            if not closed:
-                print("资源未能安全关闭（code=close_incomplete），请稍后重试。", file=sys.stderr)
-                if result == 0:
-                    result = 7
-    return result
+        if args.allow_third_party:
+            if previous_allow is None:
+                os.environ.pop(ALLOW_THIRD_PARTY_ENV, None)
+            else:
+                os.environ[ALLOW_THIRD_PARTY_ENV] = previous_allow
 
 
 def _dispatch(app: _Application, args: argparse.Namespace, ctx: RuntimeContext) -> int:
@@ -308,6 +351,8 @@ def _dispatch_book_command(app: _Application, args: argparse.Namespace) -> int:
         "report": ("book_report", (args.book_id,)) if command == "report" else ("", ()),
         "retry-failed": ("retry_failed_chapters", (args.book_id, not args.no_export, args.concurrency)) if command == "retry-failed" else ("", ()),
         "export": ("export_book", (args.book_id, args.format)) if command == "export" else ("", ()),
+        "tts-export": ("export_easyvoice_book", (args.book_id, args.output)) if command == "tts-export" else ("", ()),
+        "tts-convert": ("convert_easyvoice_book", (args.book_id, _easyvoice_options(args))) if command == "tts-convert" else ("", ()),
         "fix-titles": ("fix_book_titles", (args.book_id,)) if command == "fix-titles" else ("", ()),
         "dedup": ("deduplicate_book", (args.book_id, args.remove)) if command == "dedup" else ("", ()),
         "export-all": ("export_all_books", (args.format,)) if command == "export-all" else ("", ()),
@@ -320,14 +365,42 @@ def _dispatch_book_command(app: _Application, args: argparse.Namespace) -> int:
     method, values = calls.get(command, ("", ()))
     if not method:
         raise ApplicationError("command_unsupported")
-    result = _call(app, method, *values)
+    if command == "tts-convert":
+        result = _call(app, method, *values, export_path=args.export_path, output_dir=args.output_dir)
+    else:
+        result = _call(app, method, *values)
     _print_json(result)
+    if command == "tts-convert" and isinstance(result, Mapping):
+        code = result.get("returncode")
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
     if command in {"crawl-batch", "export-all", "retry-all"} and isinstance(result, Mapping):
         for field in ("failed", "remaining"):
             value = result.get(field, 0)
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 return 6
     return 0
+
+
+def _easyvoice_options(args: argparse.Namespace) -> EasyVoiceOptions:
+    if isinstance(args.retries, bool) or not isinstance(args.retries, int) or not 0 <= args.retries <= 100:
+        raise ApplicationError("easyvoice_options_invalid")
+    return EasyVoiceOptions(
+        base_url=args.base_url,
+        voice=args.voice,
+        rate=args.rate,
+        pitch=args.pitch,
+        volume=args.volume,
+        use_llm=args.use_llm,
+        poll_interval=args.poll_interval,
+        task_timeout=args.task_timeout,
+        retries=args.retries,
+        assemble=args.assemble,
+        media_container=args.media_container,
+        media_host_root=args.media_host_root,
+        media_container_root=args.media_container_root,
+        pipeline=args.pipeline,
+    )
 
 
 def _wait_for_task(app: _Application, task_id: str, interval: float, timeout: float) -> int:
@@ -423,6 +496,8 @@ def _application_error(exc: ApplicationError) -> int:
     print(f"{message}（code={exc.code}）。", file=sys.stderr)
     if exc.code == "task_not_found":
         return 4
+    if exc.code == "third_party_crawl_disabled":
+        return 2
     if exc.code.endswith("_invalid") or exc.code.endswith("_unsupported"):
         return 2
     return 6 if exc.retryable else 3

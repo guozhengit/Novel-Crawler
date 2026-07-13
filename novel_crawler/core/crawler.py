@@ -12,6 +12,13 @@ from novel_crawler.core.storage import BookDeletionResult, Storage
 from novel_crawler.core.title_fixer import TitleFixer, TitleFixResult
 from novel_crawler.core.utils import ensure_dir, progress_bar, safe_filename
 from novel_crawler.core.validator import ValidationReport, Validator
+from novel_crawler.easyvoice import (
+    EasyVoiceConversionResult,
+    EasyVoiceExportResult,
+    EasyVoiceOptions,
+    export_book_for_easyvoice,
+    run_easyvoice_pipeline,
+)
 from novel_crawler.exporters import epub as _epub_mod  # noqa: F401
 from novel_crawler.exporters import markdown as _md_mod  # noqa: F401
 from novel_crawler.exporters import txt as _txt_mod  # noqa: F401 触发注册
@@ -100,6 +107,30 @@ class CrawlerService:
 
     def export(self, book_id: int, fmt: str = "txt", output: Path | None = None) -> Path:
         return get_exporter(fmt, self.ctx.output_dir).export(self.storage, book_id, output)
+
+    def export_easyvoice(self, book_id: int, output: Path | None = None) -> EasyVoiceExportResult:
+        destination = output or self.ctx.data_dir / "crawler-exports" / f"book-{book_id}.json"
+        return export_book_for_easyvoice(self.storage, book_id, destination)
+
+    def convert_easyvoice(
+        self,
+        book_id: int,
+        *,
+        export_path: Path | None = None,
+        output_dir: Path | None = None,
+        options: EasyVoiceOptions | None = None,
+    ) -> EasyVoiceConversionResult:
+        opts = options or EasyVoiceOptions()
+        export_result = self.export_easyvoice(book_id, export_path)
+        result = run_easyvoice_pipeline(
+            input_path=export_result.export_path,
+            output_dir=output_dir or self.ctx.data_dir / "novel-audio",
+            project_dir=self.ctx.project_dir,
+            options=opts,
+        )
+        if result.returncode not in {0, 2}:
+            raise RuntimeError(result.stderr or result.stdout or "easyvoice_conversion_failed")
+        return result
 
     def progress(self, book_id: int) -> dict[str, int]:
         return self.storage.progress(book_id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ import pytest
 
 from novel_crawler.application import ApplicationError
 from novel_crawler.cli import build_parser, main
+from novel_crawler.compliance import ALLOW_THIRD_PARTY_ENV
 
 
 @dataclass
@@ -96,6 +98,20 @@ class FakeApplication:
     def export_book(self, book_id: int, fmt: str):
         return self._book("export", book_id, fmt)
 
+    def export_easyvoice_book(self, book_id: int, output: Path | None = None):
+        return self._book("tts-export", book_id, output)
+
+    def convert_easyvoice_book(
+        self,
+        book_id: int,
+        options: object,
+        *,
+        export_path: Path | None = None,
+        output_dir: Path | None = None,
+    ):
+        self.calls.append(("tts-convert", book_id, options, export_path, output_dir))
+        return {"completed": True, "returncode": 0, "operation": "tts-convert"}
+
     def fix_book_titles(self, book_id: int):
         return self._book("fix-titles", book_id)
 
@@ -152,6 +168,7 @@ def test_help_is_utf8_and_parser_preserves_legacy_plus_task_commands(capsys) -> 
     legacy = {
         "env", "books", "delete", "crawl", "inspect", "wizard", "resume",
         "progress", "validate", "logs", "report", "retry-failed", "export",
+        "tts-export", "tts-convert",
         "decode-font", "web", "fix-titles", "dedup", "export-all", "retry-all",
         "crawl-batch", "preview", "stats", "validate-config",
     }
@@ -189,6 +206,38 @@ def test_crawl_detaches_and_prints_safe_task_json(tmp_path, capsys) -> None:
     assert app.calls[0][0:2] == ("create", "https://example.test/book")
     assert app.calls[0][2].browser == "visible"
     assert app.closed
+
+
+def test_allow_third_party_flag_prints_disclaimer_and_restores_env(tmp_path, capsys, monkeypatch) -> None:
+    monkeypatch.delenv(ALLOW_THIRD_PARTY_ENV, raising=False)
+    app = FakeApplication()
+
+    assert main(
+        ["--allow-third-party", "crawl", "https://www.qidian.com/chapter/1/2/"],
+        project_dir=tmp_path,
+        application_factory=app_factory(app),
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert "合规免责声明" in captured.err
+    assert "CAPTCHAs" in captured.err
+    assert os.getenv(ALLOW_THIRD_PARTY_ENV) is None
+    assert app.calls[0][0:2] == ("create", "https://www.qidian.com/chapter/1/2/")
+
+
+def test_third_party_disabled_application_error_has_stable_exit_code(tmp_path, capsys) -> None:
+    class DisabledApplication(FakeApplication):
+        def create_crawl_task(self, url: str, options: object) -> SafeView:
+            raise ApplicationError("third_party_crawl_disabled")
+
+    assert main(
+        ["crawl", "https://www.qidian.com/chapter/1/2/"],
+        project_dir=tmp_path,
+        application_factory=app_factory(DisabledApplication()),
+    ) == 2
+    error = capsys.readouterr().err
+    assert "第三方线上站点抓取默认禁用" in error
+    assert "third_party_crawl_disabled" in error
 
 
 @pytest.mark.parametrize(("flag", "value"), [("--chase", None), ("--concurrency", "2")])
@@ -316,6 +365,7 @@ def test_keyboard_interrupt_and_incomplete_close_have_stable_exit_codes(tmp_path
         (["report", "1"], "report"),
         (["retry-failed", "1", "--no-export"], "retry-failed"),
         (["export", "1", "--format", "epub"], "export"),
+        (["tts-export", "1"], "tts-export"),
         (["fix-titles", "1"], "fix-titles"),
         (["dedup", "1", "--remove"], "dedup"),
         (["export-all", "--format", "md"], "export-all"),
@@ -331,6 +381,46 @@ def test_legacy_book_commands_are_routed_through_facade(tmp_path, capsys, comman
     assert main(command, project_dir=tmp_path, application_factory=app_factory(app)) == 0
     assert output_json(capsys)["operation"] == expected
     assert app.calls[0][0] == expected
+
+
+def test_tts_convert_dispatches_easyvoice_options_and_returns_pipeline_code(tmp_path, capsys) -> None:
+    class IncompleteApplication(FakeApplication):
+        def convert_easyvoice_book(
+            self,
+            book_id: int,
+            options: object,
+            *,
+            export_path: Path | None = None,
+            output_dir: Path | None = None,
+        ):
+            self.calls.append(("tts-convert", book_id, options, export_path, output_dir))
+            return {"completed": False, "incomplete": True, "returncode": 2}
+
+    app = IncompleteApplication()
+    assert main(
+        [
+            "tts-convert",
+            "7",
+            "--export-path",
+            "exports/book-7.json",
+            "--output-dir",
+            "audio",
+            "--base-url",
+            "http://easyvoice:3000",
+            "--voice",
+            "zh-CN-YunxiNeural",
+            "--assemble",
+        ],
+        project_dir=tmp_path,
+        application_factory=app_factory(app),
+    ) == 2
+    assert output_json(capsys)["incomplete"] is True
+    _, book_id, options, export_path, output_dir = app.calls[0]
+    assert book_id == 7
+    assert options.base_url == "http://easyvoice:3000"
+    assert options.assemble is True
+    assert export_path == Path("exports/book-7.json")
+    assert output_dir == Path("audio")
 
 
 @pytest.mark.parametrize("command", [["inspect", "https://example.test"], ["wizard", "https://example.test"], ["resume", "1"]])

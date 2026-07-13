@@ -86,7 +86,7 @@ python -m pytest tests/test_distribution.py -v
 
 ### 新站点
 
-先按 [SITE_ADAPTATION.md](SITE_ADAPTATION.md) 判断适配类型。稳定的域名特殊规则实现为专项 `SiteAdapter`；常见静态结构优先扩展探测器、评分规则或 `SiteConfigAdapter`。两者都必须复用 acquisition security、任务 checkpoint 和隐私 DTO，不得增加浏览器 fallback。
+先按 [SITE_ADAPTATION.md](SITE_ADAPTATION.md) 判断适配类型。真实站点不确定时，先按 [EXPLORATORY_CRAWLING.md](EXPLORATORY_CRAWLING.md) 形成探索报告，明确是结构差异、JS 渲染、API 加密、URL 身份冲突，还是 WAF/验证码/登录墙。稳定的域名特殊规则实现为专项 `SiteAdapter`；常见静态结构优先扩展探测器、评分规则或 `SiteConfigAdapter`。两者都必须复用 acquisition security、任务 checkpoint 和隐私 DTO，不得增加浏览器 fallback。
 
 ### 新导出格式
 
