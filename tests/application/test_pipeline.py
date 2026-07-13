@@ -14,17 +14,16 @@ from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.application.errors import ApplicationError
 from novel_crawler.application.pipeline import CrawlTaskPipeline
 from novel_crawler.application.site_adapter import SiteConfigAdapter
-from novel_crawler.browser import BrowserAcquirer, BrowserSessionStore, VerificationRequired
+from novel_crawler.browser import BrowserAcquirer, BrowserSessionStore
 from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.storage import Storage
 from novel_crawler.task_engine import (
     BackgroundTaskExecutor,
-    TaskControlRequested,
     TaskExecutionContext,
     TaskRepository,
     TaskStatus,
 )
-from novel_crawler.task_engine.executor import RecoverableTaskError
+from novel_crawler.task_engine.executor import TerminalTaskError
 
 
 class Registry:
@@ -223,7 +222,7 @@ def test_pipeline_explicit_legacy_fallback_and_mismatch(tmp_path: Path) -> None:
     storage.close()
 
 
-def test_protected_page_after_probe_fails_closed_with_stable_recoverable_code(tmp_path: Path) -> None:
+def test_javascript_only_page_after_probe_fails_closed_without_browser_fallback(tmp_path: Path) -> None:
     class Protected:
         def fetch(
             self,
@@ -232,17 +231,15 @@ def test_protected_page_after_probe_fails_closed_with_stable_recoverable_code(tm
             task_key: str | None = None,
             timeout: float | None = None,
         ):
-            raise VerificationRequired(
-                "verification_required", original_url="https://private.test/path?token=hidden"
-            )
+            raise AcquisitionError("javascript_required", "https://private.test", False)
 
     repo = TaskRepository(tmp_path / "protected-tasks.db")
     storage = Storage(tmp_path / "protected-crawl.db", tmp_path / "protected-data")
     pipeline = CrawlTaskPipeline(repo, storage, Registry(site_config()), Protected())
     task = active_task(repo, "https://example.test/books/index", {"crawl": {"concurrency": 1}})
-    with pytest.raises(RecoverableTaskError) as caught:
+    with pytest.raises(TerminalTaskError) as caught:
         pipeline.validating(context(repo, task), task)
-    assert caught.value.error_code == "verification_required"
+    assert caught.value.error_code == "javascript_required"
     assert "private" not in repr(caught.value)
     repo.close()
     storage.close()
@@ -295,14 +292,14 @@ def test_request_policy_controls_timeout_retry_count_and_rate_limit(tmp_path: Pa
     storage.close()
 
 
-def test_late_interaction_is_handed_to_runtime_broker_before_worker_stops(tmp_path: Path) -> None:
+def test_static_pipeline_never_invokes_browser_interaction_hooks(tmp_path: Path) -> None:
     url = "https://example.test/books/index"
     prepared: list[tuple[str, str]] = []
     adopted: list[tuple[str, str, str]] = []
 
     class Protected:
         def fetch(self, requested, *, task_key=None, timeout=None):
-            raise VerificationRequired(original_url=requested)
+            raise AcquisitionError("challenge_unsupported", "https://example.test", False)
 
     def adopt(task, requested, signal):
         adopted.append((task.task_id, requested, signal.code))
@@ -318,10 +315,10 @@ def test_late_interaction_is_handed_to_runtime_broker_before_worker_stops(tmp_pa
         access_preparer=lambda requested, task_id: prepared.append((requested, task_id)),
     )
     task = active_task(repo, url, {"crawl": {"concurrency": 1}})
-    with pytest.raises(TaskControlRequested):
+    with pytest.raises(TerminalTaskError):
         pipeline.validating(context(repo, task), task)
-    assert prepared == [(url, task.task_id)]
-    assert adopted == [(task.task_id, url, "verification_required")]
+    assert prepared == []
+    assert adopted == []
     repo.close()
     storage.close()
 

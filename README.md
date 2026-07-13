@@ -1,6 +1,6 @@
 # Novel Crawler
 
-Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工具。它会先尝试安全的静态页面解析；结构不稳定或需要 JavaScript 时，才进入受限的 Chromium 流程；无法自动确认的配置会暂停任务，等待用户验证后继续。
+Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工具。生产抓取只使用受控静态 HTTP，不启动无头浏览器、不执行页面 JavaScript，也不尝试绕过验证码或访问控制。已知站点使用专项适配器，未知站点进入有预算的通用探索流程；无法可靠确认的配置会暂停任务，等待用户修正 selector 或提供可静态访问的入口。
 
 当前版本：**0.2.0**。支持 Python 3.11、3.12 和 3.13。
 
@@ -10,7 +10,7 @@ Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工
 - 版本化站点配置、结构指纹、重验证和人工确认
 - 后台任务状态机：暂停、恢复、取消、失败重试和崩溃恢复
 - SQLite CAS、checkpoint、章节 claim、幂等正文写入和安全删除
-- 静态 HTTP 与隔离 Chromium 双通道获取
+- 专项站点适配与通用静态探索双路径
 - TXT、EPUB、Markdown 和 JSONL 导出
 - 本机安全 Web 控制台与稳定 JSON CLI 输出
 - URL、路径、正文、Cookie 和验证令牌默认不进入公开 DTO 或错误消息
@@ -19,7 +19,6 @@ Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工
 
 ```bash
 python -m pip install .
-python -m playwright install chromium
 novel-crawler env
 ```
 
@@ -55,12 +54,11 @@ novel-crawler task-resume TASK_ID
 novel-crawler task-cancel TASK_ID
 ```
 
-遇到浏览器验证或自动配置确认时：
+遇到自动配置确认时：
 
 ```bash
 novel-crawler task-continue TASK_ID
 novel-crawler task-confirm TASK_ID --selector content=article
-novel-crawler task-retry-cleanup TASK_ID
 ```
 
 启动本机 Web 控制台：
@@ -96,7 +94,7 @@ created -> probing -> validating -> ready -> crawling -> completed
 novel-crawler --data-dir /srv/novel-crawler env
 ```
 
-其中可能包含数据库、章节正文、导出文件、配置注册表和浏览器 profile。请勿提交这些内容。详见 [PRIVACY.md](PRIVACY.md)。
+其中可能包含数据库、章节正文、导出文件和配置注册表。请勿提交这些内容。详见 [PRIVACY.md](PRIVACY.md)。
 
 ## Docker
 
@@ -106,24 +104,25 @@ docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 env
 docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://example.test/books/demo"
 ```
 
-镜像包含与 Python Playwright 匹配的 Chromium。持久化数据固定挂载到 `/app/data`。
+容器内抓取遵守相同的静态 HTTP 策略，不得启动 Chromium。持久化数据固定挂载到 `/app/data`。
 
 ## 安全边界
 
 - 所有网络目标在连接前执行协议、域名、DNS 和 IP 校验；每次重定向重新校验。
 - HTTP 连接使用已批准 IP，TLS SNI/证书仍绑定原始主机名。
-- 浏览器阻断非代理出口、WebSocket、Service Worker、下载和非必要协议。
 - Web 修改接口只接受同源、带 CSRF 的 JSON `POST`。
-- 浏览器验证令牌只保存在内存中；清理失败会阻止任务恢复。
+- JavaScript、验证码、登录墙或挑战页不会触发浏览器 fallback；任务以稳定错误码暂停或失败。
 
 安全问题请参阅 [SECURITY.md](SECURITY.md)。抓取前请确认目标网站条款、robots 规则和内容许可；本项目不授予复制或再分发第三方内容的权利。
 
 ## 文档
 
+- [操作指南](docs/USER_GUIDE.md)
 - [CLI 命令](docs/CLI.md)
 - [Web API](docs/API.md)
 - [系统架构](docs/ARCHITECTURE.md)
 - [自动适配配置](docs/CONFIG.md)
+- [站点适配指南](docs/SITE_ADAPTATION.md)
 - [配置注册表](docs/REGISTRY.md)
 - [开发与测试](docs/DEVELOPMENT.md)
 - [隐私与本地数据](PRIVACY.md)

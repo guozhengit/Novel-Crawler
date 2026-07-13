@@ -6,21 +6,21 @@ from typing import Any, Protocol, cast
 
 from novel_crawler.acquisition.http import HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage
-from novel_crawler.adaptation import ConfigManager, ConfigRegistry, ConfigRevalidator, ProbeService
+from novel_crawler.adaptation import (
+    ConfigManager,
+    ConfigRegistry,
+    ConfigRevalidator,
+    ProbeService,
+    StaticAdaptiveService,
+)
 from novel_crawler.application.pipeline import CrawlTaskPipeline
 from novel_crawler.application.service import ApplicationService
-from novel_crawler.sites.base import SiteAdapter
-from novel_crawler.sites.bqg import BqgAdapter
-from novel_crawler.sites.twbook import TwbookAdapter
-from novel_crawler.browser import (
-    AdaptiveBrowserService,
-    BrowserAcquirer,
-    BrowserSessionStore,
-    Driver,
-    VerificationCoordinator,
-)
 from novel_crawler.core.crawler import CrawlerService
+from novel_crawler.core.fetcher import Fetcher
 from novel_crawler.runtime.env import RuntimeContext
+from novel_crawler.sites.bqg import BqgAdapter
+from novel_crawler.sites.router import AdapterRouter
+from novel_crawler.sites.twbook import TwbookAdapter
 from novel_crawler.task_engine import AdaptiveTaskController, BackgroundTaskExecutor, TaskRepository, TaskStatus
 
 
@@ -31,7 +31,7 @@ class _HttpAcquirer(Protocol):
 def build_application(
     ctx: RuntimeContext,
     *,
-    driver: Driver | None = None,
+    driver: object | None = None,
     http_acquirer: _HttpAcquirer | None = None,
     recover_on_start: bool = True,
     max_workers: int = 4,
@@ -44,68 +44,29 @@ def build_application(
     executor: BackgroundTaskExecutor | None = None
     try:
         registry = ConfigRegistry(ctx.data_dir / "config-registry")
-        sessions = BrowserSessionStore(ctx.data_dir / "browser-sessions")
+        del driver  # source-compatible argument; production browser acquisition is disabled
         http = http_acquirer or HttpPageAcquirer()
-        coordinator = VerificationCoordinator(sessions, driver=driver)
-        browser_acquirer = BrowserAcquirer(
-            http=cast(Any, http),
-            driver=driver,
-            sessions=sessions,
-            coordinator=coordinator,
-        )
-        probe = ProbeService(acquirer=browser_acquirer)
-        revalidator = ConfigRevalidator(acquirer=browser_acquirer, registry=registry)
+        probe = ProbeService(acquirer=cast(Any, http))
+        revalidator = ConfigRevalidator(acquirer=cast(Any, http), registry=registry)
         manager = ConfigManager(registry, revalidator, probe)
-
-        def _legacy_adapter_factory(url: str) -> SiteAdapter:
-            """Select a dedicated SiteAdapter for known sites, or fall back to AutoAdapter."""
-            adapters: list[SiteAdapter] = [
-                BqgAdapter(),
-                TwbookAdapter(ctx.project_dir),
-            ]
-            for adapter in adapters:
-                try:
-                    if adapter.match(url):
-                        adapter.set_fetcher(browser_acquirer)
-                        return adapter
-                except Exception:
-                    continue
-            # Fall back to AutoAdapter for unknown sites
-            from novel_crawler.sites.auto import AutoAdapter
-            fallback = AutoAdapter()
-            fallback.set_fetcher(browser_acquirer)
-            return fallback
-
-        adaptive = AdaptiveBrowserService(
-            manager,
-            browser_acquirer,
-            coordinator,
-            legacy_adapter=_legacy_adapter_factory,
+        router = AdapterRouter(
+            (BqgAdapter(), TwbookAdapter(ctx.project_dir)),
+            Fetcher(acquirer=cast(Any, http)),
         )
+        adaptive = StaticAdaptiveService(manager, router)
         # Task CAS/events are intentionally isolated from ctx.db_path's book
         # content schema; both databases remain private under the same data_dir.
         repository = TaskRepository(ctx.data_dir / "tasks.db")
         controller = AdaptiveTaskController(repository, cast(Any, adaptive))
         crawler = CrawlerService(ctx)
 
-        def adopt_late_interaction(task, url, signal):
-            return controller.capture_acquisition_result(
-                task.task_id,
-                task.version,
-                lambda: adaptive.capture_acquisition_signal(
-                    url, task.task_id, signal
-                ),
-            )
-
         pipeline = CrawlTaskPipeline(
             repository,
             crawler.storage,
             registry,
-            browser_acquirer,
+            cast(Any, http),
             exporter=lambda book_id, fmt: crawler.export(book_id, fmt),
-            legacy_adapter=_legacy_adapter_factory,
-            interaction_handler=adopt_late_interaction,
-            access_preparer=adaptive.prepare_task_access,
+            adapter_router=router,
         )
         handlers = {
             TaskStatus.PROBING: controller.probe_handler,

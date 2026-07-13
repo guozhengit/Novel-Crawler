@@ -26,6 +26,10 @@ _BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _SAFE_ERROR_CODES = frozenset(
     {
         "chapter_download_failed",
+        "chapter_content_duplicate",
+        "chapter_content_empty",
+        "chapter_redirect_mismatch",
+        "chapter_title_mismatch",
         "chapter_processor_failed",
         "connection_timeout",
         "duplicate_content",
@@ -509,6 +513,7 @@ class Storage:
         *,
         claim: ClaimLease | None = None,
         now: float | None = None,
+        reject_duplicate_content: bool = False,
     ) -> Path:
         with self._lock:
             try:
@@ -521,12 +526,23 @@ class Storage:
                     raise KeyError(f"chapter not found: {book_id}/{chapter.index}")
                 current = self._clock() if now is None else now
                 self._validate_claim(row, claim, current, book_id, chapter.index)
+                if not content.strip():
+                    raise ChapterContentConflict("chapter_content_empty")
                 digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 if row["status"] == "done":
                     if row["content_hash"] == digest and row["content_path"] and Path(row["content_path"]).is_file():
                         self.conn.commit()
                         return Path(row["content_path"])
                     raise ChapterContentConflict("chapter_content_conflict")
+                if reject_duplicate_content:
+                    duplicate = self.conn.execute(
+                        """SELECT chapter_index FROM chapters
+                           WHERE book_id=? AND chapter_index!=? AND status='done' AND content_hash=?
+                           LIMIT 1""",
+                        (book_id, chapter.index, digest),
+                    ).fetchone()
+                    if duplicate is not None:
+                        raise ChapterContentConflict("chapter_content_duplicate")
                 book = self.get_book(book_id)
                 content_dir = ensure_dir(self.chapter_content_dir(book_id, book.title))
                 path = content_dir / f"{chapter.index:05d}.txt"

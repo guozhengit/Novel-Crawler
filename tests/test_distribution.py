@@ -49,13 +49,13 @@ def test_gitignore_blocks_private_runtime_artifacts():
         assert pattern in ignored
 
 
-def test_dockerfile_installs_matching_chromium_and_runs_as_non_root():
+def test_dockerfile_uses_static_http_runtime_and_runs_as_non_root():
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     dockerignore = Path(".dockerignore").read_text(encoding="utf-8").splitlines()
     install_at = dockerfile.index("pip install --no-cache-dir .")
     assert dockerfile.index("COPY . .") < install_at
-    assert "python -m playwright install --with-deps chromium" in dockerfile
-    assert "PLAYWRIGHT_BROWSERS_PATH=" in dockerfile
+    assert "playwright" not in dockerfile.lower()
+    assert "chromium" not in dockerfile.lower()
     assert "useradd" in dockerfile
     assert "USER novel" in dockerfile
     assert "HEALTHCHECK" in dockerfile
@@ -65,7 +65,7 @@ def test_dockerfile_installs_matching_chromium_and_runs_as_non_root():
         assert ignored in dockerignore
 
 
-def test_build_workflow_builds_packages_and_smoke_tests_docker_browser():
+def test_build_workflow_builds_packages_and_smoke_tests_static_http_image():
     workflow_text = Path(".github/workflows/build.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(workflow_text)
     assert "branches: [main, master]" in workflow_text
@@ -82,7 +82,8 @@ def test_build_workflow_builds_packages_and_smoke_tests_docker_browser():
     assert "docker build" in joined
     smoke_command = next(command for command in commands if "docker run" in command and " env" in command)
     assert "Runtime:" in smoke_command
-    assert any("docker run" in command and "playwright" in command and "chromium.launch" in command for command in commands)
+    assert "playwright" not in joined.lower()
+    assert "chromium" not in joined.lower()
 
 
 def test_ci_workflows_gate_supported_pythons_quality_coverage_and_privacy():
@@ -99,7 +100,6 @@ def test_ci_workflows_gate_supported_pythons_quality_coverage_and_privacy():
         "--cov-fail-under=80",
         "--fail-under=85",
         "-W error",
-        "RUN_PLAYWRIGHT_INTEGRATION=1",
         "-m release",
         "test -f LICENSE",
         "__version__",

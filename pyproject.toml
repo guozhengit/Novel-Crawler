@@ -21,6 +21,7 @@ classifiers = [
 dependencies = [
   "requests>=2.31,<3",
   "urllib3>=2.2,<3",
+  "certifi>=2024.2.2,<2027",
   "idna>=3.7,<4",
   "dnspython>=2.6,<3",
   "beautifulsoup4>=4.12,<5",
@@ -31,7 +32,6 @@ dependencies = [
   "numpy>=1.26,<3",
   "PyYAML>=6,<7",
   "ebooklib>=0.18,<1",
-  "playwright>=1.48,<2",
 ]
 
 [project.optional-dependencies]
@@ -58,7 +58,7 @@ novel_crawler = ["configs/*.json", "configs/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --ignore=tests/browser"
 markers = [
   "integration: tests requiring locally installed external runtimes",
   "release: deterministic release reliability and quality gates",

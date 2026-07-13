@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import ssl
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from email.message import Message
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit
 
+import certifi
 import urllib3
 from charset_normalizer import from_bytes
 
@@ -62,11 +64,16 @@ class Urllib3PinnedTransport:
     ) -> TransportResponse:
         pool: urllib3.HTTPConnectionPool
         if scheme == "https":
+            # Some Python distributions, notably locally installed macOS builds,
+            # do not populate the OpenSSL trust store. Use certifi while keeping
+            # certificate and hostname validation enabled for pinned connections.
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
             pool = urllib3.HTTPSConnectionPool(
                 approved_ip,
                 port,
                 assert_hostname=original_host,
                 server_hostname=original_host,
+                ssl_context=ssl_context,
             )
         else:
             pool = urllib3.HTTPConnectionPool(approved_ip, port)
@@ -137,11 +144,13 @@ class HttpPageAcquirer:
         self,
         url: str,
         *,
+        task_key: str | None = None,
         max_body_bytes: int | None = None,
         locked_origin: str | None = None,
         classifiable_statuses: frozenset[int] = frozenset(),
         timeout: float | None = None,
     ) -> PageSnapshot:
+        del task_key
         return self.fetch_page(
             url,
             max_body_bytes=max_body_bytes,
@@ -154,11 +163,13 @@ class HttpPageAcquirer:
         self,
         url: str,
         *,
+        task_key: str | None = None,
         max_body_bytes: int | None = None,
         locked_origin: str | None = None,
         classifiable_statuses: frozenset[int] = frozenset(),
         timeout: float | None = None,
     ) -> AcquiredPage:
+        del task_key
         effective_max = self.max_body_bytes if max_body_bytes is None else min(self.max_body_bytes, max_body_bytes)
         if effective_max <= 0:
             raise ValueError("max_body_bytes must be positive")

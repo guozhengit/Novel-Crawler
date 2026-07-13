@@ -2,6 +2,8 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from novel_crawler.acquisition.http import HttpPageAcquirer
+from novel_crawler.core.chapter_quality import validate_parsed_chapter
 from novel_crawler.core.dedup import Deduplicator, DedupResult
 from novel_crawler.core.fetcher import Fetcher
 from novel_crawler.core.models import Book, Chapter
@@ -28,7 +30,7 @@ class CrawlerService:
     def __init__(self, ctx: RuntimeContext, proxy_file: Path | None = None):
         self.ctx = ctx
         pool = ProxyPool.from_file(proxy_file) if proxy_file and proxy_file.exists() else None
-        self.fetcher = Fetcher(proxies=ctx.proxies, enable_playwright=ctx.features.get("playwright", False), proxy_pool=pool)
+        self.fetcher = Fetcher(proxies=ctx.proxies, proxy_pool=pool, acquirer=HttpPageAcquirer())
         self.storage = Storage(ctx.db_path, ctx.data_dir)
         self.registry = AdapterRegistry(self._load_adapters())
 
@@ -259,7 +261,12 @@ class CrawlerService:
             chapter = Chapter(index=index, title=title, url=current_url)
             self.storage.upsert_chapters(book_id, [chapter])
             if body.strip():
-                self.storage.mark_done(book_id, chapter, chapter.title + "\n\n" + body)
+                self.storage.mark_done(
+                    book_id,
+                    chapter,
+                    chapter.title + "\n\n" + body,
+                    reject_duplicate_content=True,
+                )
                 self.storage.add_log(book_id, index, "info", f"chase done {index}: {title}")
                 print(f"[chase {index}] done: {title}")
             else:
@@ -324,10 +331,7 @@ class CrawlerService:
         cached = self._load_cached_html(book, chapter.index)
         if cached is not None:
             return cached, "cache"
-        if adapter and getattr(adapter, "requires_browser", False) and self.fetcher.enable_playwright:
-            html = self.fetcher.fetch_text_with_browser(chapter.url)
-        else:
-            html = self.fetcher.fetch_text(chapter.url, referer=book.url)
+        html = self.fetcher.fetch_text(chapter.url, referer=book.url)
         self._cache_html(book, chapter.index, html)
         return html, "net"
 
@@ -336,11 +340,15 @@ class CrawlerService:
             if html is None:
                 raise RuntimeError("抓取失败")
             title, body = adapter.parse_chapter(html, chapter.url)
+            validate_parsed_chapter(chapter, title, body)
             if title:
                 chapter.title = title
-            if not body.strip():
-                raise RuntimeError("正文为空")
-            self.storage.mark_done(book_id, chapter, chapter.title + "\n\n" + body)
+            self.storage.mark_done(
+                book_id,
+                chapter,
+                chapter.title + "\n\n" + body,
+                reject_duplicate_content=True,
+            )
             message = f"done {chapter.index}: {chapter.title} ({source})"
             self.storage.add_log(book_id, chapter.index, "info", message)
             print(progress_bar(pos, total, prefix="  ") + f" {message}")

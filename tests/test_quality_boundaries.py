@@ -51,7 +51,7 @@ def test_runtime_helpers_detect_features_proxies_fonts_and_format(monkeypatch, t
     font.write_bytes(b"font")
 
     assert env.detect_features()["requests"] is True
-    assert env.detect_features()["playwright"] is False
+    assert "playwright" not in env.detect_features()
     assert env.detect_proxies() == {"http": "http://proxy"}
     assert env.find_chinese_fonts([tmp_path, tmp_path]) == [font]
 

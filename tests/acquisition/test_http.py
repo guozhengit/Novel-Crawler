@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ssl
 from dataclasses import FrozenInstanceError, asdict
 from datetime import datetime
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 import pytest
 import urllib3
 
-from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer, TransportResponse
+from novel_crawler.acquisition.http import AcquisitionError, HttpPageAcquirer, TransportResponse, Urllib3PinnedTransport
 from novel_crawler.acquisition.models import PageSnapshot, RedirectHop
 from novel_crawler.acquisition.security import UrlSafetyPolicy
 from novel_crawler.core.fetcher import Fetcher, FetchOptions
@@ -93,6 +94,59 @@ def test_fetch_pins_transport_to_policy_ip_and_preserves_original_authority() ->
     }
     assert 0 < call["timeout"] <= 25
     assert call["max_body_bytes"] == 10 * 1024 * 1024
+
+
+def test_pinned_https_transport_uses_certifi_bundle_with_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    constructed: dict[str, object] = {}
+
+    class Response:
+        status = 200
+        headers = {"Content-Type": "text/html"}
+
+        @staticmethod
+        def stream(_chunk_size: int, *, decode_content: bool):
+            assert decode_content is True
+            yield b"ok"
+
+        @staticmethod
+        def release_conn() -> None:
+            pass
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    class Pool:
+        def __init__(self, _host: str, _port: int, **kwargs: object) -> None:
+            constructed.update(kwargs)
+
+        @staticmethod
+        def urlopen(*_args: object, **_kwargs: object) -> Response:
+            return Response()
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr(urllib3, "HTTPSConnectionPool", Pool)
+    result = Urllib3PinnedTransport().request(
+        approved_ip="93.184.216.34",
+        original_host="example.test",
+        port=443,
+        scheme="https",
+        path="/",
+        headers={"Host": "example.test"},
+        timeout=1,
+        max_body_bytes=1024,
+    )
+
+    context = constructed["ssl_context"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert constructed["assert_hostname"] == "example.test"
+    assert constructed["server_hostname"] == "example.test"
+    assert result.body == b"ok"
 
 
 def test_per_call_body_limit_is_forwarded_and_cannot_exceed_instance_cap() -> None:
@@ -450,10 +504,14 @@ def test_default_transport_pins_http_and_https_pool_hosts(monkeypatch: pytest.Mo
         approved_ip="93.184.216.34", original_host="example.test", port=80, scheme="http",
         path="/", headers={"Host": "example.test"}, timeout=2, max_body_bytes=10,
     )
-    assert created == [
-        ("https", "2001:4860:4860::8888", 8443, {"assert_hostname": "example.test", "server_hostname": "example.test"}),
-        ("http", "93.184.216.34", 80, {}),
-    ]
+    https_kind, https_host, https_port, https_options = created[0]
+    assert (https_kind, https_host, https_port) == ("https", "2001:4860:4860::8888", 8443)
+    assert https_options["assert_hostname"] == "example.test"
+    assert https_options["server_hostname"] == "example.test"
+    context = https_options["ssl_context"]
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert created[1] == ("http", "93.184.216.34", 80, {})
     assert all(response.released and response.closed for response in responses)
 
 

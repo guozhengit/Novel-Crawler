@@ -11,7 +11,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
-
 from urllib.parse import urlparse
 
 from novel_crawler.acquisition.security import redact_url

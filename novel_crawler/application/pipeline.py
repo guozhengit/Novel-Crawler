@@ -13,15 +13,15 @@ from novel_crawler.acquisition.models import PageSnapshot
 from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.application.models import CrawlOptions
 from novel_crawler.application.site_adapter import SiteConfigAdapter
-from novel_crawler.browser import BrowserCleanupRequired, VerificationRequired
+from novel_crawler.core.chapter_quality import validate_final_url, validate_parsed_chapter
 from novel_crawler.core.fetcher import FetchOptions
-from novel_crawler.sites.base import SiteAdapter
 from novel_crawler.core.models import Chapter
 from novel_crawler.core.storage import Storage
+from novel_crawler.sites.base import SiteAdapter
+from novel_crawler.sites.router import AdapterRouter
 from novel_crawler.task_engine.chapter_batch import ChapterBatchRunner
 from novel_crawler.task_engine.executor import (
     RecoverableTaskError,
-    TaskControlRequested,
     TaskExecutionContext,
     TerminalTaskError,
 )
@@ -54,11 +54,9 @@ class CrawlTaskPipeline:
         acquirer: _Acquirer,
         *,
         exporter: Callable[[int, str], object] | None = None,
+        adapter_router: AdapterRouter | None = None,
         legacy_adapter: Callable[[str], SiteAdapter] | None = None,
-        interaction_handler: Callable[
-            [TaskRecord, str, BrowserCleanupRequired | VerificationRequired], object
-        ]
-        | None = None,
+        interaction_handler: Callable[..., object] | None = None,
         access_preparer: Callable[[str, str], object] | None = None,
         batch_size: int = 20,
         monotonic: Callable[[], float] = time.monotonic,
@@ -69,9 +67,8 @@ class CrawlTaskPipeline:
         self._registry = registry
         self._acquirer = acquirer
         self._exporter = exporter
+        self._adapter_router = adapter_router
         self._legacy_adapter = legacy_adapter
-        self._interaction_handler = interaction_handler
-        self._access_preparer = access_preparer
         self._batch_size = batch_size
         self._monotonic = monotonic
         self._sleep = sleep
@@ -86,9 +83,9 @@ class CrawlTaskPipeline:
         options = self._options(task)
         config = self._registry.load_active(task.source_url)
         if config is None:
-            if self._legacy_adapter is None:
+            if self._adapter_router is None and self._legacy_adapter is None:
                 return TaskStatus.PROBING
-            adapter = self._legacy_adapter(task.source_url)
+            adapter = self._resolve_adapter(task.source_url)
         else:
             adapter = SiteConfigAdapter(config)
         if not adapter.match(task.source_url):
@@ -138,16 +135,18 @@ class CrawlTaskPipeline:
             raise ValueError("crawl_plan_invalid")
         config = self._registry.load_active(task.source_url)
         if config is None:
-            if self._legacy_adapter is None:
+            if self._adapter_router is None and self._legacy_adapter is None:
                 raise ValueError("active_config_missing")
-            adapter = self._legacy_adapter(task.source_url)
+            adapter = self._resolve_adapter(task.source_url)
         else:
             adapter = SiteConfigAdapter(config)
 
         def process(chapter: Chapter) -> str:
             context.check_control(force=True)
-            html = self._fetch_html(chapter.url, task, adapter)
+            html, final_url = self._fetch_chapter_html(chapter.url, task, adapter)
+            validate_final_url(chapter.url, final_url)
             title, body = adapter.parse_chapter(html, chapter.url)
+            validate_parsed_chapter(chapter, title, body)
             if title:
                 chapter.title = title
             return f"{chapter.title}\n\n{body}"
@@ -158,6 +157,7 @@ class CrawlTaskPipeline:
             batch_size=self._batch_size,
             chapter_start=chapter_start,
             chapter_end=chapter_end,
+            reject_duplicate_content=True,
         )
         ephemeral = replace(task, metadata={**task.metadata, "book_id": book_id})
         outcome = runner(context, ephemeral)
@@ -182,31 +182,37 @@ class CrawlTaskPipeline:
         return options
 
     def _fetch_html(self, url: str, task: TaskRecord, adapter: SiteAdapter) -> str:
+        html, _final_url = self._fetch_page(url, task, adapter)
+        return html
+
+    def _fetch_chapter_html(self, url: str, task: TaskRecord, adapter: SiteAdapter) -> tuple[str, str]:
+        return self._fetch_page(url, task, adapter)
+
+    def _fetch_page(self, url: str, task: TaskRecord, adapter: SiteAdapter) -> tuple[str, str]:
         options = getattr(adapter, "fetch_options", FetchOptions())
         for attempt in range(options.retries):
             self._wait_rate_limit(task, options.delay_min)
-            if self._access_preparer is not None:
-                self._access_preparer(url, task.task_id)
             try:
-                return self._acquirer.fetch(
+                fetch_page = getattr(self._acquirer, "fetch_page", None)
+                if callable(fetch_page):
+                    acquired = fetch_page(url, task_key=task.task_id, timeout=options.timeout)
+                    return acquired.snapshot.html, acquired.navigation_url
+                snapshot = self._acquirer.fetch(
                     url, task_key=task.task_id, timeout=options.timeout
-                ).html
-            except BrowserCleanupRequired as signal:
-                if self._interaction_handler is not None:
-                    self._interaction_handler(task, url, signal)
-                    raise TaskControlRequested("late_browser_interaction") from None
-                raise RecoverableTaskError("browser_cleanup_required") from None
-            except VerificationRequired as signal:
-                if self._interaction_handler is not None:
-                    self._interaction_handler(task, url, signal)
-                    raise TaskControlRequested("late_browser_interaction") from None
-                raise RecoverableTaskError("verification_required") from None
+                )
+                return snapshot.html, url
             except AcquisitionError as exc:
                 if not exc.recoverable:
                     raise TerminalTaskError(exc.code) from None
                 if attempt + 1 >= options.retries:
                     raise RecoverableTaskError(exc.code) from None
         raise RecoverableTaskError("source_fetch_failed")  # pragma: no cover
+
+    def _resolve_adapter(self, url: str) -> SiteAdapter:
+        if self._adapter_router is not None:
+            return self._adapter_router.resolve(url)
+        assert self._legacy_adapter is not None
+        return self._legacy_adapter(url)
 
     @staticmethod
     def _plan(plan: Mapping[str, object]) -> tuple[int, int, int, int, bool, str]:

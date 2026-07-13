@@ -138,6 +138,12 @@ def test_challenge_body_on_classifiable_http_status_is_auth(status: int) -> None
     assert result.kind is PageKind.AUTH_OR_CHALLENGE
 
 
+def test_blocked_title_on_forbidden_response_requires_user_interaction() -> None:
+    result = PageClassifier().classify(snapshot(403, "<title>Sorry, you have been blocked</title>"))
+    assert result.kind is PageKind.AUTH_OR_CHALLENGE
+    assert result.evidence == ("auth.blocked_title",)
+
+
 def test_primary_login_page_wins_over_article_and_recommended_chapters() -> None:
     html = """<title>用户登录</title><h1>登录</h1>
     <form><input type='password'></form><article>欢迎回来，请登录后继续阅读。</article>

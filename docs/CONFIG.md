@@ -5,7 +5,7 @@
 ## 生命周期
 
 ```text
-URL -> reuse active revision -> revalidate -> probe static/browser
+URL -> dedicated adapter or reuse active revision -> revalidate -> probe static HTTP
     -> waiting_for_user (optional) -> confirm -> immutable revision -> activate
 ```
 
@@ -106,7 +106,9 @@ URL -> reuse active revision -> revalidate -> probe static/browser
 
 `novel_crawler/configs/example.json` 和 `example.yaml` 保留为旧书籍管理工具的合成示例。生产后台任务不会自动信任这些文件；自动适配配置必须通过 schema 校验、结构重验证和注册表发布。
 
-`inspect`、`wizard` CLI 已停用。新站点应直接创建 `crawl` 任务，并通过 `task-continue`/`task-confirm` 完成人工步骤。
+`inspect`、`wizard` CLI 已停用。新站点应直接创建 `crawl` 任务，并通过 `task-confirm` 完成 selector 确认。JavaScript-only 页面、验证码、登录墙和挑战页不会升级到无头浏览器；应改用可静态访问的合法入口，或将该站点视为不支持。
+
+明确域名的特殊 URL、目录或正文规则应实现为专项 `SiteAdapter`，而不是不断放宽通用 selector。选择标准和测试要求见 [SITE_ADAPTATION.md](SITE_ADAPTATION.md)。
 
 ## 注册表操作
 

@@ -7,7 +7,6 @@ Contributions are welcome when they preserve the security, privacy and recovery 
 ```bash
 python -m venv .venv
 python -m pip install -e ".[dev]"
-python -m playwright install chromium
 python -m pytest -q
 ```
 
@@ -16,12 +15,14 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for all quality and release comma
 ## Expectations
 
 - Add a failing test before implementing a feature or bug fix.
-- Use local synthetic fixtures; do not commit real novels, target Cookies, source URL lists, font maps or browser profiles.
+- Use local synthetic fixtures; do not commit real novels, target Cookies, source URL lists or font maps.
 - Route new CLI/Web behavior through `ApplicationService`.
-- Reuse `UrlSafetyPolicy` and the browser isolation path for every network capability.
+- Reuse `UrlSafetyPolicy` and the pinned static HTTP acquisition path for every network capability.
 - Persist only bounded, schema-validated task metadata and checkpoints.
 - Use stable error codes; do not expose raw exception text.
-- Explicitly close databases, files, servers and browser contexts in tests.
+- Explicitly close databases, files, transports and servers in tests.
+- Do not add Playwright/Chromium fallback or execute target-page JavaScript.
+- Follow [docs/SITE_ADAPTATION.md](docs/SITE_ADAPTATION.md) when choosing a dedicated adapter or generic static exploration.
 
 Before submitting:
 

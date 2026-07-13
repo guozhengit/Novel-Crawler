@@ -37,13 +37,11 @@ class Fetcher:
         self,
         proxies: dict[str, str] | None = None,
         options: FetchOptions | None = None,
-        enable_playwright: bool = False,
         proxy_pool: ProxyPool | None = None,
         acquirer: PageAcquirer | None = None,
     ):
         self.proxies = proxies or {}
         self.options = options or FetchOptions()
-        self.enable_playwright = enable_playwright
         self.proxy_pool = proxy_pool
         self.acquirer = acquirer
         self.session = requests.Session()
@@ -92,31 +90,11 @@ class Fetcher:
     def fetch_text(self, url: str, referer: str | None = None) -> str:
         if self.acquirer is not None:
             return self.acquirer.fetch(url).html
-        try:
-            content = self.fetch_bytes(url, referer)
-            text = decode_bytes(content)
-            if text.strip():
-                return text
-        except Exception:
-            if not self.enable_playwright:
-                raise
-        if self.enable_playwright:
-            return self.fetch_text_with_browser(url)
+        content = self.fetch_bytes(url, referer)
+        text = decode_bytes(content)
+        if text.strip():
+            return text
         raise RuntimeError(f"抓取内容为空：{url}")
-
-    def fetch_text_with_browser(self, url: str) -> str:
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception as exc:
-            raise RuntimeError("Playwright 不可用，无法使用浏览器渲染 fallback") from exc
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                page = browser.new_page(user_agent=random.choice(USER_AGENTS), locale="zh-CN")
-                page.goto(url, wait_until="networkidle", timeout=self.options.timeout * 1000)
-                return page.content()
-            finally:
-                browser.close()
 
     def polite_sleep(self, count: int) -> None:
         delay = random.uniform(self.options.delay_min, self.options.delay_max)

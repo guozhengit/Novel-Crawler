@@ -36,6 +36,7 @@ class Classification:
 _CHAPTER_TITLE = re.compile(r"(?:第\s*[0-9零一二三四五六七八九十百千万两]+\s*[章节回卷]|chapter\s+\d+)", re.I)
 _AUTH_TITLE = re.compile(r"(?:登录|登陆|验证|sign[ -]?in|log[ -]?in|verif(?:y|ication))", re.I)
 _CHALLENGE_TEXT = re.compile(r"(?:verify (?:you are )?human|just a moment|captcha|安全验证|人机验证)", re.I)
+_BLOCKED_TITLE = re.compile(r"(?:sorry,? you have been blocked|access denied|attention required|request blocked|访问被拒绝|访问受限)", re.I)
 _ERROR_TITLE = re.compile(r"(?:404|not found|server error|页面不存在|访问出错)", re.I)
 _SEARCH_TEXT = re.compile(r"(?:搜索结果|search results?|书库|小说列表)", re.I)
 _NOISE_SELECTOR = "comments, .comments, #comments, .comment, #comment, recommendations, .recommendations, #recommendations, aside"
@@ -69,6 +70,8 @@ class PageClassifier:
         book_index = len(chapter_links) >= 3
 
         classifiable_error = snapshot.status_code in {401, 403, 429, 503}
+        if classifiable_error and _BLOCKED_TITLE.search(title):
+            return result(PageKind.AUTH_OR_CHALLENGE, 0.99, ("auth.blocked_title",))
         if (snapshot.status_code < 400 or classifiable_error) and self._challenge_score(soup, title) >= 2:
             return result(PageKind.AUTH_OR_CHALLENGE, 0.96, ("auth.challenge_signals",))
         if (snapshot.status_code < 400 or classifiable_error) and self._login_form(soup, title, primary_heading):

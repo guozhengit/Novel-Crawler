@@ -63,8 +63,6 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -e ".[dev]"
-      - run: python -m playwright install --with-deps chromium
-      - run: RUN_PLAYWRIGHT_INTEGRATION=1 python -m pytest -W error::ResourceWarning -W error::pytest.PytestUnraisableExceptionWarning -W error::DeprecationWarning -W error::PendingDeprecationWarning tests/browser/test_playwright_integration.py -q
 
   release-recovery:
     runs-on: ubuntu-latest

@@ -24,6 +24,7 @@ class ChapterBatchRunner:
         claim_lease_seconds: float = 300.0,
         chapter_start: int = 1,
         chapter_end: int | None = None,
+        reject_duplicate_content: bool = False,
     ) -> None:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 1000:
             raise ValueError("batch_size must be between 1 and 1000")
@@ -50,6 +51,7 @@ class ChapterBatchRunner:
         self._claim_lease_seconds = claim_lease_seconds
         self._chapter_start = chapter_start
         self._chapter_end = chapter_end
+        self._reject_duplicate_content = reject_duplicate_content
 
     def __call__(self, context: TaskExecutionContext, task: TaskRecord) -> TaskStatus:
         book_id = task.metadata.get("book_id")
@@ -95,7 +97,13 @@ class ChapterBatchRunner:
                     content = self._processor(chapter)
                     if not isinstance(content, str):
                         raise TypeError("chapter_processor_content_invalid")
-                    self._storage.mark_done(book_id, chapter, content, claim=lease)
+                    self._storage.mark_done(
+                        book_id,
+                        chapter,
+                        content,
+                        claim=lease,
+                        reject_duplicate_content=self._reject_duplicate_content,
+                    )
                 except (TaskControlRequested, TerminalTaskError):
                     self._storage.release_chapter_claim(book_id, chapter.index, claim=lease)
                     raise

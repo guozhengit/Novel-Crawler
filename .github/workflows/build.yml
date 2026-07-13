@@ -66,6 +66,3 @@ jobs:
           echo "$output"
           grep -F "Runtime:" <<< "$output"
           test "$(docker run --rm --entrypoint id novel-crawler:ci -u)" != "0"
-      - name: Launch matching Chromium in the image
-        run: |
-          docker run --rm --entrypoint python novel-crawler:ci -c "from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(headless=True); print(b.version); b.close(); p.stop()"

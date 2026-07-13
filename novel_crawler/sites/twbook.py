@@ -2,7 +2,7 @@ import html as ihtml
 import json
 import re
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -31,7 +31,7 @@ class TwbookAdapter(SiteAdapter):
         self.decoder = MapDecoder(project_dir / "font_decode_map.json")
 
     def match(self, url: str) -> bool:
-        return domain_of(url).endswith("twbook.cc")
+        return domain_of(url).split(":", 1)[0] in {"twbook.cc", "www.twbook.cc"}
 
     def get_book_info(self, html: str, url: str) -> Book:
         soup = BeautifulSoup(html, "html.parser")
@@ -52,28 +52,19 @@ class TwbookAdapter(SiteAdapter):
         return Book(title=title, author=author, url=url, site=self.name)
 
     def get_chapter_list(self, html: str, url: str, *, start: int | None = None, count: int | None = None) -> list[Chapter]:
-        # 优先解析目录链接；如果用户指定了 start/count，或页面只解析出少量导航链接，按URL规律生成。
-        soup = BeautifulSoup(html, "html.parser")
-        links: list[Chapter] = []
-        if start is None and count is None:
-            for a in soup.select("a[href]"):
-                href = a.get("href", "")
-                if re.search(r"/\d+/\d+\.html$", href):
-                    title = self._decode(a.get_text(strip=True)) or f"第{len(links)+1}章"
-                    links.append(Chapter(index=len(links) + 1, title=title, url=urljoin(url, href)))
-            # 少量链接通常只是“开始阅读/导航”，不是真正目录
-            if len(links) >= 20:
-                return links
-
         book_id = self._book_id_from_url(url)
         if not book_id:
             raise ValueError("无法从URL识别twbook书籍ID")
-        start = start or 1
-        count = count or self._chapter_count_from_text(html) or 1
-        return [
-            Chapter(index=i, title=f"第{i}章", url=f"https://www.twbook.cc/{book_id}/{i}.html")
-            for i in range(start, start + count)
-        ]
+        requested_start = start or 1
+        requested_count = count or self._chapter_count_from_text(html)
+        catalog = self._catalog_links(html, url, book_id)
+        if self._chapter_number(url, book_id) is None or len(catalog) >= 20:
+            return self._select_range(catalog, requested_start, requested_count)
+        discovery_limit = (
+            requested_start + requested_count - 1 if requested_count is not None else None
+        )
+        discovered = self._follow_next_links(html, url, book_id, discovery_limit)
+        return self._select_range(discovered, requested_start, requested_count)
 
     def parse_chapter(self, html: str, url: str) -> tuple[str, str]:
         soup = BeautifulSoup(html, "html.parser")
@@ -109,3 +100,60 @@ class TwbookAdapter(SiteAdapter):
         text = self._decode(BeautifulSoup(html, "html.parser").get_text("\n"))
         m = re.search(r"章節[:：]\s*(\d+)", text)
         return int(m.group(1)) if m else None
+
+    def _catalog_links(self, html: str, base_url: str, book_id: str) -> list[Chapter]:
+        soup = BeautifulSoup(html, "html.parser")
+        found: dict[int, Chapter] = {}
+        for anchor in soup.select("a[href]"):
+            target = urljoin(base_url, str(anchor.get("href", "")))
+            number = self._chapter_number(target, book_id)
+            if number is None:
+                continue
+            title = self._decode(anchor.get_text(strip=True)) or f"第{number}章"
+            found.setdefault(number, Chapter(index=number, title=title, url=target))
+        return [found[number] for number in sorted(found)]
+
+    def _follow_next_links(
+        self,
+        first_html: str,
+        first_url: str,
+        book_id: str,
+        discovery_limit: int | None,
+    ) -> list[Chapter]:
+        current_number = self._chapter_number(first_url, book_id)
+        if current_number is None:
+            return []
+        limit = min(discovery_limit or 10_000, 10_000)
+        chapters: list[Chapter] = []
+        html = first_html
+        url = first_url
+        seen = {url}
+        while len(chapters) < limit:
+            title, _body = self.parse_chapter(html, url)
+            chapters.append(Chapter(current_number, title or f"第{current_number}章", url))
+            next_url = self.find_next_chapter(html, url)
+            next_number = self._chapter_number(next_url, book_id) if next_url else None
+            if next_url is None or next_url in seen or next_number is None or next_number <= current_number:
+                break
+            if self.fetcher is None:
+                break
+            seen.add(next_url)
+            html = self.fetcher.fetch_text(next_url, referer=url)
+            url = next_url
+            current_number = next_number
+        return chapters
+
+    @staticmethod
+    def _select_range(chapters: list[Chapter], start: int, count: int | None) -> list[Chapter]:
+        selected = [chapter for chapter in chapters if chapter.index >= start]
+        return selected if count is None else selected[:count]
+
+    @staticmethod
+    def _chapter_number(url: str | None, book_id: str) -> int | None:
+        if not url:
+            return None
+        parts = urlsplit(url)
+        if parts.hostname not in {"twbook.cc", "www.twbook.cc"}:
+            return None
+        match = re.fullmatch(rf"/{re.escape(book_id)}/(\d+)\.html", parts.path)
+        return int(match.group(1)) if match else None

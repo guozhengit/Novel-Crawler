@@ -1,6 +1,6 @@
 # 系统架构
 
-Novel Crawler 0.2 以 `ApplicationService` 为唯一外部边界。CLI 和 Web 不能直接调用网络、浏览器、任务数据库或旧同步抓取服务。
+Novel Crawler 0.2 以 `ApplicationService` 为唯一外部边界。CLI 和 Web 不能直接调用网络、任务数据库或旧同步抓取服务。生产获取只走静态 HTTP，不启动浏览器运行时。
 
 ```mermaid
 flowchart TD
@@ -13,10 +13,9 @@ flowchart TD
     EXEC --> PIPE["CrawlTaskPipeline"]
     CTRL --> MANAGER["ConfigManager"]
     MANAGER --> REG["ConfigRegistry"]
-    MANAGER --> PROBE["Probe + Revalidation"]
-    PIPE --> ACQ["BrowserAcquirer"]
-    ACQ --> HTTP["Pinned HTTP acquisition"]
-    ACQ --> BROWSER["Restricted Chromium"]
+    MANAGER --> PROBE["Static Probe + Revalidation"]
+    PIPE --> ROUTE["Dedicated Adapter / SiteConfigAdapter"]
+    ROUTE --> HTTP["Pinned HTTP acquisition"]
     PIPE --> STORE["Storage / crawler.db + content files"]
     PIPE --> EXPORT["TXT / EPUB / Markdown / JSONL"]
 ```
@@ -25,9 +24,9 @@ flowchart TD
 
 `novel_crawler.application.build_application()` 创建并连接：
 
-1. 私有配置注册表和浏览器 session store
-2. 固定 IP 的 HTTP 获取器、Chromium driver 和验证协调器
-3. 自动探测、重验证和配置管理器
+1. 私有配置注册表
+2. 固定 IP 的 HTTP 获取器和 URL 安全策略
+3. 专项适配器路由、静态探测、重验证和配置管理器
 4. `TaskRepository`、自适配控制器、生产抓取流水线和后台执行器
 5. 书籍存储/导出所需的兼容 `CrawlerService`
 6. 统一 `ApplicationService`
@@ -65,18 +64,18 @@ stateDiagram-v2
     crawling --> terminal_failed
 ```
 
-所有状态变化使用版本号 CAS，并写入只含稳定字段的事件。中断状态会保存 `resume_status`；浏览器清理失败还会设置 cleanup gate，在清理成功前拒绝恢复。
+所有状态变化使用版本号 CAS，并写入只含稳定字段的事件。中断状态会保存 `resume_status`。旧版本遗留的 cleanup gate 仅用于兼容已有任务，新建静态 HTTP 任务不会创建浏览器清理 gate。
 
 ## 自动适配流程
 
-1. **复用**：按 canonical domain、URL pattern 和结构指纹查找已激活配置。
-2. **重验证**：在有限样本上检查核心 selector、分页和结构漂移。
-3. **静态探测**：抽取候选 selector，评分并进行两页正文一致性校验。
-4. **浏览器升级**：仅在 JavaScript/挑战信号明确时创建受限 Chromium context。
-5. **人工验证**：浏览器挑战或配置置信度不足时转为 `waiting_for_user`。
-6. **确认发布**：配置写入不可变注册表 revision，再更新安全 manifest。
+1. **专项路由**：canonical domain 命中明确 `SiteAdapter` 时，使用经过站点测试的目录、章节和清洗规则。
+2. **配置复用**：未命中专项适配器时，按 domain、URL pattern 和结构指纹查找已激活配置。
+3. **重验证**：在有限静态样本上检查核心 selector、分页和结构漂移。
+4. **通用探索**：抽取候选 selector，评分并进行目录、首章和相邻章一致性校验。
+5. **停止或确认**：JavaScript/挑战信号直接返回不支持；仅配置置信度不足时转为 `waiting_for_user`。
+6. **确认发布**：用户修正的配置重新静态验证后，写入不可变 registry revision 并更新安全 manifest。
 
-配置详情见 [CONFIG.md](CONFIG.md)，注册表耐久性见 [REGISTRY.md](REGISTRY.md)。
+适配决策见 [SITE_ADAPTATION.md](SITE_ADAPTATION.md)，配置详情见 [CONFIG.md](CONFIG.md)，注册表耐久性见 [REGISTRY.md](REGISTRY.md)。
 
 ## 抓取流水线
 
@@ -124,7 +123,7 @@ stateDiagram-v2
 
 数据库提交失败、claim 失效或内容冲突不会覆盖已有已确认正文。删除使用持久化 manifest/outbox，清理不完整时可重试。
 
-## 网络与浏览器信任边界
+## 网络信任边界
 
 ### HTTP
 
@@ -135,12 +134,8 @@ stateDiagram-v2
 - deadline、redirect、解压后响应体大小均有上限
 - `PageSnapshot` 只保存脱敏 origin，不保存 path/query/fragment
 
-### Chromium
 
-- 所有请求仍经过受控代理与 URL policy
-- 阻断 WebSocket、Service Worker、下载、非代理 WebRTC、QUIC 和不需要的预连接
-- profile、Cookie 和验证 token 不进入 DTO/日志
-- context 关闭失败会进入 quarantine/cleanup gate
+生产代码不执行页面 JavaScript，不启动 Chromium/Playwright，不读取浏览器 profile 或 Cookie。遇到 JavaScript-only 内容、验证码、登录墙或挑战页时，获取流程停止并返回稳定错误码。
 
 ## Web 安全模型
 
@@ -160,7 +155,7 @@ stateDiagram-v2
 stop accepting Web requests
 -> drain active handlers
 -> stop/drain BackgroundTaskExecutor
--> close AdaptiveTaskController and browser interactions
+-> close AdaptiveTaskController and HTTP acquisition
 -> close TaskRepository
 -> close crawler Storage
 ```

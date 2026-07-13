@@ -22,13 +22,13 @@ class FailingAcquirer:
         raise RuntimeError("not used during construction")
 
 
-def test_composition_uses_private_data_directories_and_browser_is_lazy(tmp_path: Path) -> None:
+def test_composition_uses_private_data_directories_without_browser_state(tmp_path: Path) -> None:
     ctx = create_runtime_context(tmp_path / "project", tmp_path / "private-data")
     driver = NeverLaunchDriver()
     app = build_application(ctx, driver=driver, http_acquirer=FailingAcquirer(), recover_on_start=True)
     assert (ctx.data_dir / "tasks.db").exists()
     assert (ctx.data_dir / "config-registry").is_dir()
-    assert (ctx.data_dir / "browser-sessions").is_dir()
+    assert not (ctx.data_dir / "browser-sessions").exists()
     assert driver.calls == 0
     assert app.close() is True
     assert app.close() is True

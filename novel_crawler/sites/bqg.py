@@ -16,7 +16,7 @@ class BqgAdapter(SiteAdapter):
 
     def match(self, url: str) -> bool:
         host = domain_of(url)
-        return host == BQG_HOST or host.endswith(".bqg998.cc")
+        return host == BQG_HOST or host.endswith(".bqg998.cc")˚
 
     def _fetch_json(self, api_url: str) -> dict:
         html = self.fetcher.fetch_text(api_url)

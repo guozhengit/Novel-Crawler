@@ -28,6 +28,7 @@ from .scoring import (
     ScoringRule,
 )
 from .service import ProbeService
+from .static_service import StaticAdaptiveService
 from .validation import ConfigDraft, MultiPageValidator, PageValidation, ValidationResult
 
 __all__ = [
@@ -59,6 +60,7 @@ __all__ = [
     "ScoringRule",
     "ScoredPageBatch",
     "ProbeService",
+    "StaticAdaptiveService",
     "ConfigDraft",
     "ConfigConflictError",
     "ConfigRegistry",

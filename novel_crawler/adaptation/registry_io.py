@@ -421,31 +421,36 @@ class PosixRegistryIO:  # pragma: no cover - exercised by POSIX CI
             os.close(destination_fd)
 
     def open_lock(self, path: Path) -> BufferedRandom:
-        self.ensure_directory(path.parent)
-        parent_fd = self._open_directory(path.parent, require_private=True)
-        descriptor = -1
-        try:
-            descriptor = os.open(
-                path.name,
-                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=parent_fd,
-            )
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise RegistryIOError("registry lock is not a regular file")
-            _FCHMOD(descriptor, 0o600)
-            stream = os.fdopen(descriptor, "r+b")
+        for attempt in range(2):
+            self.ensure_directory(path.parent)
+            parent_fd = self._open_directory(path.parent, require_private=True)
             descriptor = -1
-            return stream
-        except OSError as exc:
-            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
-                raise RegistryIOError("registry lock path is not a regular file or contains a symlink") from exc
-            raise RegistryIOError("registry lock cannot be opened safely") from exc
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            os.close(parent_fd)
+            try:
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise RegistryIOError("registry lock is not a regular file")
+                _FCHMOD(descriptor, 0o600)
+                stream = os.fdopen(descriptor, "r+b")
+                descriptor = -1
+                return stream
+            except FileNotFoundError as exc:
+                if attempt == 1:
+                    raise RegistryIOError("registry lock cannot be opened safely") from exc
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise RegistryIOError("registry lock path is not a regular file or contains a symlink") from exc
+                raise RegistryIOError("registry lock cannot be opened safely") from exc
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                os.close(parent_fd)
+        raise RegistryIOError("registry lock cannot be opened safely")  # pragma: no cover
 
 
 class _WindowsAPI(Protocol):

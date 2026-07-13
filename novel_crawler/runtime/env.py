@@ -39,7 +39,6 @@ def detect_features() -> dict[str, bool]:
         "fonttools": "fontTools",
         "pillow": "PIL",
         "numpy": "numpy",
-        "playwright": "playwright",
         "ebooklib": "ebooklib",
         "charset_normalizer": "charset_normalizer",
     }

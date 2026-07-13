@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -12,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.sync_api import Error as PlaywrightError
 
 from novel_crawler.acquisition.models import AcquiredPage
 from novel_crawler.acquisition.security import UrlSafetyPolicy
@@ -20,8 +20,15 @@ from novel_crawler.adaptation.service import ProbeService
 from novel_crawler.browser.driver import BrowserRequestPolicy, DefaultPlaywrightDriver
 from novel_crawler.browser.sessions import BrowserSessionStore
 
+PLAYWRIGHT_AVAILABLE = importlib.util.find_spec("playwright") is not None
+if PLAYWRIGHT_AVAILABLE:
+    from playwright.sync_api import Error as PlaywrightError
+else:
+    PlaywrightError = Exception
+
 pytestmark = [
     pytest.mark.integration,
+    pytest.mark.skipif(not PLAYWRIGHT_AVAILABLE, reason="legacy Playwright runtime is not installed"),
     pytest.mark.skipif(
         os.environ.get("RUN_PLAYWRIGHT_INTEGRATION") != "1",
         reason="set RUN_PLAYWRIGHT_INTEGRATION=1; the compatible Chromium binary is mandatory",
