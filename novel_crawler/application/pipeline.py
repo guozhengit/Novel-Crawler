@@ -14,7 +14,7 @@ from novel_crawler.adaptation.config_schema import SiteConfig
 from novel_crawler.application.models import CrawlOptions
 from novel_crawler.application.site_adapter import SiteConfigAdapter
 from novel_crawler.core.chapter_quality import validate_final_url, validate_parsed_chapter
-from novel_crawler.core.fetcher import FetchOptions
+from novel_crawler.core.fetcher import Fetcher, FetchOptions
 from novel_crawler.core.models import Chapter
 from novel_crawler.core.storage import Storage
 from novel_crawler.sites.base import SiteAdapter
@@ -53,6 +53,7 @@ class CrawlTaskPipeline:
         registry: _Registry,
         acquirer: _Acquirer,
         *,
+        visible_browser_acquirer: _Acquirer | None = None,
         exporter: Callable[[int, str], object] | None = None,
         adapter_router: AdapterRouter | None = None,
         legacy_adapter: Callable[[str], SiteAdapter] | None = None,
@@ -66,6 +67,7 @@ class CrawlTaskPipeline:
         self._storage = storage
         self._registry = registry
         self._acquirer = acquirer
+        self._visible_browser_acquirer = visible_browser_acquirer
         self._exporter = exporter
         self._adapter_router = adapter_router
         self._legacy_adapter = legacy_adapter
@@ -88,6 +90,7 @@ class CrawlTaskPipeline:
             adapter = self._resolve_adapter(task.source_url)
         else:
             adapter = SiteConfigAdapter(config)
+        self._configure_adapter_fetcher(adapter, task)
         if not adapter.match(task.source_url):
             raise ValueError("active_config_mismatch")
         context.check_control(force=True)
@@ -140,6 +143,7 @@ class CrawlTaskPipeline:
             adapter = self._resolve_adapter(task.source_url)
         else:
             adapter = SiteConfigAdapter(config)
+        self._configure_adapter_fetcher(adapter, task)
 
         def process(chapter: Chapter) -> str:
             context.check_control(force=True)
@@ -190,14 +194,15 @@ class CrawlTaskPipeline:
 
     def _fetch_page(self, url: str, task: TaskRecord, adapter: SiteAdapter) -> tuple[str, str]:
         options = getattr(adapter, "fetch_options", FetchOptions())
+        acquirer = self._select_acquirer(task)
         for attempt in range(options.retries):
             self._wait_rate_limit(task, options.delay_min)
             try:
-                fetch_page = getattr(self._acquirer, "fetch_page", None)
+                fetch_page = getattr(acquirer, "fetch_page", None)
                 if callable(fetch_page):
                     acquired = fetch_page(url, task_key=task.task_id, timeout=options.timeout)
                     return acquired.snapshot.html, acquired.navigation_url
-                snapshot = self._acquirer.fetch(
+                snapshot = acquirer.fetch(
                     url, task_key=task.task_id, timeout=options.timeout
                 )
                 return snapshot.html, url
@@ -207,6 +212,18 @@ class CrawlTaskPipeline:
                 if attempt + 1 >= options.retries:
                     raise RecoverableTaskError(exc.code) from None
         raise RecoverableTaskError("source_fetch_failed")  # pragma: no cover
+
+    def _select_acquirer(self, task: TaskRecord) -> _Acquirer:
+        options = self._options(task)
+        if options.browser == "visible":
+            if self._visible_browser_acquirer is None:
+                raise TerminalTaskError("visible_browser_unavailable")
+            return self._visible_browser_acquirer
+        return self._acquirer
+
+    def _configure_adapter_fetcher(self, adapter: SiteAdapter, task: TaskRecord) -> None:
+        acquirer = self._select_acquirer(task)
+        adapter.set_fetcher(Fetcher(acquirer=acquirer))
 
     def _resolve_adapter(self, url: str) -> SiteAdapter:
         if self._adapter_router is not None:

@@ -199,7 +199,16 @@ def test_create_validates_and_persists_only_bounded_safe_options(app) -> None:
     assert executor.submitted == [view.task_id]
     record = repo.get_task(view.task_id)
     assert record.metadata == {
-        "crawl": {"chase": False, "concurrency": 1, "count": 20, "export": False, "export_format": "epub", "max_chapters": 10, "start": 2}
+        "crawl": {
+            "browser": "http",
+            "chase": False,
+            "concurrency": 1,
+            "count": 20,
+            "export": False,
+            "export_format": "epub",
+            "max_chapters": 10,
+            "start": 2,
+        }
     }
     assert "example.com" not in repr(view)
     assert "secret" not in str(view.to_safe_dict())
@@ -423,6 +432,7 @@ def test_retry_all_reports_bounded_remaining_work(tmp_path: Path) -> None:
         ({"export": 1}, "export_invalid"),
         ({"export_format": "pdf"}, "export_format_invalid"),
         ({"chase": "yes"}, "chase_invalid"),
+        ({"browser": "headless"}, "browser_invalid"),
         ({"unknown": 1}, "options_invalid"),
     ],
 )

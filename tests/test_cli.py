@@ -181,12 +181,13 @@ def test_env_does_not_construct_application(tmp_path, capsys) -> None:
 def test_crawl_detaches_and_prints_safe_task_json(tmp_path, capsys) -> None:
     app = FakeApplication()
     assert main(
-        ["crawl", "https://example.test/book", "--start", "2", "--count", "3"],
+        ["crawl", "https://example.test/book", "--start", "2", "--count", "3", "--browser", "visible"],
         project_dir=tmp_path,
         application_factory=app_factory(app),
     ) == 0
     assert output_json(capsys) == {"status": "created", "task_id": "task-safe", "terminal": False}
     assert app.calls[0][0:2] == ("create", "https://example.test/book")
+    assert app.calls[0][2].browser == "visible"
     assert app.closed
 
 

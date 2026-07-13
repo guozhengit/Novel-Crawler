@@ -16,7 +16,7 @@
 - Remote Web access has no authentication or TLS; use loopback or a trusted tunnel.
 - Automatic selectors can require user confirmation after structural drift.
 - Sites using unsupported DRM, CAPTCHAs, authenticated paywalls or native applications may not work and are not bypassed.
-- JavaScript-only pages are unsupported. The crawler does not launch Playwright/Chromium or execute page scripts.
+- JavaScript-only pages are unsupported by default HTTP crawling. If the user explicitly chooses `--browser visible`, the crawler may use a user-visible Chrome session for public pages the user can already access; CAPTCHAs, authenticated paywalls and DRM are still not bypassed.
 
 ## Getting help
 

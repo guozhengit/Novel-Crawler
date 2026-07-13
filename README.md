@@ -1,6 +1,6 @@
 # Novel Crawler
 
-Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工具。生产抓取只使用受控静态 HTTP，不启动无头浏览器、不执行页面 JavaScript，也不尝试绕过验证码或访问控制。已知站点使用专项适配器，未知站点进入有预算的通用探索流程；无法可靠确认的配置会暂停任务，等待用户修正 selector 或提供可静态访问的入口。
+Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工具。生产抓取默认使用受控静态 HTTP；需要处理 Cloudflare 或必须由真实浏览器渲染的公开页面时，可显式使用 `--browser visible` 启动有界面 Chrome。工具不使用无头浏览器，也不尝试绕过验证码、登录墙、付费墙或访问控制。已知站点使用专项适配器，未知站点进入有预算的通用探索流程；无法可靠确认的配置会暂停任务，等待用户修正 selector 或提供可访问入口。
 
 当前版本：**0.2.0**。支持 Python 3.11、3.12 和 3.13。
 
@@ -11,6 +11,7 @@ Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工
 - 后台任务状态机：暂停、恢复、取消、失败重试和崩溃恢复
 - SQLite CAS、checkpoint、章节 claim、幂等正文写入和安全删除
 - 专项站点适配与通用静态探索双路径
+- 显式 `--browser visible` 有界面 Chrome 抓取模式
 - TXT、EPUB、Markdown 和 JSONL 导出
 - 本机安全 Web 控制台与稳定 JSON CLI 输出
 - URL、路径、正文、Cookie 和验证令牌默认不进入公开 DTO 或错误消息
@@ -104,14 +105,14 @@ docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 env
 docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://example.test/books/demo"
 ```
 
-容器内抓取遵守相同的静态 HTTP 策略，不得启动 Chromium。持久化数据固定挂载到 `/app/data`。
+容器内抓取默认遵守相同的静态 HTTP 策略。`--browser visible` 需要 GUI 和本机 Chrome，通常不适用于普通容器。持久化数据固定挂载到 `/app/data`。
 
 ## 安全边界
 
 - 所有网络目标在连接前执行协议、域名、DNS 和 IP 校验；每次重定向重新校验。
 - HTTP 连接使用已批准 IP，TLS SNI/证书仍绑定原始主机名。
 - Web 修改接口只接受同源、带 CSRF 的 JSON `POST`。
-- JavaScript、验证码、登录墙或挑战页不会触发浏览器 fallback；任务以稳定错误码暂停或失败。
+- JavaScript、验证码、登录墙或挑战页不会触发自动浏览器 fallback；只有用户显式指定 `--browser visible` 时才启动有界面 Chrome。验证码、登录墙、付费墙或 DRM 仍不属于绕过范围。
 
 安全问题请参阅 [SECURITY.md](SECURITY.md)。抓取前请确认目标网站条款、robots 规则和内容许可；本项目不授予复制或再分发第三方内容的权利。
 

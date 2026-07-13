@@ -21,7 +21,7 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for all quality and release comma
 - Persist only bounded, schema-validated task metadata and checkpoints.
 - Use stable error codes; do not expose raw exception text.
 - Explicitly close databases, files, transports and servers in tests.
-- Do not add Playwright/Chromium fallback or execute target-page JavaScript.
+- Do not add automatic Playwright/Chromium fallback. Browser use must remain explicit (`--browser visible`), user-visible, and covered by tests that do not hit real sites.
 - Follow [docs/SITE_ADAPTATION.md](docs/SITE_ADAPTATION.md) when choosing a dedicated adapter or generic static exploration.
 
 Before submitting:

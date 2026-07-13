@@ -6,6 +6,7 @@ from typing import Any, Protocol, cast
 
 from novel_crawler.acquisition.http import HttpPageAcquirer
 from novel_crawler.acquisition.models import AcquiredPage
+from novel_crawler.acquisition.visible_browser import VisibleBrowserAcquirer
 from novel_crawler.adaptation import (
     ConfigManager,
     ConfigRegistry,
@@ -46,6 +47,7 @@ def build_application(
         registry = ConfigRegistry(ctx.data_dir / "config-registry")
         del driver  # source-compatible argument; production browser acquisition is disabled
         http = http_acquirer or HttpPageAcquirer()
+        visible_browser = VisibleBrowserAcquirer(ctx.data_dir / "visible-browser")
         probe = ProbeService(acquirer=cast(Any, http))
         revalidator = ConfigRevalidator(acquirer=cast(Any, http), registry=registry)
         manager = ConfigManager(registry, revalidator, probe)
@@ -59,12 +61,14 @@ def build_application(
         repository = TaskRepository(ctx.data_dir / "tasks.db")
         controller = AdaptiveTaskController(repository, cast(Any, adaptive))
         crawler = CrawlerService(ctx)
+        crawler.add_closeable(visible_browser)
 
         pipeline = CrawlTaskPipeline(
             repository,
             crawler.storage,
             registry,
             cast(Any, http),
+            visible_browser_acquirer=cast(Any, visible_browser),
             exporter=lambda book_id, fmt: crawler.export(book_id, fmt),
             adapter_router=router,
         )

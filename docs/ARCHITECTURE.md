@@ -1,6 +1,6 @@
 # 系统架构
 
-Novel Crawler 0.2 以 `ApplicationService` 为唯一外部边界。CLI 和 Web 不能直接调用网络、任务数据库或旧同步抓取服务。生产获取只走静态 HTTP，不启动浏览器运行时。
+Novel Crawler 0.2 以 `ApplicationService` 为唯一外部边界。CLI 和 Web 不能直接调用网络、任务数据库或旧同步抓取服务。生产获取默认走静态 HTTP；只有任务选项显式指定 `browser=visible` 时，才启动有界面 Chrome 获取用户可访问的公开页面。
 
 ```mermaid
 flowchart TD
@@ -135,7 +135,7 @@ stateDiagram-v2
 - `PageSnapshot` 只保存脱敏 origin，不保存 path/query/fragment
 
 
-生产代码不执行页面 JavaScript，不启动 Chromium/Playwright，不读取浏览器 profile 或 Cookie。遇到 JavaScript-only 内容、验证码、登录墙或挑战页时，获取流程停止并返回稳定错误码。
+生产代码不会自动执行页面 JavaScript，也不会自动启动 Chromium/Playwright 或读取浏览器 profile/Cookie。遇到 JavaScript-only 内容、验证码、登录墙或挑战页时，默认获取流程停止并返回稳定错误码。`--browser visible` 是显式用户选择的有界面 Chrome 路径，不用于绕过登录、付费墙、验证码或 DRM。
 
 ## Web 安全模型
 

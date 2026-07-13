@@ -8,8 +8,9 @@ from novel_crawler.application.errors import ApplicationError
 
 _FORMATS = frozenset({"txt", "epub", "md", "jsonl"})
 _OPTION_KEYS = frozenset(
-    {"start", "count", "max_chapters", "concurrency", "export", "export_format", "chase"}
+    {"start", "count", "max_chapters", "concurrency", "export", "export_format", "chase", "browser"}
 )
+_BROWSERS = frozenset({"http", "visible"})
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class CrawlOptions:
     export: bool = True
     export_format: str = "txt"
     chase: bool = False
+    browser: str = "http"
 
     @classmethod
     def parse(cls, value: CrawlOptions | dict[str, Any] | None) -> CrawlOptions:
@@ -52,6 +54,8 @@ class CrawlOptions:
             raise ApplicationError("export_format_invalid")
         if not isinstance(self.chase, bool):
             raise ApplicationError("chase_invalid")
+        if not isinstance(self.browser, str) or self.browser not in _BROWSERS:
+            raise ApplicationError("browser_invalid")
 
     def to_metadata(self) -> dict[str, dict[str, bool | int | str | None]]:
         return {
@@ -63,6 +67,7 @@ class CrawlOptions:
                 "export_format": self.export_format,
                 "max_chapters": self.max_chapters,
                 "start": self.start,
+                "browser": self.browser,
             }
         }
 

@@ -29,10 +29,30 @@ logger = logging.getLogger(__name__)
 class CrawlerService:
     def __init__(self, ctx: RuntimeContext, proxy_file: Path | None = None):
         self.ctx = ctx
+        self._closeables: list[object] = []
         pool = ProxyPool.from_file(proxy_file) if proxy_file and proxy_file.exists() else None
         self.fetcher = Fetcher(proxies=ctx.proxies, proxy_pool=pool, acquirer=HttpPageAcquirer())
         self.storage = Storage(ctx.db_path, ctx.data_dir)
         self.registry = AdapterRegistry(self._load_adapters())
+
+    def add_closeable(self, resource: object) -> None:
+        self._closeables.append(resource)
+
+    def close(self) -> None:
+        failure: Exception | None = None
+        for resource in reversed(self._closeables):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    failure = failure or exc
+        try:
+            self.storage.close()
+        except Exception as exc:
+            failure = failure or exc
+        if failure is not None:
+            raise RuntimeError("crawler_close_failed") from None
 
     def crawl(self, url: str, *, start: int | None = None, count: int | None = None, export: bool = True, concurrency: int = 1, max_chapters: int | None = None, chase: bool = False) -> int:
         adapter = self.registry.find(url)

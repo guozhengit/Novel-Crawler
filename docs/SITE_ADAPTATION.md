@@ -1,13 +1,15 @@
 # 站点适配指南
 
-生产抓取只有两条获取路径：**专项站点适配**与**通用静态探索**。两者都必须复用 `acquisition` 的 URL 安全策略、固定 IP HTTP transport、响应体上限、重试与限速；不得启动 Playwright/Chromium、执行页面 JavaScript、导入浏览器 Cookie，或绕过验证码、登录墙和付费访问控制。
+生产抓取的默认路径是 **专项站点适配** 与 **通用静态探索**。两者都必须复用 `acquisition` 的 URL 安全策略、固定 IP HTTP transport、响应体上限、重试与限速；不得自动启动 Playwright/Chromium、执行页面 JavaScript、导入浏览器 Cookie，或绕过验证码、登录墙和付费访问控制。
+
+当操作者明确传入 `--browser visible` 时，任务可使用有界面 Chrome 读取用户可访问的公开页面。该模式用于人工可见的兼容性抓取，不是自动 fallback，不使用无头浏览器，也不应被专项适配器默认启用。
 
 ## 路由原则
 
 1. 对 URL 做协议、主机、DNS、IP 和端口校验。
 2. `AdapterRegistry` 先匹配明确域名的专项 `SiteAdapter`。
 3. 没有专项适配器时，进入 `ProbeService` 的通用静态探索。
-4. 页面明确依赖 JavaScript、返回挑战页或需要身份凭据时停止，不降级到浏览器。
+4. 页面明确依赖 JavaScript、返回挑战页或需要身份凭据时停止；只有用户显式选择 `--browser visible` 时才使用有界面浏览器。
 5. selector 置信度不足时进入 `waiting_for_user`，只允许用户确认或修正 selector；不得提交 Cookie、token 或账号密码。
 
 ## 专项站点适配
@@ -49,6 +51,7 @@
 | 公开静态 HTML，结构接近常见目录/章节页面 | 通用静态探索 |
 | URL 编号、分页或正文清洗具有特殊规则 | 新增专项适配器 |
 | 页面必须执行 JavaScript 才产生正文 | 不支持 |
+| 用户本机 Chrome 可访问且已显式指定 `--browser visible` | 有界面浏览器抓取 |
 | 验证码、登录墙、付费墙或 DRM | 不支持，不绕过 |
 
 配置 schema、selector 限制和 revision 生命周期见 [CONFIG.md](CONFIG.md)，网络信任边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。

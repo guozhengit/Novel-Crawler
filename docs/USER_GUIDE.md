@@ -6,7 +6,7 @@
 
 - 仅抓取有权访问、保存或导出的内容，并遵守目标网站的服务条款、robots 规则和版权许可。
 - 抓取地址、章节正文、数据库和导出文件均属于私有数据。不要提交、共享或附在公开问题报告中。
-- 工具只进行安全的静态 HTTP 抓取，不启动无头浏览器或执行页面 JavaScript，也不会绕过访问控制、验证码或网站许可。
+- 默认使用安全的静态 HTTP 抓取。确需处理 Cloudflare 或必须由真实浏览器渲染的公开页面时，可显式使用 `--browser visible` 启动有界面 Chrome；不会使用无头浏览器，也不会绕过登录、付费墙、验证码或网站许可。
 - 当前生产任务仅支持单任务顺序抓取，即 `--concurrency 1`；不支持 `--chase` 和 `--proxy-file`。
 
 ## 安装与环境检查
@@ -65,6 +65,9 @@ novel-crawler crawl "https://example.test/books/demo" --max-chapters 100
 
 # 完成抓取但不自动导出
 novel-crawler crawl "https://example.test/books/demo" --no-export
+
+# 使用有界面 Chrome 抓取。适合普通 HTTP 被 Cloudflare 拦截、但用户本机 Chrome 可正常访问的公开页面。
+novel-crawler crawl "https://example.test/books/demo" --browser visible
 ```
 
 任务范围会被持久化；恢复任务不会因同一本书已经存在的章节而扩大本次的范围。
@@ -76,6 +79,120 @@ novel-crawler crawl "https://example.test/books/demo" --wait --timeout 600
 ```
 
 `--wait` 默认每 0.5 秒轮询，默认最长等待 300 秒。可用 `--poll-interval` 调整到 0.05 至 10 秒。等待模式的关键退出码为：`0` 已完成、`9` 超时、`10` 等待人工操作、`11` 终止失败、`12` 已取消、`13` 已暂停/可恢复失败/需要清理。
+
+`--browser visible` 会在数据目录下创建 `visible-browser/` 作为 Chrome 用户数据目录，用于保留站点 Cookie 和验证状态。该目录可能包含浏览器会话数据，应按私有数据处理，不要提交或共享。容器环境通常没有 GUI，不适合使用该模式。
+
+## 原地址解析示例
+
+### twbook 前 5 章
+
+原地址：
+
+```text
+https://www.twbook.cc/1910596421/1.html
+```
+
+解析：
+
+```text
+站点: twbook
+书籍 ID: 1910596421
+起始章节: 1
+章节 URL 模式: https://www.twbook.cc/1910596421/{chapter}.html
+```
+
+twbook 当前对普通 HTTP 客户端可能返回 Cloudflare 403；如本机 Chrome 可访问，使用可见浏览器模式：
+
+```bash
+novel-crawler --data-dir twbook-visible-test crawl \
+  'https://www.twbook.cc/1910596421/1.html' \
+  --start 1 \
+  --count 5 \
+  --max-chapters 5 \
+  --browser visible \
+  --wait \
+  --timeout 300
+```
+
+结果检查：
+
+```bash
+novel-crawler --data-dir twbook-visible-test books
+find twbook-visible-test/output -type f
+novel-crawler --data-dir twbook-visible-test preview 1 1 --length 500
+```
+
+### bqg107 前 5 章
+
+原地址：
+
+```text
+https://www.bqg107.xyz/#/book/1155/1.html
+```
+
+解析：
+
+```text
+站点: bqg 系列
+域名: www.bqg107.xyz
+书籍 ID: 1155
+起始章节: 1
+章节 URL 模式: https://www.bqg107.xyz/#/book/1155/{chapter}.html
+书籍 API: https://www.bqg107.xyz/api/book?id=1155
+目录 API: https://www.bqg107.xyz/api/booklist?id=1155
+```
+
+`bqg107.xyz` 走现有 `bqg.py` 的 bqg 系列适配器：适配器会从输入 URL 推导 API host，并使用同一 host 生成章节 URL。API 已验证可访问，但这不等于三个示例地址都能直接成功抓取；bqg107 仍建议按前 5 章单独验证。
+
+```bash
+novel-crawler --data-dir bqg107-test crawl \
+  'https://www.bqg107.xyz/#/book/1155/1.html' \
+  --start 1 \
+  --count 5 \
+  --max-chapters 5 \
+  --wait \
+  --timeout 300
+```
+
+如果正文必须由前端渲染，再增加 `--browser visible`。
+
+当前结论：
+
+```text
+twbook: 已具备并验证前 5 章可用，必要时使用 --browser visible。
+bqg107: 使用 bqg.py 的 bqg 系列适配器；API 可访问，前 5 章需按目标命令验证。
+qidian: 当前没有 QidianAdapter，不能从单章 URL 安全解析后续章节。
+```
+
+### qidian 前 2 章
+
+原地址：
+
+```text
+https://www.qidian.com/chapter/1049543990/909659028/
+```
+
+解析：
+
+```text
+站点: qidian
+书籍 ID: 1049543990
+当前章节 ID: 909659028
+地址类型: 单章地址，不是目录地址
+```
+
+当前项目没有 qidian 专项适配器。仅凭该 URL 无法从数字规律安全推导下一章 ID；需要先新增 `QidianAdapter`，从页面 DOM 解析书名、正文和“下一章”链接，再用递推方式抓前 2 章。实现后的目标命令为：
+
+```bash
+novel-crawler --data-dir qidian-test crawl \
+  'https://www.qidian.com/chapter/1049543990/909659028/' \
+  --start 1 \
+  --count 2 \
+  --max-chapters 2 \
+  --browser visible \
+  --wait \
+  --timeout 300
+```
 
 ### 2. 查看状态和事件
 
@@ -198,7 +315,7 @@ docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 env
 docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://example.test/books/demo"
 ```
 
-容器内抓取同样只使用静态 HTTP，不能依赖或启动 Chromium。数据目录固定为 `/app/data`；每次运行应挂载相同卷，否则任务和导出结果会在容器删除后丢失。
+容器内抓取默认使用静态 HTTP。`--browser visible` 需要 GUI 和本机 Chrome，通常不适用于普通容器。数据目录固定为 `/app/data`；每次运行应挂载相同卷，否则任务和导出结果会在容器删除后丢失。
 
 ## 故障排查
 
@@ -209,7 +326,8 @@ docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://examp
 | 无法恢复且要求清理 | 运行 `task-retry-cleanup`，成功后再运行 `task-resume`。 |
 | `terminal_failed` | 该任务不能直接恢复；检查事件、目标页面和配置，再创建新任务。 |
 | `task_not_found` | 确认 `TASK_ID` 与 `--data-dir` 是否正确。 |
-| 页面需要 JavaScript、验证码或登录 | 不使用浏览器 fallback；提供合法的静态入口、开发专项 HTTP 适配器，或将该站点视为不支持。 |
+| 页面需要 JavaScript | 默认不使用浏览器 fallback；如本机 Chrome 可访问公开页面，可显式使用 `--browser visible`。 |
+| 验证码、登录墙、付费墙或 DRM | 不绕过；提供合法的静态入口、开发专项 HTTP 适配器，或将该站点视为不支持。 |
 | 导出结果不符合预期 | 使用 `validate`、`report` 和 `preview` 检查书籍，再选择 `retry-failed`、`fix-titles` 或 `dedup`。 |
 
 脚本集成应使用退出码与 JSON 中的 `status`、`error_code` 字段处理结果，不要解析中文提示。完整 CLI 参数和退出码表见 [CLI.md](CLI.md)；专项适配和通用探索见 [SITE_ADAPTATION.md](SITE_ADAPTATION.md)。

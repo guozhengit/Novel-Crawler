@@ -124,6 +124,45 @@ def test_validating_persists_bounded_plan_and_crawling_completes_and_exports(tmp
     storage.close()
 
 
+def test_visible_browser_option_routes_pipeline_to_visible_acquirer(tmp_path: Path) -> None:
+    url = "https://example.test/books/index.html"
+    pages = {
+        url: "<h1 class=book>Book</h1><div id=list><a href='1.html'>One</a></div>",
+        "https://example.test/books/1.html": "<h1 class=chapter>One</h1><article><p>A</p></article>",
+    }
+    repo = TaskRepository(tmp_path / "visible-tasks.db")
+    storage = Storage(tmp_path / "visible-crawl.db", tmp_path / "visible-data")
+    http = Acquirer({})
+    visible = Acquirer(pages)
+    pipeline = CrawlTaskPipeline(
+        repo,
+        storage,
+        Registry(site_config()),
+        http,
+        visible_browser_acquirer=visible,
+    )
+    task = active_task(
+        repo,
+        url,
+        {
+            "crawl": {
+                "browser": "visible",
+                "concurrency": 1,
+                "export": False,
+            }
+        },
+    )
+    assert pipeline.validating(context(repo, task), task) is TaskStatus.READY
+    ready = repo.transition(task.task_id, TaskStatus.READY, expected_version=task.version)
+    crawling = repo.transition(task.task_id, TaskStatus.CRAWLING, expected_version=ready.version)
+    assert pipeline.crawling(context(repo, crawling), crawling) is TaskStatus.COMPLETED
+    assert storage.progress(1) == {"total": 1, "done": 1}
+    assert http.task_keys == []
+    assert visible.task_keys == [task.task_id, task.task_id]
+    repo.close()
+    storage.close()
+
+
 def test_pipeline_consumes_real_browser_acquirer_page_snapshot(tmp_path: Path) -> None:
     url = "https://example.test/books/index.html"
     html = "<h1 class=book>Book</h1><div id=list><a href='1.html'>One</a></div>"

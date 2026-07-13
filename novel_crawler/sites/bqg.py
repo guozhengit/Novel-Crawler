@@ -1,5 +1,6 @@
-"""bqg998.cc 专用适配器：SPA 站点，API 获取目录，Playwright 渲染章节页。"""
+"""bqg 系列适配器：SPA 站点，API 获取目录，Playwright 渲染章节页。"""
 import re
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
@@ -7,7 +8,7 @@ from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.utils import normalize_blank_lines
 from novel_crawler.sites.base import BS_PARSER, SiteAdapter, domain_of
 
-BQG_HOST = "www.bqg998.cc"
+BQG_HOST_RE = re.compile(r"^(?:www\.)?bqg\d+\.(?:cc|xyz)$", re.I)
 
 
 class BqgAdapter(SiteAdapter):
@@ -15,8 +16,8 @@ class BqgAdapter(SiteAdapter):
     requires_browser = True
 
     def match(self, url: str) -> bool:
-        host = domain_of(url)
-        return host == BQG_HOST or host.endswith(".bqg998.cc")
+        host = domain_of(url).split(":", 1)[0]
+        return bool(BQG_HOST_RE.fullmatch(host))
 
     def _fetch_json(self, api_url: str) -> dict:
         html = self.fetcher.fetch_text(api_url)
@@ -28,7 +29,7 @@ class BqgAdapter(SiteAdapter):
         if not book_id:
             return Book(title="未知", url=url, site=self.name)
         try:
-            data = self._fetch_json(f"https://{BQG_HOST}/api/book?id={book_id}")
+            data = self._fetch_json(f"https://{self._api_host(url)}/api/book?id={book_id}")
             return Book(title=data.get("title", "未知"), author=data.get("author"), url=url, site=self.name)
         except Exception:
             return Book(title=f"book_{book_id}", url=url, site=self.name)
@@ -37,7 +38,8 @@ class BqgAdapter(SiteAdapter):
         book_id = self._book_id_from_url(url)
         if not book_id:
             return []
-        data = self._fetch_json(f"https://{BQG_HOST}/api/booklist?id={book_id}")
+        host = self._api_host(url)
+        data = self._fetch_json(f"https://{host}/api/booklist?id={book_id}")
         titles = data.get("list", [])
         chapters = []
         for i, title in enumerate(titles, start=1):
@@ -46,7 +48,7 @@ class BqgAdapter(SiteAdapter):
             if count and len(chapters) >= count:
                 break
             title = self._clean_title(title)
-            chapter_url = f"https://{BQG_HOST}/#/book/{book_id}/{i}.html"
+            chapter_url = f"https://{host}/#/book/{book_id}/{i}.html"
             chapters.append(Chapter(index=i, title=title, url=chapter_url))
         return chapters
 
@@ -75,6 +77,12 @@ class BqgAdapter(SiteAdapter):
     def _book_id_from_url(self, url: str) -> str | None:
         m = re.search(r"book/(\d+)", url)
         return m.group(1) if m else None
+
+    def _api_host(self, url: str) -> str:
+        host = urlparse(url).netloc.lower().split(":", 1)[0]
+        if not BQG_HOST_RE.fullmatch(host):
+            raise ValueError("无法从URL识别bqg API host")
+        return host
 
     def _clean_title(self, title: str) -> str:
         return title.replace("?", "").strip()

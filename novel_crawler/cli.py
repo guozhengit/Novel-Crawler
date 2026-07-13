@@ -34,6 +34,7 @@ _ERROR_MESSAGES = {
     "service_closed": "服务已关闭",
     "chase_unsupported": "当前版本不支持递推抓取",
     "concurrency_unsupported": "当前版本仅支持单任务顺序抓取",
+    "visible_browser_unavailable": "可见浏览器不可用，请确认已安装 Chrome/Playwright",
 }
 
 
@@ -81,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--max-chapters", type=int, default=None, help="本次最多下载章节数")
     crawl.add_argument("--chase", action="store_true", help="递推抓取（当前不支持）")
     crawl.add_argument("--proxy-file", type=Path, default=None, help="兼容参数（当前不支持）")
+    crawl.add_argument("--browser", choices=["http", "visible"], default="http", help="抓取后端：默认 http；visible 使用有界面 Chrome")
     crawl.add_argument("--wait", action="store_true", help="等待任务结束或需要人工操作")
     crawl.add_argument("--poll-interval", type=_bounded_float(0.05, 10), default=0.5)
     crawl.add_argument("--timeout", type=_bounded_float(0.1, 86_400), default=300.0)
@@ -240,6 +242,7 @@ def _dispatch(app: _Application, args: argparse.Namespace, ctx: RuntimeContext) 
             concurrency=args.concurrency,
             export=not args.no_export,
             chase=args.chase,
+            browser=args.browser,
         )
         view = _call(app, "create_crawl_task", args.url, options)
         if not args.wait:

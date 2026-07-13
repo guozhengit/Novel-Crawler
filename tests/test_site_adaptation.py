@@ -5,6 +5,7 @@ import pytest
 from novel_crawler.core.models import Book, Chapter
 from novel_crawler.core.storage import ChapterContentConflict, Storage
 from novel_crawler.sites.auto import AutoAdapter
+from novel_crawler.sites.bqg import BqgAdapter
 from novel_crawler.sites.router import AdapterRouter
 from novel_crawler.sites.twbook import TwbookAdapter
 
@@ -54,6 +55,28 @@ def test_adapter_router_prefers_exact_dedicated_domain(tmp_path: Path) -> None:
     assert router.resolve("https://www.twbook.cc/123/1.html") is twbook
     assert isinstance(router.resolve("https://example.test/book"), AutoAdapter)
     assert not twbook.match("https://eviltwbook.cc/123/1.html")
+
+
+def test_bqg_adapter_uses_current_series_host_for_api_and_chapters() -> None:
+    url = "https://www.bqg107.xyz/#/book/1155/1.html"
+    pages = {
+        "https://www.bqg107.xyz/api/book?id=1155": '{"title":"书名","author":"作者"}',
+        "https://www.bqg107.xyz/api/booklist?id=1155": '{"list":["第1章","第2章","第3章"]}',
+    }
+    adapter = BqgAdapter()
+    adapter.set_fetcher(StaticFetcher(pages))  # type: ignore[arg-type]
+
+    assert adapter.match(url)
+    assert not adapter.match("https://www.bqg.example/#/book/1155/1.html")
+    assert adapter.get_book_info("", url).title == "书名"
+
+    chapters = adapter.get_chapter_list("", url, start=2, count=2)
+
+    assert [chapter.title for chapter in chapters] == ["第2章", "第3章"]
+    assert [chapter.url for chapter in chapters] == [
+        "https://www.bqg107.xyz/#/book/1155/2.html",
+        "https://www.bqg107.xyz/#/book/1155/3.html",
+    ]
 
 
 def test_storage_rejects_duplicate_content_across_chapters(tmp_path: Path) -> None:
