@@ -5,6 +5,7 @@
 ## 使用前须知
 
 - 仅抓取有权访问、保存或导出的内容，并遵守目标网站的服务条款、robots 规则和版权许可。
+- 第三方线上站点默认禁用。确认授权后，使用全局 `--allow-third-party` 开关；本机、私有网络和测试/文档域名不需要该开关。
 - 抓取地址、章节正文、数据库和导出文件均属于私有数据。不要提交、共享或附在公开问题报告中。
 - 默认使用安全的静态 HTTP 抓取。确需处理 Cloudflare 或必须由真实浏览器渲染的公开页面时，可显式使用 `--browser visible` 启动有界面 Chrome；不会使用无头浏览器，也不会绕过登录、付费墙、验证码或网站许可。
 - 当前生产任务仅支持单任务顺序抓取，即 `--concurrency 1`；不支持 `--chase` 和 `--proxy-file`。
@@ -72,6 +73,12 @@ novel-crawler crawl "https://example.test/books/demo" --browser visible
 
 任务范围会被持久化；恢复任务不会因同一本书已经存在的章节而扩大本次的范围。
 
+第三方线上站点必须显式开启本次进程访问：
+
+```bash
+novel-crawler --allow-third-party crawl "https://example.org/books/demo" --count 5
+```
+
 如需在当前终端等待任务结束或需要人工操作：
 
 ```bash
@@ -83,6 +90,26 @@ novel-crawler crawl "https://example.test/books/demo" --wait --timeout 600
 `--browser visible` 会在数据目录下创建 `visible-browser/` 作为 Chrome 用户数据目录，用于保留站点 Cookie 和验证状态。该目录可能包含浏览器会话数据，应按私有数据处理，不要提交或共享。容器环境通常没有 GUI，不适合使用该模式。
 
 ## 原地址解析示例
+
+### 新源站探索流程
+
+遇到没有专项适配器的新源站时，先生成探索报告和候选配置：
+
+```bash
+novel-crawler --allow-third-party explore-site \
+  "https://example.org/book/1.html" \
+  --sample 3 \
+  --output exploratory/example-site-report.json
+
+novel-crawler propose-config exploratory/example-site-report.json \
+  --output novel_crawler/configs/example-site.json
+
+novel-crawler validate-config novel_crawler/configs/example-site.json
+```
+
+`explore-site` 只抓取少量样本页，并输出候选 selector、正文长度、段落数、风险提示和 `proposed_config`。`propose-config` 只导出通用 JSON 配置；不会自动启用配置，也不会生成 Python 适配器。
+
+如果报告里 `requires_dedicated_adapter` 为 `true`，说明通用 selector 不足以表达站点逻辑。常见原因是一章多分页、SPA/API、字体混淆或特殊 URL 规则，应开发专项 `SiteAdapter` 并补本地 fixture 测试。
 
 ### twbook 前 5 章
 
@@ -163,6 +190,41 @@ twbook: 已具备并验证前 5 章可用，必要时使用 --browser visible。
 bqg107: 使用 bqg.py 的 bqg 系列适配器；API 可访问，前 5 章需按目标命令验证。
 qidian: 当前没有 QidianAdapter，不能从单章 URL 安全解析后续章节。
 ```
+
+### shuyous 前 5 章与 TTS
+
+`shuyous.com` 已有专项适配器，支持静态目录、正文抽取和章内分页合并。授权后可抓取前 5 章：
+
+```bash
+novel-crawler --allow-third-party --data-dir shuyous-tts-explore crawl \
+  'https://www.shuyous.com/book/2579696-1.html' \
+  --start 1 \
+  --count 5 \
+  --max-chapters 5 \
+  --wait \
+  --timeout 600
+```
+
+完成后导出 EasyVoice 交换 JSON：
+
+```bash
+novel-crawler --allow-third-party --data-dir shuyous-tts-explore tts-export 1 \
+  --output shuyous-tts-explore/crawler-exports/book-1.json
+```
+
+如果 EasyVoice 通过 Docker 暴露在 `http://localhost:9549/generate`，CLI 的 API 根地址传 `http://localhost:9549` 或 `http://127.0.0.1:9549`。宿主机未安装 `ffprobe` 时，可把音频输出放入 EasyVoice 容器挂载目录，并用容器内媒体工具校验：
+
+```bash
+python integrations/easyvoice/novel_tts_pipeline.py \
+  --input shuyous-tts-explore/crawler-exports/book-1.json \
+  --output /Users/admin/docker-data/easyVoice/shuyous-tts-explore/novel-audio \
+  --base-url http://127.0.0.1:9549 \
+  --media-container easyvoice \
+  --media-host-root /Users/admin/docker-data/easyVoice \
+  --media-container-root /app/audio
+```
+
+输出目录包含每章 `mp3`、`srt` 和 `manifest.json`。这些都是运行产物和第三方内容，不应加入 Git。
 
 ### qidian 前 2 章
 
@@ -296,6 +358,14 @@ novel-crawler web
 ```
 
 在浏览器打开 `http://127.0.0.1:8765`。控制台提供创建、查看、暂停、恢复、取消、确认任务以及导出、删除书籍的界面。
+
+当前 Web 控制台也包含：
+
+- 合规确认复选框：第三方线上抓取、探索和 TTS 前必须显式勾选。
+- 新源站探索：输入 URL 和样本数量，生成报告摘要与候选通用配置 JSON。
+- EasyVoice 操作：对已抓取书籍导出 EasyVoice JSON 或提交 TTS 转换。
+
+Web 端不会自动保存候选配置文件，也不会自动生成 Python 专项适配器。需要把候选配置纳入项目时，仍应通过 CLI `propose-config` 或人工复制后进行代码审查。
 
 端口冲突时可指定其他端口：
 

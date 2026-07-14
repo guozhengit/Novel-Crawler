@@ -13,6 +13,18 @@
 
 探索任务不得直接承诺生产可抓取。进入正式抓取前，必须通过站点适配器或配置适配器的质量验证。
 
+当前优先使用内置探索命令生成可审计报告：
+
+```bash
+novel-crawler --allow-third-party explore-site "https://example.org/book/1.html" \
+  --sample 3 \
+  --output exploratory/example-report.json
+novel-crawler propose-config exploratory/example-report.json \
+  --output novel_crawler/configs/example.json
+```
+
+报告中的 `proposed_config` 仅是候选配置；`requires_dedicated_adapter=true` 时，应把探索结论升级为专项适配器需求，而不是强行放宽通用 selector。
+
 ## 操作流程
 
 推荐命令形态：

@@ -100,11 +100,17 @@ novel-crawler crawl-batch urls.txt [--max-chapters N]
 ```bash
 novel-crawler env
 novel-crawler decode-font FONT [--output MAP.json]
+novel-crawler explore-site URL [--sample 3] [--output exploratory/site-report.json]
+novel-crawler propose-config exploratory/site-report.json --output novel_crawler/configs/site.json
 novel-crawler validate-config CONFIG.json
 novel-crawler web [--host 127.0.0.1] [--port 8765]
 ```
 
 远程监听必须显式添加 `--unsafe-remote`。此模式没有登录认证或 TLS，不得直接暴露到公网。
+
+`explore-site` 用于授权目标的新源站探索。它只抓取少量样本页，输出 DOM 候选 selector、样本质量摘要、风险提示和通用配置草案。第三方线上站点仍必须显式添加全局 `--allow-third-party`。
+
+`propose-config` 从探索报告导出 `GenericAdapter` 可读取的 JSON 配置。该步骤不会自动启用配置，也不会生成 Python 专属适配器。遇到章内分页、SPA API、字体混淆或加密字段时，报告会标记 `requires_dedicated_adapter`，需要人工确认后再开发专项适配器。
 
 `inspect`、`wizard` 和旧式 `resume BOOK_ID` 命令保留名称用于迁移提示，但已停用。自动适配现在由后台任务执行，续传使用 `task-resume TASK_ID`。
 

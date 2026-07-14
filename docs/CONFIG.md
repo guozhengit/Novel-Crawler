@@ -2,6 +2,8 @@
 
 生产抓取使用 `SiteConfig` schema v1。配置由探测/重验证流程生成，用户确认后写入私有 `ConfigRegistry`；它不是需要手工提交到仓库的站点脚本。
 
+`explore-site` / `propose-config` 生成的是面向 `GenericAdapter` 的候选 JSON 配置，用于人工审查和本地验证。它和私有 `SiteConfig` revision 不是同一种格式：前者可作为开发资产提交，后者包含结构指纹、salt 和验证样本，只应保存在数据目录的注册表中。
+
 ## 生命周期
 
 ```text
@@ -104,9 +106,9 @@ URL -> dedicated adapter or reuse active revision -> revalidate -> probe static 
 
 ## 旧式配置文件
 
-`novel_crawler/configs/example.json` 和 `example.yaml` 保留为旧书籍管理工具的合成示例。生产后台任务不会自动信任这些文件；自动适配配置必须通过 schema 校验、结构重验证和注册表发布。
+`novel_crawler/configs/example.json` 和 `example.yaml` 保留为合成示例。`propose-config` 也可以把探索报告中的 `proposed_config` 导出到该目录，供 `GenericAdapter` 读取。此类文件必须人工审查，并用 `validate-config` 和小样本抓取验证后再纳入版本控制。
 
-`inspect`、`wizard` CLI 已停用。新站点应直接创建 `crawl` 任务，并通过 `task-confirm` 完成 selector 确认。JavaScript-only 页面、验证码、登录墙和挑战页不会自动升级到浏览器；只有操作者显式使用 `--browser visible` 时才会启动有界面 Chrome。登录墙、付费墙、验证码和 DRM 仍应视为不支持。
+`inspect`、`wizard` CLI 已停用。新站点优先运行 `explore-site` 形成可审计报告，再用 `propose-config` 导出候选通用配置；也可以直接创建 `crawl` 任务，并通过 `task-confirm` 完成 selector 确认。JavaScript-only 页面、验证码、登录墙和挑战页不会自动升级到浏览器；只有操作者显式使用 `--browser visible` 时才会启动有界面 Chrome。登录墙、付费墙、验证码和 DRM 仍应视为不支持。
 
 明确域名的特殊 URL、目录或正文规则应实现为专项 `SiteAdapter`，而不是不断放宽通用 selector。选择标准和测试要求见 [SITE_ADAPTATION.md](SITE_ADAPTATION.md)。
 

@@ -21,6 +21,7 @@ from novel_crawler.core.fetcher import Fetcher
 from novel_crawler.runtime.env import RuntimeContext
 from novel_crawler.sites.bqg import BqgAdapter
 from novel_crawler.sites.router import AdapterRouter
+from novel_crawler.sites.shuyous import ShuyousAdapter
 from novel_crawler.sites.twbook import TwbookAdapter
 from novel_crawler.task_engine import AdaptiveTaskController, BackgroundTaskExecutor, TaskRepository, TaskStatus
 
@@ -52,7 +53,7 @@ def build_application(
         revalidator = ConfigRevalidator(acquirer=cast(Any, http), registry=registry)
         manager = ConfigManager(registry, revalidator, probe)
         router = AdapterRouter(
-            (BqgAdapter(), TwbookAdapter(ctx.project_dir)),
+            (BqgAdapter(), ShuyousAdapter(), TwbookAdapter(ctx.project_dir)),
             Fetcher(acquirer=cast(Any, http)),
         )
         adaptive = StaticAdaptiveService(manager, router)

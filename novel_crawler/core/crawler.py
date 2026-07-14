@@ -28,6 +28,7 @@ from novel_crawler.sites.auto import AutoAdapter
 from novel_crawler.sites.base import AdapterRegistry, SiteAdapter
 from novel_crawler.sites.bqg import BqgAdapter
 from novel_crawler.sites.generic import GenericAdapter
+from novel_crawler.sites.shuyous import ShuyousAdapter
 from novel_crawler.sites.twbook import TwbookAdapter
 
 logger = logging.getLogger(__name__)
@@ -428,7 +429,7 @@ class CrawlerService:
         return path
 
     def _load_adapters(self) -> list[SiteAdapter]:
-        adapters: list[SiteAdapter] = [TwbookAdapter(self.ctx.project_dir), BqgAdapter()]
+        adapters: list[SiteAdapter] = [TwbookAdapter(self.ctx.project_dir), BqgAdapter(), ShuyousAdapter()]
         for a in adapters:
             a.set_fetcher(self.fetcher)
         config_dir = self.ctx.project_dir / "novel_crawler" / "configs"

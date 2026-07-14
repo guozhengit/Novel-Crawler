@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import math
+import os
 import re
 import secrets
 import socket
@@ -21,7 +22,10 @@ from typing import Protocol, cast
 from urllib.parse import urlsplit
 
 from novel_crawler.application import ApplicationError
+from novel_crawler.compliance import ALLOW_THIRD_PARTY_ENV, decide_third_party_access, is_local_or_test_url
 from novel_crawler.core.domains import canonical_domain
+from novel_crawler.easyvoice import EasyVoiceOptions
+from novel_crawler.exploration import explore_site
 
 from .assets import HTML
 
@@ -42,8 +46,10 @@ _INTERACTION_FIELDS = {
 _PROGRESS_FIELDS = {"total", "done", "failed", "pending"}
 _RESULT_FIELDS = {
     "completed", "state", "format", "book_id", "job_id", "cleanup_required",
-    "manual_cleanup_required", "error_code",
+    "manual_cleanup_required", "error_code", "chapters", "incomplete", "returncode",
+    "operation",
 }
+_EXPLORATION_FIELDS = {"completed", "domain", "sample_count", "requires_dedicated_adapter", "warning_codes", "proposed_config"}
 _UNSAFE_TEXT = re.compile(
     r"https?://|(?:password|passwd|token|secret|cookie|authorization)\s*[:=]|"
     r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]|(?<![A-Za-z0-9_])/(?:[^/\s]+/)+[^/\s]+",
@@ -65,6 +71,8 @@ class Application(Protocol):
     def list_books(self) -> list[dict[str, object]]: ...
     def book_report(self, book_id: int) -> str: ...
     def export_book(self, book_id: int, fmt: str = "txt") -> dict[str, object]: ...
+    def export_easyvoice_book(self, book_id: int, output: object = None) -> dict[str, object]: ...
+    def convert_easyvoice_book(self, book_id: int, options: EasyVoiceOptions, **kwargs: object) -> dict[str, object]: ...
     def delete_book(self, book_id: int) -> dict[str, object]: ...
     def close(self) -> bool: ...
 
@@ -278,7 +286,7 @@ class WebHandler(BaseHTTPRequestHandler):
             return self._error("not_found", HTTPStatus.NOT_FOUND)
         if self._session() is None:
             return self._error("session_required", HTTPStatus.UNAUTHORIZED)
-        if re.fullmatch(r"/api/(?:tasks/[^/]+/(?:pause|resume|cancel|continue|confirm|retry-cleanup)|books/\d+/(?:export|delete))", path):
+        if re.fullmatch(r"/api/(?:tasks/[^/]+/(?:pause|resume|cancel|continue|confirm|retry-cleanup)|books/\d+/(?:export|delete|tts-export|tts-convert)|explorations)", path):
             return self._error("method_not_allowed", HTTPStatus.METHOD_NOT_ALLOWED)
         try:
             self._get_api(path)
@@ -346,14 +354,40 @@ class WebHandler(BaseHTTPRequestHandler):
     def _post_api(self, path: str, payload: dict[str, object]) -> None:
         app = self.server.application
         if path == "/api/tasks":
-            _fields(payload, {"url", "options"}, {"url"})
+            _fields(payload, {"url", "options", "allow_third_party"}, {"url"})
             url = payload["url"]
             if not isinstance(url, str):
                 raise _HttpError("request_invalid")
             options = payload.get("options")
             if options is not None and not isinstance(options, dict):
                 raise _HttpError("request_invalid")
-            return self._json(HTTPStatus.ACCEPTED, {"task": _view(app.create_crawl_task(url, options))})
+            allow_third_party = _bool(payload.get("allow_third_party", False))
+            _require_authorized(url, allow_third_party)
+            if allow_third_party:
+                with _temporary_third_party_access():
+                    task = app.create_crawl_task(url, options)
+            else:
+                task = app.create_crawl_task(url, options)
+            return self._json(HTTPStatus.ACCEPTED, {"task": _view(task)})
+        if path == "/api/explorations":
+            _fields(payload, {"url", "sample", "allow_third_party"}, {"url", "allow_third_party"})
+            url = payload["url"]
+            if not isinstance(url, str):
+                raise _HttpError("request_invalid")
+            sample = payload.get("sample", 3)
+            if isinstance(sample, bool) or not isinstance(sample, int) or not 1 <= sample <= 5:
+                raise _HttpError("sample_invalid")
+            _require_authorized(url, _bool(payload.get("allow_third_party")))
+            report = explore_site(url, sample=sample)
+            safe_report = {
+                "completed": True,
+                "domain": report["domain"],
+                "sample_count": report["sample_count"],
+                "requires_dedicated_adapter": report["requires_dedicated_adapter"],
+                "warning_codes": [item["code"] for item in report["warnings"]],
+                "proposed_config": report["proposed_config"],
+            }
+            return self._json(HTTPStatus.OK, _allow_mapping(safe_report, _EXPLORATION_FIELDS))
         task = re.fullmatch(r"/api/tasks/([A-Za-z0-9_-]{1,128})/(pause|resume|cancel|continue|confirm|retry-cleanup)", path)
         if task:
             task_id, action = task.groups()
@@ -374,7 +408,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 }[action]
                 result = operation(task_id)
             return self._json(HTTPStatus.OK, {"task": _view(result)})
-        book = re.fullmatch(r"/api/books/(\d{1,10})/(export|delete)", path)
+        book = re.fullmatch(r"/api/books/(\d{1,10})/(export|delete|tts-export|tts-convert)", path)
         if book:
             book_id, action = _book_id(book.group(1)), book.group(2)
             if action == "export":
@@ -383,6 +417,23 @@ class WebHandler(BaseHTTPRequestHandler):
                 if fmt not in {"txt", "epub", "md", "jsonl"}:
                     raise _HttpError("export_format_invalid")
                 return self._json(HTTPStatus.OK, _allow_mapping(app.export_book(book_id, str(fmt)), _RESULT_FIELDS))
+            if action == "tts-export":
+                _fields(payload, {"allow_third_party"})
+                if _bool(payload.get("allow_third_party", False)):
+                    with _temporary_third_party_access():
+                        result = app.export_easyvoice_book(book_id)
+                else:
+                    result = app.export_easyvoice_book(book_id)
+                return self._json(HTTPStatus.OK, _allow_mapping(result, _RESULT_FIELDS))
+            if action == "tts-convert":
+                _fields(payload, {"allow_third_party", "base_url", "voice", "rate", "pitch", "volume", "use_llm"})
+                options = _easyvoice_options(payload)
+                if _bool(payload.get("allow_third_party", False)):
+                    with _temporary_third_party_access():
+                        result = app.convert_easyvoice_book(book_id, options)
+                else:
+                    result = app.convert_easyvoice_book(book_id, options)
+                return self._json(HTTPStatus.OK, _allow_mapping({**result, "operation": "tts-convert"}, _RESULT_FIELDS))
             _fields(payload, set())
             return self._json(HTTPStatus.OK, _allow_mapping(app.delete_book(book_id), _RESULT_FIELDS))
         raise _HttpError("not_found", HTTPStatus.NOT_FOUND)
@@ -790,6 +841,49 @@ def _selector_overrides(value: object) -> dict[str, str]:
             raise _HttpError("request_invalid")
         result[key] = selector
     return result
+
+
+def _bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise _HttpError("request_invalid")
+    return value
+
+
+def _require_authorized(url: str, allowed: bool) -> None:
+    if is_local_or_test_url(url):
+        return
+    if not allowed:
+        raise _HttpError("third_party_confirmation_required")
+    decision = decide_third_party_access(url)
+    if decision.code != "third_party_crawl_disabled":
+        raise _HttpError(decision.code)
+
+
+class _temporary_third_party_access:
+    def __enter__(self) -> None:
+        self.previous = os.environ.get(ALLOW_THIRD_PARTY_ENV)
+        os.environ[ALLOW_THIRD_PARTY_ENV] = "1"
+
+    def __exit__(self, *_args: object) -> None:
+        previous = getattr(self, "previous", None)
+        if previous is None:
+            os.environ.pop(ALLOW_THIRD_PARTY_ENV, None)
+        else:
+            os.environ[ALLOW_THIRD_PARTY_ENV] = previous
+
+
+def _easyvoice_options(payload: Mapping[str, object]) -> EasyVoiceOptions:
+    values: dict[str, object] = {}
+    for key in ("base_url", "voice", "rate", "pitch", "volume"):
+        value = payload.get(key)
+        if value is not None:
+            if not isinstance(value, str) or not value or len(value) > 300:
+                raise _HttpError("request_invalid")
+            values[key] = value
+    use_llm = payload.get("use_llm")
+    if use_llm is not None:
+        values["use_llm"] = _bool(use_llm)
+    return EasyVoiceOptions(**values)
 
 
 def _book_id(value: str) -> int:

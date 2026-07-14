@@ -64,6 +64,8 @@ class TwbookAdapter(SiteAdapter):
             requested_start + requested_count - 1 if requested_count is not None else None
         )
         discovered = self._follow_next_links(html, url, book_id, discovery_limit)
+        if requested_count is not None and requested_count >= 50 and len(discovered) < requested_count:
+            return self._sequential_chapters(book_id, requested_start, requested_count, url)
         return self._select_range(discovered, requested_start, requested_count)
 
     def parse_chapter(self, html: str, url: str) -> tuple[str, str]:
@@ -147,6 +149,20 @@ class TwbookAdapter(SiteAdapter):
     def _select_range(chapters: list[Chapter], start: int, count: int | None) -> list[Chapter]:
         selected = [chapter for chapter in chapters if chapter.index >= start]
         return selected if count is None else selected[:count]
+
+    @staticmethod
+    def _sequential_chapters(book_id: str, start: int, count: int, url: str) -> list[Chapter]:
+        parts = urlsplit(url)
+        host = parts.netloc or "www.twbook.cc"
+        scheme = parts.scheme or "https"
+        return [
+            Chapter(
+                index=number,
+                title=f"第{number}章",
+                url=f"{scheme}://{host}/{book_id}/{number}.html",
+            )
+            for number in range(start, start + count)
+        ]
 
     @staticmethod
     def _chapter_number(url: str | None, book_id: str) -> int | None:

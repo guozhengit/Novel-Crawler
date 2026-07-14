@@ -86,7 +86,19 @@ python -m pytest tests/test_distribution.py -v
 
 ### 新站点
 
-先按 [SITE_ADAPTATION.md](SITE_ADAPTATION.md) 判断适配类型。真实站点不确定时，先按 [EXPLORATORY_CRAWLING.md](EXPLORATORY_CRAWLING.md) 形成探索报告，明确是结构差异、JS 渲染、API 加密、URL 身份冲突，还是 WAF/验证码/登录墙。稳定的域名特殊规则实现为专项 `SiteAdapter`；常见静态结构优先扩展探测器、评分规则或 `SiteConfigAdapter`。两者都必须复用 acquisition security、任务 checkpoint 和隐私 DTO，不得增加浏览器 fallback。
+先按 [SITE_ADAPTATION.md](SITE_ADAPTATION.md) 判断适配类型。真实站点不确定时，优先使用 `explore-site` 生成结构化报告，再用 `propose-config` 导出候选通用配置：
+
+```bash
+novel-crawler --allow-third-party explore-site "https://example.org/book/1.html" \
+  --sample 3 \
+  --output exploratory/example-report.json
+novel-crawler propose-config exploratory/example-report.json \
+  --output novel_crawler/configs/example.json
+```
+
+报告应明确是结构差异、章内分页、JS 渲染、API 加密、URL 身份冲突，还是 WAF/验证码/登录墙。常见静态结构优先改进探索器、评分规则、`GenericAdapter` 配置或 `SiteConfigAdapter`；稳定的域名特殊规则实现为专项 `SiteAdapter`。
+
+新增专项适配器必须提供本地合成 fixture，至少覆盖目录抽取、范围截取、正文清洗、空正文、重复正文和结构漂移；如果站点有章内分页，还要覆盖分页合并。真实站点只做手动验收，不能进入 CI fixture。所有路径都必须复用 acquisition security、任务 checkpoint 和隐私 DTO，不得增加浏览器 fallback。
 
 ### 新导出格式
 

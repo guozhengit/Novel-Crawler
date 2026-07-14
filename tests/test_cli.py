@@ -170,7 +170,7 @@ def test_help_is_utf8_and_parser_preserves_legacy_plus_task_commands(capsys) -> 
         "progress", "validate", "logs", "report", "retry-failed", "export",
         "tts-export", "tts-convert",
         "decode-font", "web", "fix-titles", "dedup", "export-all", "retry-all",
-        "crawl-batch", "preview", "stats", "validate-config",
+        "crawl-batch", "preview", "stats", "validate-config", "explore-site", "propose-config",
     }
     task_commands = {
         "tasks", "task", "task-events", "task-pause", "task-resume",
@@ -193,6 +193,23 @@ def test_env_does_not_construct_application(tmp_path, capsys) -> None:
 
     assert main(["env"], project_dir=tmp_path, application_factory=forbidden) == 0
     assert "Runtime:" in capsys.readouterr().out
+
+
+def test_propose_config_does_not_construct_application(tmp_path, capsys) -> None:
+    report = tmp_path / "report.json"
+    output = tmp_path / "site.json"
+    report.write_text(
+        json.dumps({"proposed_config": {"site": "demo", "domain": ["example.test"]}}),
+        encoding="utf-8",
+    )
+
+    def forbidden(_ctx):
+        raise AssertionError("propose-config must not construct the application")
+
+    assert main(["propose-config", str(report), "--output", str(output)], project_dir=tmp_path, application_factory=forbidden) == 0
+    payload = output_json(capsys)
+    assert payload["completed"] is True
+    assert output.is_file()
 
 
 def test_crawl_detaches_and_prints_safe_task_json(tmp_path, capsys) -> None:

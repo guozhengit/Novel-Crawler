@@ -8,6 +8,14 @@ Novel Crawler 默认禁用第三方线上站点抓取。默认允许的目标仅
 novel-crawler --allow-third-party crawl "https://example.org/books/demo"
 ```
 
+探索、导出和 TTS 转换也遵守同一开关：
+
+```bash
+novel-crawler --allow-third-party explore-site "https://example.org/books/demo"
+novel-crawler --allow-third-party tts-export 1
+novel-crawler --allow-third-party tts-convert 1
+```
+
 或仅对当前进程设置环境变量：
 
 ```bash

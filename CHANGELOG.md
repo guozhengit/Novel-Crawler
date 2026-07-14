@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Default-disabled third-party access gate with `--allow-third-party` and compliance disclaimer.
+- EasyVoice export and chapter-level TTS conversion workflow.
+- AI-ready `explore-site` reports and `propose-config` generic config export for authorized new sources.
+- Dedicated `shuyous.com` adapter with chapter pagination merging and fixture tests.
+
+### Changed
+
+- Site adaptation docs now use the report -> candidate config -> human confirmation workflow.
+- Third-party book content export and TTS conversion are checked against the compliance gate.
+
 ## [0.2.0] - 2026-07-12
 
 ### Added

@@ -69,6 +69,12 @@ class FakeApplication:
     def export_book(self, book_id, fmt="txt"):
         self._call("export", book_id, fmt)
         return {"completed": True, "format": fmt}
+    def export_easyvoice_book(self, book_id, output=None):
+        self._call("tts-export", book_id, output)
+        return {"completed": True, "book_id": book_id, "chapters": 2, "export_path": "/private/book.json"}
+    def convert_easyvoice_book(self, book_id, options, **kwargs):
+        self._call("tts-convert", book_id, options, kwargs)
+        return {"completed": True, "book_id": book_id, "returncode": 0, "manifest_path": "/private/manifest.json"}
     def delete_book(self, book_id):
         self._call("delete", book_id)
         return {"state": "completed", "completed": True}
@@ -175,6 +181,7 @@ def test_root_creates_hardened_session_and_safe_dom_ui(web_app) -> None:
     assert "小说抓取任务" in page
     assert all(label in page for label in ("继续验证", "确认配置", "重试清理", "safe_origin"))
     assert all(label in page for label in ("确认删除", "取消删除", "书籍已删除", "导出已完成"))
+    assert all(label in page for label in ("合规确认", "新源站探索", "EasyVoice JSON", "转换语音"))
 
 
 def test_host_session_origin_and_csrf_are_strict(web_app) -> None:
@@ -206,6 +213,76 @@ def test_task_endpoints_use_application_service_and_only_post_mutates(web_app) -
     assert client.post("/api/tasks/task-1/confirm", {"selector_overrides": {"content": "article"}})[0] == 200
     assert client.request("GET", "/api/tasks/task-1/pause")[0] == 405
     assert ("create", ("https://example.test/book", {"export": False})) in app.calls
+
+
+def test_third_party_task_creation_requires_explicit_web_confirmation(web_app) -> None:
+    app, _, client = web_app
+    client.login()
+
+    status, _, payload = decoded(client.post("/api/tasks", {"url": "https://www.qidian.com/chapter/1/2/"}))
+    assert status == 400
+    assert payload["error"]["code"] == "third_party_confirmation_required"
+
+    status, _, created = decoded(
+        client.post(
+            "/api/tasks",
+            {"url": "https://www.qidian.com/chapter/1/2/", "allow_third_party": True},
+        )
+    )
+    assert status == 202 and created["task"]["task_id"] == "task-1"
+    assert app.calls[-1][0] == "create"
+
+
+def test_exploration_endpoint_returns_safe_summary_and_candidate_config(web_app, monkeypatch) -> None:
+    _, _, client = web_app
+    client.login()
+
+    monkeypatch.setattr(
+        web_server,
+        "explore_site",
+        lambda url, sample: {
+            "domain": "example.test",
+            "sample_count": sample,
+            "requires_dedicated_adapter": False,
+            "warnings": [{"code": "content_short"}],
+            "proposed_config": {
+                "site": "example",
+                "domain": ["example.test"],
+                "book": {"chapter_list_selector": ".chapters a"},
+            },
+        },
+    )
+
+    status, _, payload = decoded(
+        client.post(
+            "/api/explorations",
+            {"url": "https://example.test/book/1.html", "sample": 2, "allow_third_party": False},
+        )
+    )
+
+    assert status == 200
+    assert payload["domain"] == "example.test"
+    assert payload["warning_codes"] == ["content_short"]
+    assert payload["proposed_config"]["book"]["chapter_list_selector"] == ".chapters a"
+
+
+def test_tts_endpoints_are_available_and_redact_paths(web_app) -> None:
+    app, _, client = web_app
+    client.login()
+
+    status, _, exported = decoded(client.post("/api/books/1/tts-export", {"allow_third_party": True}))
+    assert status == 200
+    assert exported == {"book_id": 1, "chapters": 2, "completed": True}
+
+    status, _, converted = decoded(
+        client.post(
+            "/api/books/1/tts-convert",
+            {"allow_third_party": True, "base_url": "http://localhost:9549", "voice": "zh-CN-YunxiNeural"},
+        )
+    )
+    assert status == 200
+    assert converted == {"book_id": 1, "completed": True, "operation": "tts-convert", "returncode": 0}
+    assert app.calls[-1][0] == "tts-convert"
 
 
 def test_json_contract_rejects_type_size_and_unknown_fields(web_app) -> None:

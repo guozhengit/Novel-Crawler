@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from novel_crawler.application import ApplicationError, CrawlOptions, build_application
-from novel_crawler.compliance import ALLOW_THIRD_PARTY_ENV, DISCLAIMER
+from novel_crawler.compliance import ALLOW_THIRD_PARTY_ENV, DISCLAIMER, decide_third_party_access
 from novel_crawler.easyvoice import EasyVoiceOptions
+from novel_crawler.exploration import explore_site, propose_config_from_report, write_report
 from novel_crawler.runtime.env import RuntimeContext, create_runtime_context, format_runtime_report
 from novel_crawler.task_engine import TaskStatus
 
@@ -197,6 +198,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stats", help="显示全局下载统计")
     validate_config = sub.add_parser("validate-config", help="校验站点配置文件")
     validate_config.add_argument("config", type=Path)
+    explore_site_cmd = sub.add_parser("explore-site", help="探索新源站并生成候选配置报告")
+    explore_site_cmd.add_argument("url")
+    explore_site_cmd.add_argument("--sample", type=int, default=3, help="样本章节数量，1 到 5")
+    explore_site_cmd.add_argument("--output", type=Path, default=None, help="探索报告 JSON 输出路径")
+    propose_config = sub.add_parser("propose-config", help="从探索报告导出通用站点配置")
+    propose_config.add_argument("report", type=Path)
+    propose_config.add_argument("--output", type=Path, required=True, help="候选配置 JSON 输出路径")
     return parser
 
 
@@ -219,6 +227,22 @@ def main(
             return 0
         if args.command == "decode-font":
             return _decode_font(ctx, args)
+        if args.command == "explore-site":
+            try:
+                return _explore_site(args)
+            except ApplicationError as exc:
+                return _application_error(exc)
+            except Exception:
+                print("探索失败（code=exploration_failed）。", file=sys.stderr)
+                return 3
+        if args.command == "propose-config":
+            try:
+                output = propose_config_from_report(args.report, args.output)
+            except Exception:
+                print("候选配置生成失败（code=propose_config_failed）。", file=sys.stderr)
+                return 3
+            _print_json({"completed": True, "output": str(output)})
+            return 0
         app: _Application | None = None
         result = 3
         try:
@@ -379,6 +403,29 @@ def _dispatch_book_command(app: _Application, args: argparse.Namespace) -> int:
             value = result.get(field, 0)
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 return 6
+    return 0
+
+
+def _explore_site(args: argparse.Namespace) -> int:
+    decision = decide_third_party_access(args.url)
+    if not decision.allowed:
+        raise ApplicationError(decision.code)
+    if isinstance(args.sample, bool) or not 1 <= args.sample <= 5:
+        print("样本数量必须在 1 到 5 之间（code=sample_invalid）。", file=sys.stderr)
+        return 2
+    output = args.output or Path("exploratory") / "site-report.json"
+    report = explore_site(args.url, sample=args.sample)
+    path = write_report(report, output)
+    _print_json(
+        {
+            "completed": True,
+            "output": str(path),
+            "domain": report["domain"],
+            "sample_count": report["sample_count"],
+            "requires_dedicated_adapter": report["requires_dedicated_adapter"],
+            "warning_codes": [item["code"] for item in report["warnings"]],
+        }
+    )
     return 0
 
 

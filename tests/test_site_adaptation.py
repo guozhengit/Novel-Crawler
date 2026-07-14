@@ -49,6 +49,22 @@ def test_twbook_follows_real_next_links_and_stops_at_last_chapter(tmp_path: Path
     assert chapters[-1].url == "https://www.twbook.cc/123/7.html"
 
 
+def test_twbook_generates_large_explicit_sequential_ranges(tmp_path: Path) -> None:
+    adapter = TwbookAdapter(tmp_path)
+
+    chapters = adapter.get_chapter_list(
+        chapter_page(200, next_number=201),
+        "https://www.twbook.cc/123/200.html",
+        start=200,
+        count=120,
+    )
+
+    assert len(chapters) == 120
+    assert chapters[0].url == "https://www.twbook.cc/123/200.html"
+    assert chapters[-1].index == 319
+    assert chapters[-1].url == "https://www.twbook.cc/123/319.html"
+
+
 def test_adapter_router_prefers_exact_dedicated_domain(tmp_path: Path) -> None:
     twbook = TwbookAdapter(tmp_path)
     router = AdapterRouter((twbook,))

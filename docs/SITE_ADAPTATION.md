@@ -45,6 +45,34 @@
 
 需要使用真实站点样本判断阻断原因、浏览器渲染、network API 或验证码时，先按 [EXPLORATORY_CRAWLING.md](EXPLORATORY_CRAWLING.md) 生成探索报告。探索失败也应记录为有效结果，不得直接把 WAF、验证码或登录墙问题改写成 selector 适配问题。
 
+## AI-ready 探索工作流
+
+当前系统支持“自动探索 -> 候选配置 -> 人工确认”的最小闭环，后续可把候选排序和解释层替换为 LLM，但正式启用仍必须经过测试和确认。
+
+```bash
+novel-crawler --allow-third-party explore-site "https://example.org/book/1.html" \
+  --sample 3 \
+  --output exploratory/example-site-report.json
+
+novel-crawler propose-config exploratory/example-site-report.json \
+  --output novel_crawler/configs/example-site.json
+
+novel-crawler validate-config novel_crawler/configs/example-site.json
+```
+
+`explore-site` 只输出结构化报告：候选 selector、样本数量、正文长度、段落数、风险提示和 `proposed_config`。它不会写入注册表，不会修改源码，也不会自动启用配置。
+
+`propose-config` 只把报告里的 `proposed_config` 导出为 `GenericAdapter` 可读取的 JSON。人工确认后，才可把配置纳入版本控制或放入运行时配置目录。
+
+报告中 `requires_dedicated_adapter=true` 表示通用配置不足以安全表达该站点逻辑，常见原因包括：
+
+- 一章多分页，需要合并多个页面为同一章。
+- 目录或正文来自 SPA/API。
+- 字体混淆、加密字段或非 HTML 数据源。
+- 章节 URL 规则需要额外校验，不能只靠 selector。
+
+这些情况应新增 `novel_crawler/sites/*.py` 专项适配器和本地 fixture 测试。AI 可以辅助生成 patch，但不能绕过 Ruff、单元测试、小样本验收和人工确认。
+
 ## 选择哪种方式
 
 | 情况 | 方式 |

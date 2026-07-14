@@ -99,6 +99,14 @@ curl http://localhost:9549/api/health
 novel-crawler --data-dir twbook-visible-test tts-export 1
 ```
 
+如果书籍来源是第三方线上站点，导出和转换前仍需显式开启合规开关：
+
+```bash
+novel-crawler --allow-third-party --data-dir shuyous-tts-explore tts-export 1
+novel-crawler --allow-third-party --data-dir shuyous-tts-explore tts-convert 1 \
+  --base-url http://localhost:9549
+```
+
 也可以显式指定路径：
 
 ```bash
@@ -124,6 +132,10 @@ novel-crawler --data-dir twbook-visible-test tts-convert 1 \
 ```
 
 `--assemble` 会额外生成整本 MP3、M4B 和总 SRT。不需要整本文件时可以删除该参数。
+
+如果当前运行环境限制 Python 进程访问本机网络，但允许 `curl`，可直接运行
+`integrations/easyvoice/novel_tts_pipeline.py` 并为该进程放开本机 EasyVoice 访问；输出目录仍应放在
+EasyVoice 容器挂载目录下，以便容器内 `ffprobe` 能读取生成的音频。
 
 ## 五、爬虫也运行在 Docker 中
 

@@ -11,8 +11,10 @@ Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工
 - 后台任务状态机：暂停、恢复、取消、失败重试和崩溃恢复
 - SQLite CAS、checkpoint、章节 claim、幂等正文写入和安全删除
 - 专项站点适配与通用静态探索双路径
+- AI-ready 新源站探索报告与候选配置导出
 - 显式 `--browser visible` 有界面 Chrome 抓取模式
 - TXT、EPUB、Markdown 和 JSONL 导出
+- EasyVoice 分章 TTS 交换 JSON 与音频转换流水线
 - 本机安全 Web 控制台与稳定 JSON CLI 输出
 - URL、路径、正文、Cookie 和验证令牌默认不进入公开 DTO 或错误消息
 
@@ -42,6 +44,16 @@ novel-crawler crawl "https://example.test/books/demo"
 
 ```bash
 novel-crawler --allow-third-party crawl "https://example.org/books/demo"
+```
+
+未知源站先生成探索报告和候选配置，不直接写专属适配器：
+
+```bash
+novel-crawler --allow-third-party explore-site "https://example.org/books/demo" \
+  --sample 3 \
+  --output exploratory/example-report.json
+novel-crawler propose-config exploratory/example-report.json \
+  --output novel_crawler/configs/example.json
 ```
 
 等待任务结束，或等待进入人工验证状态：
@@ -75,6 +87,7 @@ novel-crawler web
 ```
 
 默认只监听 `127.0.0.1:8765`。`--unsafe-remote` 没有身份认证或 TLS，不能直接暴露到公网。
+页面提供合规确认、新建抓取任务、新源站探索、书籍导出、EasyVoice JSON 导出和 EasyVoice 语音转换入口。
 
 ## 任务状态
 
@@ -119,6 +132,7 @@ docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://examp
 - HTTP 连接使用已批准 IP，TLS SNI/证书仍绑定原始主机名。
 - Web 修改接口只接受同源、带 CSRF 的 JSON `POST`。
 - JavaScript、验证码、登录墙或挑战页不会触发自动浏览器 fallback；只有用户显式指定 `--browser visible` 时才启动有界面 Chrome。验证码、登录墙、付费墙或 DRM 仍不属于绕过范围。
+- `explore-site` 和 `propose-config` 只生成可审计报告与候选通用配置；不会自动启用配置、不会自动写 Python 专属适配器。
 
 安全问题请参阅 [SECURITY.md](SECURITY.md)。抓取前请确认目标网站条款、robots 规则和内容许可；本项目不授予复制或再分发第三方内容的权利。
 合规开关和完整免责声明见 [COMPLIANCE.md](COMPLIANCE.md)。
@@ -131,6 +145,7 @@ docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://examp
 - [系统架构](docs/ARCHITECTURE.md)
 - [自动适配配置](docs/CONFIG.md)
 - [站点适配指南](docs/SITE_ADAPTATION.md)
+- [EasyVoice 接入](docs/easyvoice/README.md)
 - [配置注册表](docs/REGISTRY.md)
 - [开发与测试](docs/DEVELOPMENT.md)
 - [隐私与本地数据](PRIVACY.md)
