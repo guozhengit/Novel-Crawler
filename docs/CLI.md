@@ -17,11 +17,15 @@ CLI 只通过 `ApplicationService` 访问任务与书籍；标准输出为稳定
 ```bash
 novel-crawler crawl URL \
   [--start N] [--count N] [--max-chapters N] \
-  [--no-export] [--wait] [--poll-interval SECONDS] [--timeout SECONDS]
+  [--no-export] [--browser http|visible] \
+  [--wait] [--poll-interval SECONDS] [--timeout SECONDS] \
+  [--concurrency 1] [--chase] [--proxy-file PATH]
 ```
 
 命令创建后台任务并立即返回安全任务视图。`--wait` 会轮询到终态、人工操作、暂停或可恢复失败。任务范围会被写入持久化 crawl plan；恢复时不会抓取同一本书范围之外的历史章节。
 第三方线上站点会被默认拒绝并返回 `third_party_crawl_disabled`；本机、私有网络和测试/文档域名不需要该开关。
+
+`--browser` 默认为 `http`。只有在用户本机 Chrome 可访问公开页面、且确实需要真实浏览器渲染时，才使用 `--browser visible`。该模式会使用有界面 Chrome，不会绕过登录、付费墙、验证码或 DRM。
 
 当前限制：
 
@@ -94,6 +98,22 @@ novel-crawler crawl-batch urls.txt [--max-chapters N]
 文件最大 1 MiB、最多 1000 个 URL，不跟随符号链接。部分成功时 JSON 会返回 `created`、`submitted`、`failed`、`not_started`、稳定 `error_code` 和已创建任务 ID，进程返回非零退出码。
 
 `export-all` 和 `retry-all` 是有界 best-effort 操作，会返回 `requested`、`attempted`、`succeeded`、`failed`、`remaining` 和安全错误码。
+
+EasyVoice：
+
+```bash
+novel-crawler tts-export BOOK_ID [--output book.json]
+novel-crawler tts-convert BOOK_ID \
+  [--export-path book.json] [--output-dir audio-dir] \
+  [--base-url http://localhost:9549] \
+  [--voice VOICE] [--rate +0%] [--pitch +0Hz] [--volume +0%] \
+  [--use-llm] [--poll-interval SECONDS] [--task-timeout SECONDS] \
+  [--retries N] [--assemble] \
+  [--media-container NAME] [--media-host-root PATH] [--media-container-root PATH] \
+  [--pipeline integrations/easyvoice/novel_tts_pipeline.py]
+```
+
+`tts-export` 导出 EasyVoice 交换 JSON。`tts-convert` 会先确保交换文件存在，再调用 EasyVoice pipeline；返回码沿用 pipeline 结果，`0` 表示完成，`2` 表示 manifest 已生成但仍有未完成章节。第三方来源书籍仍必须显式开启全局 `--allow-third-party`。
 
 ## 运行与工具
 

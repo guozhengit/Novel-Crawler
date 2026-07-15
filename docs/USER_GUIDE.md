@@ -364,6 +364,14 @@ novel-crawler web
 - 合规确认复选框：第三方线上抓取、探索和 TTS 前必须显式勾选。
 - 新源站探索：输入 URL 和样本数量，生成报告摘要与候选通用配置 JSON。
 - EasyVoice 操作：对已抓取书籍导出 EasyVoice JSON 或提交 TTS 转换。
+- 语音转换进度：轮询 EasyVoice 输出目录，显示分组完成数、当前分组、当前阶段和最近分组摘要。
+
+如果要查看指定 EasyVoice 输出目录，启动前设置：
+
+```bash
+NOVEL_CRAWLER_TTS_PROGRESS_ROOT=/Users/admin/docker-data/easyVoice/twbook-100786922-200-2021/novel-audio \
+  novel-crawler web
+```
 
 Web 端不会自动保存候选配置文件，也不会自动生成 Python 专项适配器。需要把候选配置纳入项目时，仍应通过 CLI `propose-config` 或人工复制后进行代码审查。
 

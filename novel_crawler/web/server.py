@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Protocol, cast
 from urllib.parse import urlsplit
 
@@ -50,6 +51,9 @@ _RESULT_FIELDS = {
     "operation",
 }
 _EXPLORATION_FIELDS = {"completed", "domain", "sample_count", "requires_dedicated_adapter", "warning_codes", "proposed_config"}
+_TTS_PROGRESS_ROOT_ENV = "NOVEL_CRAWLER_TTS_PROGRESS_ROOT"
+_DEFAULT_TTS_PROGRESS_ROOT = Path("/Users/admin/docker-data/easyVoice")
+_TTS_GROUP = re.compile(r"^[A-Za-z0-9_-]+-\d{4}-\d{4}$")
 _UNSAFE_TEXT = re.compile(
     r"https?://|(?:password|passwd|token|secret|cookie|authorization)\s*[:=]|"
     r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]|(?<![A-Za-z0-9_])/(?:[^/\s]+/)+[^/\s]+",
@@ -142,6 +146,7 @@ class _SessionCodec:
 
 class WebServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 64
 
     def __init__(
         self,
@@ -349,6 +354,8 @@ class WebHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/books/(\d{1,10})/report", path)
         if match:
             return self._json(HTTPStatus.OK, {"report": _safe_text(app.book_report(_book_id(match.group(1))), 32_768)})
+        if path == "/api/tts/progress":
+            return self._json(HTTPStatus.OK, {"conversions": _tts_progress()})
         self._error("not_found", HTTPStatus.NOT_FOUND)
 
     def _post_api(self, path: str, payload: dict[str, object]) -> None:
@@ -819,6 +826,173 @@ def _safe_text(value: str, maximum: int) -> str:
 def _book(value: Mapping[str, object]) -> dict[str, object]:
     allowed = {"id", "title", "author", "site", "total", "done", "failed", "pending"}
     return _safe_mapping({key: item for key, item in value.items() if key in allowed})
+
+
+def _tts_progress() -> list[dict[str, object]]:
+    root = _tts_progress_root()
+    if root is None or not root.is_dir():
+        return []
+    output_roots = _tts_output_roots(root)
+    return [_tts_output_progress(output) for output in output_roots[:20]]
+
+
+def _tts_progress_root() -> Path | None:
+    configured = os.environ.get(_TTS_PROGRESS_ROOT_ENV)
+    root = Path(configured).expanduser() if configured else _DEFAULT_TTS_PROGRESS_ROOT
+    try:
+        resolved = root.resolve()
+    except OSError:
+        return None
+    if len(str(resolved)) > 512:
+        return None
+    return resolved
+
+
+def _tts_output_roots(root: Path) -> list[Path]:
+    candidates: set[Path] = set()
+    if _looks_like_tts_output(root):
+        candidates.add(root)
+    try:
+        for child in root.iterdir():
+            if child.is_dir():
+                if _looks_like_tts_output(child):
+                    candidates.add(child)
+                for grandchild in list(child.iterdir())[:200]:
+                    if grandchild.is_dir() and _looks_like_tts_output(grandchild):
+                        candidates.add(grandchild)
+    except OSError:
+        pass
+    return sorted(candidates, key=lambda path: _latest_mtime(path), reverse=True)
+
+
+def _looks_like_tts_output(path: Path) -> bool:
+    if (path / "tts-jobs.sqlite3").is_file():
+        return True
+    try:
+        return any(child.is_dir() and _TTS_GROUP.fullmatch(child.name) for child in list(path.iterdir())[:200])
+    except OSError:
+        return False
+
+
+def _tts_output_progress(output: Path) -> dict[str, object]:
+    groups = [_tts_group_progress(group) for group in _tts_group_dirs(output)]
+    completed = sum(1 for group in groups if group["status"] == "completed")
+    failed = sum(1 for group in groups if group["status"] == "failed")
+    active = next((group for group in groups if group["status"] == "running"), None)
+    current = active or next((group for group in groups if group["status"] not in {"completed", "empty"}), None)
+    return {
+        "id": _safe_tts_name(output.name),
+        "total_groups": len(groups),
+        "completed_groups": completed,
+        "failed_groups": failed,
+        "running": active is not None,
+        "current_group": current["group"] if current else None,
+        "current_phase": current["phase"] if current else "idle",
+        "groups": groups[:50],
+    }
+
+
+def _tts_group_dirs(output: Path) -> list[Path]:
+    try:
+        groups = [child for child in output.iterdir() if child.is_dir() and _TTS_GROUP.fullmatch(child.name)]
+    except OSError:
+        return []
+    return sorted(groups, key=lambda path: path.name)
+
+
+def _tts_group_progress(group: Path) -> dict[str, object]:
+    manifest = _read_json(group / "manifest.json")
+    chapters = group / "chapters"
+    assembled = group / "assembled"
+    chapter_mp3 = _count_files(chapters, "*.mp3")
+    chapter_srt = _count_files(chapters, "*.srt")
+    assembled_mp3 = assembled / f"{group.name}.mp3"
+    assembled_srt = assembled / f"{group.name}.srt"
+    assembled_m4b = assembled / f"{group.name}.m4b"
+    has_mp3 = assembled_mp3.is_file()
+    has_srt = assembled_srt.is_file()
+    has_m4b = assembled_m4b.is_file()
+    manifest_completed = isinstance(manifest, Mapping) and manifest.get("status") == "COMPLETED"
+    manifest_assembled = isinstance(manifest, Mapping) and isinstance(manifest.get("assembled"), Mapping)
+    recent_m4b = has_m4b and time.time() - _safe_mtime(assembled_m4b) < 180
+    if manifest_assembled:
+        status, phase = "completed", "completed"
+    elif recent_m4b:
+        status, phase = "running", "m4b_transcoding"
+    elif has_mp3 and has_srt and has_m4b:
+        status, phase = "completed", "completed"
+    elif has_mp3 and has_srt and not has_m4b:
+        status, phase = "running", "m4b_pending"
+    elif has_mp3 and chapter_mp3 >= 1:
+        status, phase = "running", "assembling"
+    elif chapter_mp3 >= 1:
+        status, phase = "running", "chapters"
+    elif manifest_completed and has_mp3 and has_m4b:
+        status, phase = "completed", "completed"
+    else:
+        status, phase = "empty", "pending"
+    if _group_has_error(group):
+        status, phase = "failed", "failed"
+    return {
+        "group": _safe_tts_name(group.name),
+        "status": status,
+        "phase": phase,
+        "chapter_mp3": chapter_mp3,
+        "chapter_srt": chapter_srt,
+        "assembled": {"mp3": has_mp3, "srt": has_srt, "m4b": has_m4b, "m4b_size": _safe_size(assembled_m4b)},
+        "updated_at": int(_latest_mtime(group)),
+    }
+
+
+def _read_json(path: Path) -> object | None:
+    try:
+        if not path.is_file() or path.stat().st_size > 2_000_000:
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def _count_files(path: Path, pattern: str) -> int:
+    try:
+        return sum(1 for item in path.glob(pattern) if item.is_file())
+    except OSError:
+        return 0
+
+
+def _safe_size(path: Path) -> int:
+    try:
+        return path.stat().st_size if path.is_file() else 0
+    except OSError:
+        return 0
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _latest_mtime(path: Path) -> float:
+    latest = _safe_mtime(path)
+    try:
+        for child in path.iterdir():
+            latest = max(latest, _safe_mtime(child))
+    except OSError:
+        pass
+    return latest
+
+
+def _group_has_error(group: Path) -> bool:
+    manifest = _read_json(group / "manifest.json")
+    if isinstance(manifest, Mapping) and manifest.get("status") == "INCOMPLETE":
+        return True
+    return False
+
+
+def _safe_tts_name(value: str) -> str:
+    return value if re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value) else "redacted"
 
 
 def _fields(value: Mapping[str, object], allowed: set[str], required: set[str] | None = None) -> None:

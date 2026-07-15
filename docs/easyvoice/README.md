@@ -243,7 +243,19 @@ tts_updated_at
 - 正文或语音参数变化会产生新的任务版本。
 - 当前 Worker 串行处理章节，适合优先保证稳定性；不要同时对同一个 SQLite 文件启动多个进程。
 
-## 九、接入验收清单
+## 九、批量转换和 Web 进度
+
+长篇小说按章节范围拆分后，建议使用 [EasyVoice 批量转换操作手册](./OPERATIONS.md) 交付。
+Web 控制台提供“语音转换进度”面板，会轮询 `/api/tts/progress`，显示分组完成数、当前阶段和
+assembled 文件状态。默认扫描 `/Users/admin/docker-data/easyVoice`，生产或长任务场景建议用
+`NOVEL_CRAWLER_TTS_PROGRESS_ROOT` 指向具体输出目录，减少扫描范围：
+
+```bash
+NOVEL_CRAWLER_TTS_PROGRESS_ROOT=/Users/admin/docker-data/easyVoice/twbook-100786922-200-2021/novel-audio \
+  novel-crawler web
+```
+
+## 十、接入验收清单
 
 - [ ] 爬虫输出通过 JSON Schema 校验。
 - [ ] `book.id` 和 `chapter.id` 在重复抓取时保持不变。

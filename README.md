@@ -2,7 +2,7 @@
 
 Novel Crawler 是一个可解释、可恢复、面向多站点的小说抓取工具。生产抓取默认使用受控静态 HTTP；需要处理 Cloudflare 或必须由真实浏览器渲染的公开页面时，可显式使用 `--browser visible` 启动有界面 Chrome。工具不使用无头浏览器，也不尝试绕过验证码、登录墙、付费墙或访问控制。已知站点使用专项适配器，未知站点进入有预算的通用探索流程；无法可靠确认的配置会暂停任务，等待用户修正 selector 或提供可访问入口。
 
-当前版本：**0.2.0**。支持 Python 3.11、3.12 和 3.13。
+当前包版本：**0.2.0**。当前源码还包含 [CHANGELOG](CHANGELOG.md) `Unreleased` 中的后续功能。支持 Python 3.11、3.12 和 3.13。
 
 ## 主要能力
 
@@ -146,6 +146,7 @@ docker run --rm -v novel-data:/app/data novel-crawler:0.2.0 crawl "https://examp
 - [自动适配配置](docs/CONFIG.md)
 - [站点适配指南](docs/SITE_ADAPTATION.md)
 - [EasyVoice 接入](docs/easyvoice/README.md)
+- [EasyVoice 批量转换操作手册](docs/easyvoice/OPERATIONS.md)
 - [配置注册表](docs/REGISTRY.md)
 - [开发与测试](docs/DEVELOPMENT.md)
 - [隐私与本地数据](PRIVACY.md)

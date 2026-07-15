@@ -8,6 +8,7 @@ All notable changes to this project are documented here.
 
 - Default-disabled third-party access gate with `--allow-third-party` and compliance disclaimer.
 - EasyVoice export and chapter-level TTS conversion workflow.
+- Web progress endpoint and console panel for EasyVoice batch conversion groups.
 - AI-ready `explore-site` reports and `propose-config` generic config export for authorized new sources.
 - Dedicated `shuyous.com` adapter with chapter pagination merging and fixture tests.
 

@@ -182,6 +182,7 @@ def test_root_creates_hardened_session_and_safe_dom_ui(web_app) -> None:
     assert all(label in page for label in ("继续验证", "确认配置", "重试清理", "safe_origin"))
     assert all(label in page for label in ("确认删除", "取消删除", "书籍已删除", "导出已完成"))
     assert all(label in page for label in ("合规确认", "新源站探索", "EasyVoice JSON", "转换语音"))
+    assert all(label in page for label in ("语音转换进度", "loadTtsProgress", "/tts/progress"))
 
 
 def test_host_session_origin_and_csrf_are_strict(web_app) -> None:
@@ -283,6 +284,38 @@ def test_tts_endpoints_are_available_and_redact_paths(web_app) -> None:
     assert status == 200
     assert converted == {"book_id": 1, "completed": True, "operation": "tts-convert", "returncode": 0}
     assert app.calls[-1][0] == "tts-convert"
+
+
+def test_tts_progress_endpoint_summarizes_outputs_without_paths(web_app, tmp_path, monkeypatch) -> None:
+    _, _, client = web_app
+    output = tmp_path / "novel-audio"
+    done = output / "twbook-100786922-0200-0299"
+    running = output / "twbook-100786922-0300-0399"
+    (done / "assembled").mkdir(parents=True)
+    (running / "assembled").mkdir(parents=True)
+    (running / "chapters").mkdir(parents=True)
+    (done / "manifest.json").write_text(
+        json.dumps({"status": "COMPLETED", "assembled": {"mp3": "private"}}),
+        encoding="utf-8",
+    )
+    (done / "assembled" / "twbook-100786922-0200-0299.mp3").write_bytes(b"x")
+    (done / "assembled" / "twbook-100786922-0200-0299.srt").write_bytes(b"x")
+    (done / "assembled" / "twbook-100786922-0200-0299.m4b").write_bytes(b"x")
+    for index in range(3):
+        (running / "chapters" / f"030{index}-第{index}.mp3").write_bytes(b"x")
+    (running / "assembled" / "twbook-100786922-0300-0399.mp3").write_bytes(b"x")
+    (running / "assembled" / "twbook-100786922-0300-0399.srt").write_bytes(b"x")
+    (running / "assembled" / "twbook-100786922-0300-0399.m4b").write_bytes(b"x" * 5)
+    monkeypatch.setenv("NOVEL_CRAWLER_TTS_PROGRESS_ROOT", str(output))
+
+    client.login()
+    status, _, payload = decoded(client.request("GET", "/api/tts/progress"))
+
+    assert status == 200
+    assert payload["conversions"][0]["completed_groups"] == 1
+    assert payload["conversions"][0]["current_group"] == "twbook-100786922-0300-0399"
+    assert payload["conversions"][0]["groups"][1]["assembled"]["m4b_size"] == 5
+    assert str(tmp_path) not in json.dumps(payload)
 
 
 def test_json_contract_rejects_type_size_and_unknown_fields(web_app) -> None:
